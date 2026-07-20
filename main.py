@@ -13,7 +13,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         # "http://localhost:3001"
-        "https://squid-app-m2wq8.ondigitalocean.app"
+        "www.nxzenai.com"
         
     ],
     allow_credentials=True,
