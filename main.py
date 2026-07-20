@@ -1,7 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.routers.leads import router as lead_router
+from routers.leads import router as lead_router
 
 app = FastAPI(
     title="NEXTGENAI API",

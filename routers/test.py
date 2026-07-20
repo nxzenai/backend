@@ -1,5 +1,5 @@
 from fastapi import APIRouter
-from app.database.mongodb import db
+from database.mongodb import db
 
 router = APIRouter()
 
