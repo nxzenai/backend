@@ -13,7 +13,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         # "http://localhost:3001"
-        "www.nxzenai.com"
+        "https://www.nxzenai.com"
         
     ],
     allow_credentials=True,
