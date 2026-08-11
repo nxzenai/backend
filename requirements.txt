@@ -25,3 +25,4 @@ joblib
 xgboost
 lightgbm
 catboost
+argon2-cffi
