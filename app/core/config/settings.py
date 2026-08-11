@@ -1,6 +1,6 @@
 from functools import lru_cache
 
-from pydantic import Field
+from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -29,7 +29,10 @@ class Settings(BaseSettings):
     # Security
     # -------------------------------------------------
 
-    secret_key: str = Field(default="change-me-in-production", alias="SECRET_KEY")
+    secret_key: str = Field(
+        default="change-me-in-production",
+        validation_alias=AliasChoices("SECRET_KEY", "JWT_SECRET"),
+    )
     algorithm: str = Field(default="HS256", alias="ALGORITHM")
     access_token_expire_minutes: int = Field(
         default=60,
@@ -40,7 +43,10 @@ class Settings(BaseSettings):
     # MongoDB
     # -------------------------------------------------
 
-    mongodb_uri: str = Field(default="mongodb://localhost:27017", alias="MONGODB_URI")
+    mongodb_uri: str = Field(
+        default="mongodb://localhost:27017",
+        validation_alias=AliasChoices("MONGODB_URI", "MONGODB_URL"),
+    )
     database_name: str = Field(default="ai_studio", alias="DATABASE_NAME")
 
     # -------------------------------------------------
