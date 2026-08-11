@@ -14,8 +14,8 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# Both frontends are served by the merged Next.js deployment. Keep the local
-# development ports as well as the production domain here.
+# Both frontends are served by the merged deployment. Keep the local development
+# ports as well as the production domain enabled for compatibility.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -32,10 +32,12 @@ app.add_middleware(
 
 register_exception_handlers(app)
 
-# Preserve the marketing API and mount AI Studio under /api/v1.
+# Preserve the marketing API and mount the application router under /api/v1.
 app.include_router(lead_router)
 app.include_router(api_router)
+
 
 @app.get("/")
 async def root():
     return {"message": "NxZenAI Backend Running"}
+
