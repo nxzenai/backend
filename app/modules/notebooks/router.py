@@ -1,0 +1,266 @@
+from fastapi import APIRouter, Depends, status
+
+from app.modules.auth.dependencies import get_current_user
+from app.modules.auth.models import UserModel
+
+from app.modules.notebooks.dependencies import (
+    get_notebook_service,
+)
+
+from app.modules.notebooks.schemas import (
+    CellResponse,
+    CreateCellRequest,
+    CreateNotebookRequest,
+    NotebookResponse,
+    ReorderCellsRequest,
+    UpdateCellRequest,
+    UpdateNotebookRequest,
+)
+
+from app.modules.notebooks.service import NotebookService
+
+from app.shared.responses.base import APIResponse
+
+def to_cell_response(cell) -> CellResponse:
+    return CellResponse(
+        id=cell.id,
+        cell_type=cell.cell_type,
+        source=cell.source,
+        outputs=cell.outputs,
+        execution_count=cell.execution_count,
+        metadata=cell.metadata,
+        position=cell.position,
+        created_at=cell.created_at,
+        updated_at=cell.updated_at,
+    )
+
+router = APIRouter(
+    prefix="/notebooks",
+    tags=["Notebooks"],
+)
+@router.post(
+    "",
+    response_model=APIResponse[NotebookResponse],
+    status_code=status.HTTP_201_CREATED,
+)
+async def create_notebook(
+    request: CreateNotebookRequest,
+    current_user: UserModel = Depends(get_current_user),
+    service: NotebookService = Depends(get_notebook_service),
+):
+
+    notebook = await service.create_notebook(
+        request,
+        current_user,
+    )
+
+    return APIResponse(
+        success=True,
+        message="Notebook created successfully.",
+        data=NotebookResponse(**notebook.model_dump()),
+    )
+@router.get(
+    "",
+    response_model=APIResponse[list[NotebookResponse]],
+)
+async def list_notebooks(
+    current_user: UserModel = Depends(get_current_user),
+    service: NotebookService = Depends(get_notebook_service),
+):
+
+    notebooks = await service.list_notebooks(
+        current_user
+    )
+
+    return APIResponse(
+        success=True,
+        message="Notebooks retrieved successfully.",
+        data=[
+            NotebookResponse(**n.model_dump())
+            for n in notebooks
+        ],
+    )
+@router.get(
+    "/{notebook_id}",
+    response_model=APIResponse[NotebookResponse],
+)
+async def get_notebook(
+    notebook_id: str,
+    current_user: UserModel = Depends(get_current_user),
+    service: NotebookService = Depends(get_notebook_service),
+):
+
+    notebook = await service.get_notebook(
+        notebook_id,
+        current_user,
+    )
+
+    return APIResponse(
+        success=True,
+        message="Notebook retrieved successfully.",
+        data=NotebookResponse(**notebook.model_dump()),
+    )
+@router.patch(
+    "/{notebook_id}",
+    response_model=APIResponse[NotebookResponse],
+)
+async def update_notebook(
+    notebook_id: str,
+    request: UpdateNotebookRequest,
+    current_user: UserModel = Depends(get_current_user),
+    service: NotebookService = Depends(get_notebook_service),
+):
+
+    notebook = await service.update_notebook(
+        notebook_id,
+        request,
+        current_user,
+    )
+
+    return APIResponse(
+        success=True,
+        message="Notebook updated successfully.",
+        data=NotebookResponse(**notebook.model_dump()),
+    )
+@router.delete(
+    "/{notebook_id}",
+    response_model=APIResponse[None],
+)
+async def delete_notebook(
+    notebook_id: str,
+    current_user: UserModel = Depends(get_current_user),
+    service: NotebookService = Depends(get_notebook_service),
+):
+
+    await service.delete_notebook(
+        notebook_id,
+        current_user,
+    )
+
+    return APIResponse(
+        success=True,
+        message="Notebook deleted successfully.",
+        data=None,
+    )
+@router.post(
+    "/{notebook_id}/cells",
+    response_model=APIResponse[CellResponse],
+    status_code=status.HTTP_201_CREATED,
+    summary="Add Cell",
+)
+async def add_cell(
+    notebook_id: str,
+    request: CreateCellRequest,
+    current_user: UserModel = Depends(get_current_user),
+    service: NotebookService = Depends(get_notebook_service),
+):
+
+    cell = await service.add_cell(
+        notebook_id,
+        request,
+        current_user,
+    )
+
+    return APIResponse(
+        success=True,
+        message="Cell created successfully.",
+        data=to_cell_response(cell),
+    )
+@router.get(
+    "/{notebook_id}/cells",
+    response_model=APIResponse[list[CellResponse]],
+    summary="List Cells",
+)
+async def list_cells(
+    notebook_id: str,
+    current_user: UserModel = Depends(get_current_user),
+    service: NotebookService = Depends(get_notebook_service),
+):
+
+    cells = await service.list_cells(
+        notebook_id,
+        current_user,
+    )
+
+    return APIResponse(
+        success=True,
+        message="Cells retrieved successfully.",
+        data=[
+            to_cell_response(cell)
+            for cell in cells
+        ],
+    )
+@router.patch(
+    "/{notebook_id}/cells/{cell_id}",
+    response_model=APIResponse[CellResponse],
+    summary="Update Cell",
+)
+async def update_cell(
+    notebook_id: str,
+    cell_id: str,
+    request: UpdateCellRequest,
+    current_user: UserModel = Depends(get_current_user),
+    service: NotebookService = Depends(get_notebook_service),
+):
+
+    cell = await service.update_cell(
+        notebook_id,
+        cell_id,
+        request,
+        current_user,
+    )
+
+    return APIResponse(
+        success=True,
+        message="Cell updated successfully.",
+        data=to_cell_response(cell),
+    )
+@router.delete(
+    "/{notebook_id}/cells/{cell_id}",
+    response_model=APIResponse[None],
+    summary="Delete Cell",
+)
+async def delete_cell(
+    notebook_id: str,
+    cell_id: str,
+    current_user: UserModel = Depends(get_current_user),
+    service: NotebookService = Depends(get_notebook_service),
+):
+
+    await service.delete_cell(
+        notebook_id,
+        cell_id,
+        current_user,
+    )
+
+    return APIResponse(
+        success=True,
+        message="Cell deleted successfully.",
+        data=None,
+    )
+@router.post(
+    "/{notebook_id}/cells/reorder",
+    response_model=APIResponse[list[CellResponse]],
+    summary="Reorder Cells",
+)
+async def reorder_cells(
+    notebook_id: str,
+    request: ReorderCellsRequest,
+    current_user: UserModel = Depends(get_current_user),
+    service: NotebookService = Depends(get_notebook_service),
+):
+
+    cells = await service.reorder_cells(
+        notebook_id,
+        request,
+        current_user,
+    )
+
+    return APIResponse(
+        success=True,
+        message="Cells reordered successfully.",
+        data=[
+            to_cell_response(cell)
+            for cell in cells
+        ],
+    )
