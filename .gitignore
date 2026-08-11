@@ -1,0 +1,62 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pyre/
+
+# Virtual environments
+.venv/
+.venv311/
+venv/
+ENV/
+env/
+.python-version
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# Build and distribution
+build/
+dist/
+*.egg-info/
+.eggs/
+*.egg
+pip-wheel-metadata/
+
+# Test and coverage reports
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+
+# Logs and runtime data
+*.log
+logs/
+*.pid
+*.sqlite3
+*.db
+
+# IDE/editor and OS files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Generated application data
+.ipynb_checkpoints/
+uploads/
+storage/
+catboost_info/
+*.tmp
+*.temp
+local_settings.py
+secrets.json
