@@ -15,6 +15,7 @@ async def lifespan(app: FastAPI):
 
     yield
 
-    await MongoDB.disconnect()
+    if MongoDB.client is not None:
+        await MongoDB.disconnect()
 
     logger.info("NxZenAI Studio Shutdown Complete")
