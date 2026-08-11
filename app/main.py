@@ -30,7 +30,7 @@ app = FastAPI(
 
 origins = [
     "http://localhost:3001",
-    "http://127.0.0.1:8001",
+    #"http://127.0.0.1:8001",
     "https://www.nxzenai.com",
     
 
