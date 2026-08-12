@@ -1,18 +1,19 @@
+from app.modules.auth.models import UserModel
 from fastapi import APIRouter, Depends, status
 
+from app.modules.auth.dependencies import get_auth_service
+from app.modules.auth.schemas import RegisterRequest, UserResponse
+from app.modules.auth.service import AuthService
+
+from app.shared.responses import APIResponse
+from app.modules.auth.schemas import (
+    LoginRequest,
+    TokenResponse,
+)
 from app.modules.auth.dependencies import (
     get_auth_service,
     get_current_user,
 )
-from app.modules.auth.models import UserModel
-from app.modules.auth.schemas import (
-    LoginRequest,
-    RegisterRequest,
-    TokenResponse,
-    UserResponse,
-)
-from app.modules.auth.service import AuthService
-from app.shared.responses import APIResponse
 
 router = APIRouter(
     prefix="/auth",
@@ -45,8 +46,6 @@ async def register_user(
             is_verified=user.is_verified,
         ).model_dump(),
     )
-
-
 @router.post(
     "/login",
     response_model=APIResponse[TokenResponse],
@@ -64,8 +63,6 @@ async def login(
         message="Login successful.",
         data=token,
     )
-
-
 @router.get(
     "/me",
     response_model=APIResponse[UserResponse],

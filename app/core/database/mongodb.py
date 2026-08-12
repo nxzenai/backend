@@ -20,40 +20,28 @@ class MongoDB:
     async def connect(cls):
         logger.info("Connecting to MongoDB...")
 
-        if not settings.mongodb_uri:
-            logger.warning(
-                "MongoDB URI is not configured. Starting application without a database connection."
-            )
-            cls.client = None
-            cls.database = None
-            cls.marketing_database = None
-            return
+        cls.client = AsyncIOMotorClient(
+            settings.mongodb_uri,
+            maxPoolSize=100,
+            minPoolSize=5,
+            serverSelectionTimeoutMS=5000,
+        )
 
-        try:
-            cls.client = AsyncIOMotorClient(
-                settings.mongodb_uri,
-                maxPoolSize=100,
-                minPoolSize=5,
-                serverSelectionTimeoutMS=5000,
-            )
+        await cls.client.admin.command("ping")
 
-            await cls.client.admin.command("ping")
+        # AI Studio Database
+        cls.database = cls.client[
+            settings.database_name
+        ]
 
-            # AI Studio Database
-            cls.database = cls.client[settings.database_name]
+        # Marketing Database
+        cls.marketing_database = cls.client[
+            settings.marketing_database_name
+        ]
 
-            # Marketing Database
-            cls.marketing_database = cls.client["nxzenai_marketing"]
-
-            logger.success("MongoDB Connected Successfully")
-        except Exception as exc:  # pragma: no cover - startup robustness
-            logger.warning(
-                "MongoDB is unavailable during startup; continuing without DB connection. Reason: %s",
-                exc,
-            )
-            cls.client = None
-            cls.database = None
-            cls.marketing_database = None
+        logger.success(
+            "MongoDB Connected Successfully"
+        )
 
     @classmethod
     async def disconnect(cls):
