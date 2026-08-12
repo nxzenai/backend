@@ -136,25 +136,26 @@ class CRMRepository:
     # Get Lead
     ####################################################
 
-async def get_lead(
-    self,
-    lead_id: str,
-):
+    async def get_lead(
+        self,
+        lead_id: str,
+    ):
 
-    lead = await self.collection.find_one(
-        {
-            "_id": ObjectId(lead_id),
-        }
-    )
+        lead = await self.collection.find_one(
+            {
+                "_id": ObjectId(lead_id),
+            }
+        )
 
-    if not lead:
-        return None
+        if not lead:
+            return None
 
-    lead["id"] = str(lead["_id"])
+        lead["id"] = str(lead["_id"])
 
-    del lead["_id"]
+        del lead["_id"]
 
-    return lead
+        return lead
+
     ####################################################
     # Update Lead
     ####################################################

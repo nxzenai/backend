@@ -5,7 +5,6 @@ from app.core.security.jwt import create_access_token
 from app.core.security.password import (
     hash_password,
     verify_password,
-    needs_rehash,
 )
 
 from app.modules.auth.constants import (
@@ -97,10 +96,6 @@ class AuthService:
             request.email
         )
 
-        # -----------------------------------------------
-        # User Not Found
-        # -----------------------------------------------
-
         if not user:
             raise AIStudioException(
                 message="Invalid email or password.",
@@ -108,25 +103,15 @@ class AuthService:
                 error_code="INVALID_CREDENTIALS",
             )
 
-        # -----------------------------------------------
-        # Verify Password
-        # -----------------------------------------------
-
-        password_valid = verify_password(
+        if not verify_password(
             request.password,
             user.hashed_password,
-        )
-
-        if not password_valid:
+        ):
             raise AIStudioException(
                 message="Invalid email or password.",
                 status_code=401,
                 error_code="INVALID_CREDENTIALS",
             )
-
-        # -----------------------------------------------
-        # Account Status
-        # -----------------------------------------------
 
         if not user.is_active:
             raise AIStudioException(
@@ -135,35 +120,9 @@ class AuthService:
                 error_code="ACCOUNT_DISABLED",
             )
 
-        # -----------------------------------------------
-        # Password Migration
-        #
-        # If this user was created using bcrypt,
-        # automatically migrate the password to Argon2.
-        # -----------------------------------------------
-
-        if needs_rehash(user.hashed_password):
-
-            new_password_hash = hash_password(
-                request.password
-            )
-
-            await self.repository.update_password(
-                user.id,
-                new_password_hash,
-            )
-
-        # -----------------------------------------------
-        # Update Last Login
-        # -----------------------------------------------
-
         await self.repository.update_last_login(
             user.id
         )
-
-        # -----------------------------------------------
-        # Create Access Token
-        # -----------------------------------------------
 
         access_token = create_access_token(
             {
@@ -173,12 +132,7 @@ class AuthService:
             }
         )
 
-        # -----------------------------------------------
-        # Return Token
-        # -----------------------------------------------
-
         return TokenResponse(
             access_token=access_token,
             token_type="bearer",
         )
-
