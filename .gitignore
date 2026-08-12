@@ -1,63 +1,51 @@
-# Python bytecode and caches
-__pycache__/
-*.py[cod]
-*$py.class
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
-.pyre/
-
-# Virtual environments
-.venv/
-.venv311/
-venv/
-ENV/
-env/
-.python-version
-
-# Environment files
+# Environment
 .env
 .env.*
 !.env.example
+/.venv
+venv/
+env/
+ENV/
 
-# Build and distribution
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.cache/
+
+# Distribution / packaging
 build/
 dist/
 *.egg-info/
-.eggs/
 *.egg
-pip-wheel-metadata/
 
-# Test and coverage reports
-.coverage
-.coverage.*
-htmlcov/
-.tox/
-.nox/
-
-# Logs and runtime data
-*.log
-logs/
-*.pid
-*.sqlite3
+# Databases
 *.db
+*.sqlite
+*.sqlite3
 
-# IDE/editor and OS files
+# Logs
+logs/
+*.log
+
+# Runtime / user data
+storage/
+uploads/
+
+# IDE / OS
 .vscode/
 .idea/
-*.swp
-*.swo
-*~
 .DS_Store
 Thumbs.db
 
-# Generated application data
+# Jupyter
 .ipynb_checkpoints/
-uploads/
-storage/
-catboost_info/
-*.tmp
-*.temp
-local_settings.py
-secrets.json
 
+# Coverage
+.coverage
+.coverage.*
+htmlcov/
