@@ -1,6 +1,10 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from app.api.v1 import api_router
+from app.core.config.settings import settings
+from app.core.exceptions.handlers import register_exception_handlers
+from app.lifespan import lifespan
 from routers.leads import router as lead_router
 
 from app.api.v1 import api_router
@@ -13,7 +17,8 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# CORS Configuration
+# Both frontends are served by the merged deployment. Keep the local development
+# ports as well as the production domain enabled for compatibility.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -36,6 +41,8 @@ register_exception_handlers(app)
 
 # Legacy public marketing site API (lead capture form on nxzenai.com)
 app.include_router(lead_router)
+app.include_router(api_router)
+
 
 # AI Studio API consumed by the dashboard/studio frontend (/api/v1/...)
 app.include_router(api_router)
