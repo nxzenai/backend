@@ -7,10 +7,13 @@ from app.core.exceptions.handlers import register_exception_handlers
 from app.lifespan import lifespan
 from routers.leads import router as lead_router
 
+from app.api.v1 import api_router
+from app.core.exceptions.handlers import register_exception_handlers
+from app.lifespan import lifespan
+
 app = FastAPI(
-    title="NxZenAI API",
-    version=settings.app_version,
-    debug=settings.debug,
+    title="NEXTGENAI API",
+    version="1.0.0",
     lifespan=lifespan,
 )
 
@@ -19,26 +22,41 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        #"http://localhost:3000",
-        #"http://localhost:3001",
-        #"http://127.0.0.1:3000",
-        #"http://127.0.0.1:3001",
         "https://www.nxzenai.com",
-        #"https://coral-app-8t2db.ondigitalocean.app"
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        # "http://localhost:3001"
     ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# Global exception handlers for the AI Studio modules (auth, crm, datasets, etc.)
 register_exception_handlers(app)
 
-# Preserve the marketing API and mount the application router under /api/v1.
+# ---------------------------------------------------------
+# Routers
+# ---------------------------------------------------------
+
+# Legacy public marketing site API (lead capture form on nxzenai.com)
 app.include_router(lead_router)
+app.include_router(api_router)
+
+
+# AI Studio API consumed by the dashboard/studio frontend (/api/v1/...)
 app.include_router(api_router)
 
 
 @app.get("/")
 async def root():
-    return {"message": "NxZenAI Backend Running"}
+    return {
+        "message": "NEXTGENAI Backend Running"
+    }
 
+
+@app.get("/health")
+async def health():
+    return {
+        "status": "healthy"
+    }
