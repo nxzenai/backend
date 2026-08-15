@@ -1,19 +1,19 @@
 """
 NxZen AI Studio
-
 AutoML Service
 
-Business service responsible for orchestrating
-the complete AutoML workflow.
+Business/service layer around AutoMLTrainer.
 
 Responsibilities
 ----------------
-• Dataset Loading
-• AutoML Training
-• Model Analysis
-• Leaderboard Generation
-• Prediction
-• Model Persistence
+- Dataset loading
+- Training
+- Prediction
+- Model persistence
+- Dataset inspection
+- JSON-safe responses
+- Service health/status
+- No cross-request task mutation
 """
 
 from __future__ import annotations
@@ -22,63 +22,31 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import math
+import numpy as np
 import pandas as pd
 
-##########################################################
-# AutoML Modules
-##########################################################
-
 from app.modules.automl.trainer import (
-
-    AutoMLTrainer,
-
     AutoMLResult,
-
+    AutoMLTask,
+    AutoMLTrainer,
     TrainerConfig,
-
 )
 
-from app.modules.automl.analyzer import (
 
-    AutoMLAnalyzer,
-
-    AnalysisResult,
-
-    AnalyzerConfig,
-
-)
-
-from app.modules.automl.leaderboard import (
-
-    LeaderboardEngine,
-
-    LeaderboardResult,
-
-    LeaderboardConfig,
-
-)
-
-##########################################################
-# Service Configuration
-##########################################################
+# ================================================================
+# CONFIG
+# ================================================================
 
 
 @dataclass
 class AutoMLServiceConfig:
     """
-    Configuration used by AutoMLService.
+    Service-level configuration.
     """
 
     trainer_config: TrainerConfig = field(
     default_factory=TrainerConfig
-    )
-
-    analyzer_config: AnalyzerConfig = field(
-    default_factory=AnalyzerConfig
-    )
-
-    leaderboard_config: LeaderboardConfig = field(
-    default_factory=LeaderboardConfig
     )
 
     auto_save_best_model: bool = False
@@ -86,1067 +54,1118 @@ class AutoMLServiceConfig:
     model_directory: str = "models"
 
 
-##########################################################
-# AutoML Service
-##########################################################
+# ================================================================
+# JSON SAFETY
+# ================================================================
+
+
+def _json_safe(
+    value: Any,
+) -> Any:
+
+    if value is None:
+        return None
+
+    if isinstance(
+        value,
+        (str, int, bool),
+    ):
+        return value
+
+    if isinstance(
+        value,
+        float,
+    ):
+
+        if not math.isfinite(value):
+            return None
+
+        return value
+
+    if isinstance(
+        value,
+        np.generic,
+    ):
+        return _json_safe(
+            value.item()
+        )
+
+    if isinstance(
+        value,
+        np.ndarray,
+    ):
+        return [
+            _json_safe(item)
+            for item in value.tolist()
+        ]
+
+    if isinstance(
+        value,
+        pd.Timestamp,
+    ):
+        return value.isoformat()
+
+    if isinstance(
+        value,
+        Path,
+    ):
+        return str(value)
+
+    if isinstance(
+        value,
+        dict,
+    ):
+        return {
+            str(key): _json_safe(item)
+            for key, item in value.items()
+        }
+
+    if isinstance(
+        value,
+        (list, tuple, set),
+    ):
+        return [
+            _json_safe(item)
+            for item in value
+        ]
+
+    # sklearn/model objects must never be returned directly
+    # through JSON responses.
+    return str(value)
+
+
+# ================================================================
+# SERVICE
+# ================================================================
 
 
 class AutoMLService:
     """
-    Enterprise AutoML Service.
+    Enterprise AutoML service.
 
-    Coordinates the Trainer,
-    Analyzer and Leaderboard.
+    A service instance can be safely used for multiple requests
+    because request-specific task selection is passed into trainer
+    methods rather than mutating trainer configuration.
     """
 
     def __init__(
-
         self,
-
         config: AutoMLServiceConfig | None = None,
-
     ):
 
-        if config is None:
-
-            config = AutoMLServiceConfig()
-
-        self.config = config
-
-        ##################################################
-        # Core Components
-        ##################################################
+        self.config = (
+            config
+            if config is not None
+            else AutoMLServiceConfig()
+        )
 
         self.trainer = AutoMLTrainer(
-
-            config.trainer_config,
-
+            self.config.trainer_config
         )
-
-        self.analyzer = AutoMLAnalyzer(
-
-            config.analyzer_config,
-
-        )
-
-        self.leaderboard_engine = LeaderboardEngine(
-
-            config.leaderboard_config,
-
-        )
-
-        ##################################################
-        # Storage
-        ##################################################
 
         self.model_directory = Path(
-
-            config.model_directory,
-
+            self.config.model_directory
         )
 
         self.model_directory.mkdir(
-
             parents=True,
-
             exist_ok=True,
-
         )
-            ######################################################
-    # Dataset Loading
-    ######################################################
+
+    # ============================================================
+    # DATASET LOADING
+    # ============================================================
 
     def load_csv(
         self,
         filepath: str | Path,
     ) -> pd.DataFrame:
-        """
-        Loads a CSV dataset.
-        """
 
-        filepath = Path(filepath)
+        filepath = Path(
+            filepath
+        )
 
         if not filepath.exists():
-
             raise FileNotFoundError(
-
                 f"Dataset not found: {filepath}"
-
             )
 
         return pd.read_csv(
-
-            filepath,
-
+            filepath
         )
-
-    ######################################################
-    # Load Excel Dataset
-    ######################################################
 
     def load_excel(
         self,
         filepath: str | Path,
     ) -> pd.DataFrame:
-        """
-        Loads an Excel dataset.
-        """
 
-        filepath = Path(filepath)
+        filepath = Path(
+            filepath
+        )
 
         if not filepath.exists():
-
             raise FileNotFoundError(
-
                 f"Dataset not found: {filepath}"
-
             )
 
         return pd.read_excel(
-
-            filepath,
-
+            filepath
         )
-
-    ######################################################
-    # Auto Dataset Loader
-    ######################################################
 
     def load_dataset(
         self,
         filepath: str | Path,
     ) -> pd.DataFrame:
-        """
-        Automatically loads a dataset
-        based on file extension.
-        """
 
-        filepath = Path(filepath)
+        filepath = Path(
+            filepath
+        )
 
-        extension = filepath.suffix.lower()
+        extension = (
+            filepath.suffix.lower()
+        )
 
         if extension == ".csv":
-
             return self.load_csv(
-
-                filepath,
-
+                filepath
             )
 
-        if extension in [
-
+        if extension in {
             ".xlsx",
-
             ".xls",
-
-        ]:
-
+        }:
             return self.load_excel(
-
-                filepath,
-
+                filepath
             )
 
         raise ValueError(
-
-            f"Unsupported dataset format: {extension}"
-
+            "Unsupported dataset format: "
+            f"{extension}. Supported formats: "
+            ".csv, .xlsx, .xls"
         )
 
-    ######################################################
-    # Dataset Validation
-    ######################################################
+    # ============================================================
+    # DATASET VALIDATION
+    # ============================================================
 
     def validate_dataset(
         self,
         dataframe: pd.DataFrame,
-        target_column: str,
+        target_column: str | None = None,
+        *,
+        task: AutoMLTask | str | None = None,
     ) -> bool:
-        """
-        Validates dataset before training.
-        """
 
         self.trainer.validate_dataset(
-
             dataframe,
-
             target_column,
-
+            task=task,
         )
 
         return True
 
-    ######################################################
-    # Dataset Information
-    ######################################################
+    # ============================================================
+    # DATASET INFORMATION
+    # ============================================================
 
     def dataset_information(
         self,
         dataframe: pd.DataFrame,
-    ) -> dict:
-        """
-        Returns dataset information.
-        """
+    ) -> dict[str, Any]:
 
-        return {
+        if dataframe is None:
+            raise ValueError(
+                "Dataset cannot be None."
+            )
 
-            "rows": len(
+        if dataframe.empty:
+            raise ValueError(
+                "Dataset is empty."
+            )
 
-                dataframe,
+        return _json_safe(
+            {
+                "rows": int(
+                    len(dataframe)
+                ),
+                "columns": int(
+                    len(dataframe.columns)
+                ),
+                "column_names": [
+                    str(column)
+                    for column in dataframe.columns
+                ],
+                "dtypes": {
+                    str(column): str(
+                        dtype
+                    )
+                    for column, dtype
+                    in dataframe.dtypes.items()
+                },
+                "missing_values": int(
+                    dataframe.isnull()
+                    .sum()
+                    .sum()
+                ),
+                "memory_usage_bytes": int(
+                    dataframe.memory_usage(
+                        deep=True
+                    ).sum()
+                ),
+            }
+        )
 
-            ),
-
-            "columns": len(
-
-                dataframe.columns,
-
-            ),
-
-            "column_names": list(
-
-                dataframe.columns,
-
-            ),
-
-            "missing_values": int(
-
-                dataframe.isnull().sum().sum()
-
-            ),
-
-            "memory_usage_bytes": int(
-
-                dataframe.memory_usage(
-
-                    deep=True,
-
-                ).sum()
-
-            ),
-
-        }
-
-    ######################################################
-    # Dataset Preview
-    ######################################################
+    # ============================================================
+    # PREVIEW
+    # ============================================================
 
     def preview_dataset(
         self,
         dataframe: pd.DataFrame,
         rows: int = 5,
     ) -> pd.DataFrame:
-        """
-        Returns the first rows of the dataset.
-        """
+
+        if rows < 1:
+            raise ValueError(
+                "rows must be at least 1."
+            )
+
+        if rows > 100:
+            raise ValueError(
+                "rows cannot exceed 100."
+            )
 
         return dataframe.head(
-
-            rows,
-
+            rows
         )
 
-    ######################################################
-    # Dataset Shape
-    ######################################################
+    # ============================================================
+    # SHAPE
+    # ============================================================
 
     def dataset_shape(
         self,
         dataframe: pd.DataFrame,
     ) -> tuple[int, int]:
-        """
-        Returns dataset dimensions.
-        """
 
         return dataframe.shape
 
-    ######################################################
-    # Dataset Columns
-    ######################################################
+    # ============================================================
+    # COLUMNS
+    # ============================================================
 
     def dataset_columns(
         self,
         dataframe: pd.DataFrame,
     ) -> list[str]:
-        """
-        Returns dataset column names.
-        """
 
-        return list(
+        return [
+            str(column)
+            for column in dataframe.columns
+        ]
 
-            dataframe.columns,
-
-        )
-        ######################################################
-    # AutoML Training
-    ######################################################
+    # ============================================================
+    # TRAIN
+    # ============================================================
 
     def train(
         self,
         dataframe: pd.DataFrame,
-        target_column: str,
+        target_column: str | None = None,
+        *,
+        task: AutoMLTask | str | None = None,
     ) -> AutoMLResult:
-        """
-        Executes the complete AutoML pipeline.
-        """
 
-        self.validate_dataset(
-
-            dataframe,
-
-            target_column,
-
-        )
-
-        result = self.trainer.train(
-
-            dataframe,
-
-            target_column,
-
-        )
-
-        if self.config.auto_save_best_model:
-
-            filepath = (
-
-                self.model_directory
-
-                /
-
-                "best_model.pkl"
-
+        if dataframe is None:
+            raise ValueError(
+                "Dataset cannot be None."
             )
 
-            self.trainer.save_best_model(
+        if dataframe.empty:
+            raise ValueError(
+                "Dataset is empty."
+            )
 
-                result,
+        # --------------------------------------------------------
+        # Request-specific task is passed directly.
+        #
+        # We DO NOT mutate:
+        #
+        #     self.trainer.config.task
+        #
+        # This prevents one request from affecting another.
+        # --------------------------------------------------------
 
-                str(filepath),
+        result = self.trainer.train(
+            dataframe=dataframe,
+            target_column=target_column,
+            task=task,
+        )
 
+        if (
+            self.config.auto_save_best_model
+            and result.model_artifact is not None
+        ):
+
+            self.save_best_model(
+                result
             )
 
         return result
 
-    ######################################################
-    # Train From File
-    ######################################################
+    # ============================================================
+    # TRAIN FROM FILE
+    # ============================================================
 
     def train_from_file(
         self,
         filepath: str | Path,
-        target_column: str,
+        target_column: str | None = None,
+        *,
+        task: AutoMLTask | str | None = None,
     ) -> AutoMLResult:
-        """
-        Loads a dataset from disk and trains.
-        """
 
         dataframe = self.load_dataset(
-
-            filepath,
-
+            filepath
         )
 
         return self.train(
-
-            dataframe,
-
-            target_column,
-
+            dataframe=dataframe,
+            target_column=target_column,
+            task=task,
         )
 
-    ######################################################
-    # Prediction
-    ######################################################
+    # ============================================================
+    # PREDICTION
+    # ============================================================
 
     def predict(
         self,
-        model,
+        model: Any,
         dataframe: pd.DataFrame,
-    ):
-        """
-        Generates predictions.
-        """
+    ) -> Any:
 
-        return self.trainer.predict(
-
+        predictions = self.trainer.predict(
             model,
-
             dataframe,
-
         )
 
-    ######################################################
-    # Batch Prediction
-    ######################################################
+        return _json_safe(
+            predictions
+        )
+
+    # ============================================================
+    # BATCH PREDICTION
+    # ============================================================
 
     def predict_batch(
         self,
-        model,
+        model: Any,
         dataframe: pd.DataFrame,
-    ):
-        """
-        Generates batch predictions.
-        """
+    ) -> Any:
 
         return self.predict(
-
             model,
-
             dataframe,
-
         )
 
-    ######################################################
-    # Save Best Model
-    ######################################################
+    # ============================================================
+    # BEST MODEL
+    # ============================================================
+
+    def best_model(
+        self,
+        result: AutoMLResult,
+    ) -> Any:
+
+        if result is None:
+            return None
+
+        return result.best_model
+
+    # ============================================================
+    # MODEL INFORMATION
+    # ============================================================
+
+    def model_information(
+        self,
+        result: AutoMLResult,
+    ) -> dict[str, Any]:
+
+        return _json_safe(
+            self.trainer.model_information(
+                result
+            )
+        )
+
+    # ============================================================
+    # SAVE MODEL
+    # ============================================================
+
+    def save_model(
+        self,
+        model: Any,
+        filename: str,
+    ) -> Path:
+
+        if not filename:
+            raise ValueError(
+                "Model filename cannot be empty."
+            )
+
+        filepath = (
+            self.model_directory
+            / filename
+        )
+
+        self.trainer.save_model(
+            model,
+            filepath,
+        )
+
+        return filepath
+
+    # ============================================================
+    # SAVE BEST MODEL
+    # ============================================================
 
     def save_best_model(
         self,
         result: AutoMLResult,
         filename: str = "best_model.pkl",
     ) -> Path:
-        """
-        Saves the best model into the
-        configured model directory.
-        """
 
-        filepath = self.model_directory / filename
+        filepath = (
+            self.model_directory
+            / filename
+        )
 
         self.trainer.save_best_model(
-
             result,
-
-            str(filepath),
-
+            filepath,
         )
 
         return filepath
 
-    ######################################################
-    # Load Model
-    ######################################################
+    # ============================================================
+    # LOAD MODEL
+    # ============================================================
 
     def load_model(
         self,
         filename: str,
-    ):
-        """
-        Loads a saved model.
-        """
+    ) -> Any:
 
-        filepath = self.model_directory / filename
+        filepath = (
+            self.model_directory
+            / filename
+        )
 
         return self.trainer.load_model(
-
-            str(filepath),
-
+            filepath
         )
 
-    ######################################################
-    # Best Model
-    ######################################################
-
-    def best_model(
-        self,
-        result: AutoMLResult,
-    ):
-        """
-        Returns the best trained model.
-        """
-
-        return result.best_model
-
-    ######################################################
-    # Model Information
-    ######################################################
-
-    def model_information(
-        self,
-        result: AutoMLResult,
-    ) -> dict:
-        """
-        Returns metadata of the best model.
-        """
-
-        return self.trainer.model_information(
-
-            result,
-
-        )
-        ######################################################
-    # AutoML Analysis
-    ######################################################
-
-    def analyze(
-        self,
-        result: AutoMLResult,
-    ) -> AnalysisResult:
-        """
-        Performs complete AutoML analysis.
-        """
-
-        return self.analyzer.analyze(
-
-            result,
-
-        )
-
-    ######################################################
-    # Executive Summary
-    ######################################################
-
-    def executive_summary(
-        self,
-        result: AutoMLResult,
-    ) -> dict:
-        """
-        Returns the executive summary
-        generated by the analyzer.
-        """
-
-        return self.analyzer.executive_summary(
-
-            result,
-
-        )
-
-    ######################################################
-    # Leaderboard
-    ######################################################
-
-    def leaderboard(
-        self,
-        result: AutoMLResult,
-    ) -> LeaderboardResult:
-        """
-        Returns the leaderboard corresponding
-        to the trained AutoML task.
-        """
-
-        if result.task == "classification":
-
-            return self.leaderboard_engine.classification_leaderboard(
-
-                result.training_results,
-
-            )
-
-        return self.leaderboard_engine.regression_leaderboard(
-
-            result.training_results,
-
-        )
-
-    ######################################################
-    # Best Model Insights
-    ######################################################
-
-    def best_model_insights(
-        self,
-        result: AutoMLResult,
-    ) -> dict:
-        """
-        Returns detailed information
-        about the best model.
-        """
-
-        return self.analyzer.best_model_insights(
-
-            result,
-
-        )
-
-    ######################################################
-    # Recommendations
-    ######################################################
-
-    def recommendations(
-        self,
-        result: AutoMLResult,
-    ) -> list[str]:
-        """
-        Returns deployment recommendations.
-        """
-
-        return self.analyzer.recommendations(
-
-            result,
-
-        )
-
-    ######################################################
-    # Training Statistics
-    ######################################################
-
-    def training_statistics(
-        self,
-        result: AutoMLResult,
-    ) -> dict:
-        """
-        Returns training statistics.
-        """
-
-        return self.analyzer.training_statistics(
-
-            result,
-
-        )
-
-    ######################################################
-    # Complete Service Response
-    ######################################################
-
-    def complete_response(
-        self,
-        result: AutoMLResult,
-    ) -> dict:
-        """
-        Returns a complete AutoML response
-        for API consumers.
-        """
-
-        leaderboard = self.leaderboard(
-
-            result,
-
-        )
-
-        analysis = self.analyze(
-
-            result,
-
-        )
-
-        return {
-
-            "task": result.task,
-
-            "dataset_summary": result.dataset_summary,
-
-            "leaderboard": self.leaderboard_engine.export_dict(
-
-                leaderboard,
-
-            ),
-
-            "analysis": {
-
-                "summary": analysis.summary,
-
-                "comparison": analysis.comparison,
-
-                "recommendations": analysis.recommendations,
-
-            },
-
-            "best_model": self.best_model_insights(
-
-                result,
-
-            ),
-
-            "training_statistics": self.training_statistics(
-
-                result,
-
-            ),
-
-        }
-
-    ######################################################
-    # Quick Summary
-    ######################################################
-
-    def summary(
-        self,
-        result: AutoMLResult,
-    ) -> dict:
-        """
-        Returns a lightweight summary.
-        """
-
-        leaderboard = self.leaderboard(
-
-            result,
-
-        )
-
-        winner = None
-
-        if leaderboard.entries:
-
-            winner = leaderboard.entries[0]
-
-        return {
-
-            "task": result.task,
-
-            "models_trained": len(
-
-                result.training_results,
-
-            ),
-
-            "best_model": (
-
-                winner.model_name
-
-                if winner
-
-                else None
-
-            ),
-
-            "ranking_metric": leaderboard.ranking_metric,
-
-            "score": (
-
-                winner.score
-
-                if winner
-
-                else None
-
-            ),
-
-        }
-        ######################################################
-    # Model Exists
-    ######################################################
+    # ============================================================
+    # MODEL EXISTS
+    # ============================================================
 
     def model_exists(
         self,
         filename: str,
     ) -> bool:
-        """
-        Checks whether a model exists.
-        """
 
-        filepath = self.model_directory / filename
+        return (
+            self.model_directory
+            / filename
+        ).exists()
 
-        return filepath.exists()
-
-    ######################################################
-    # List Models
-    ######################################################
+    # ============================================================
+    # LIST MODELS
+    # ============================================================
 
     def list_models(
         self,
     ) -> list[str]:
-        """
-        Lists all saved models.
-        """
 
         return sorted(
-
-            [
-
-                file.name
-
-                for file in self.model_directory.glob("*.pkl")
-
-            ]
-
+            file.name
+            for file in
+            self.model_directory.glob(
+                "*.pkl"
+            )
         )
 
-    ######################################################
-    # Delete Model
-    ######################################################
+    # ============================================================
+    # DELETE MODEL
+    # ============================================================
 
     def delete_model(
         self,
         filename: str,
     ) -> bool:
-        """
-        Deletes a saved model.
-        """
 
-        filepath = self.model_directory / filename
+        filepath = (
+            self.model_directory
+            / filename
+        )
 
         if not filepath.exists():
-
             return False
 
         filepath.unlink()
 
         return True
 
-    ######################################################
-    # Clear Model Directory
-    ######################################################
+    # ============================================================
+    # CLEAR MODELS
+    # ============================================================
 
     def clear_models(
         self,
     ) -> int:
-        """
-        Deletes all saved models.
-
-        Returns
-        -------
-        int
-            Number of deleted models.
-        """
 
         deleted = 0
 
-        for file in self.model_directory.glob("*.pkl"):
+        for filepath in (
+            self.model_directory.glob(
+                "*.pkl"
+            )
+        ):
 
-            file.unlink()
+            filepath.unlink()
 
             deleted += 1
 
         return deleted
 
-    ######################################################
-    # Model Path
-    ######################################################
+    # ============================================================
+    # MODEL PATH
+    # ============================================================
 
     def model_path(
         self,
         filename: str,
     ) -> Path:
-        """
-        Returns the absolute path
-        to a saved model.
-        """
 
-        return self.model_directory / filename
+        return (
+            self.model_directory
+            / filename
+        )
 
-    ######################################################
-    # Model Information
-    ######################################################
+    # ============================================================
+    # SAVED MODEL INFORMATION
+    # ============================================================
 
     def saved_model_information(
         self,
         filename: str,
-    ) -> dict:
-        """
-        Returns information about
-        a saved model.
-        """
+    ) -> dict[str, Any]:
 
-        filepath = self.model_directory / filename
+        filepath = (
+            self.model_directory
+            / filename
+        )
 
         if not filepath.exists():
-
             raise FileNotFoundError(
-
-                f"Model '{filename}' does not exist."
-
+                f"Model '{filename}' "
+                "does not exist."
             )
 
         stat = filepath.stat()
 
-        return {
+        return _json_safe(
+            {
+                "filename": filepath.name,
+                "path": str(filepath),
+                "size_bytes": stat.st_size,
+                "created_at": stat.st_ctime,
+                "modified_at": stat.st_mtime,
+            }
+        )
 
-            "filename": filepath.name,
+    # ============================================================
+    # LEADERBOARD
+    # ============================================================
 
-            "path": str(filepath),
+    def leaderboard(
+        self,
+        result: AutoMLResult,
+    ) -> list[dict[str, Any]]:
 
-            "size_bytes": stat.st_size,
+        if result is None:
+            return []
 
-            "created_at": stat.st_ctime,
+        return _json_safe(
+            result.leaderboard
+        )
 
-            "modified_at": stat.st_mtime,
+    # ============================================================
+    # BEST MODEL INSIGHTS
+    # ============================================================
 
+    def best_model_insights(
+        self,
+        result: AutoMLResult,
+    ) -> dict[str, Any]:
+
+        if result is None:
+            return {
+                "available": False
+            }
+
+        best = result.best_model
+
+        if best is None:
+            return {
+                "available": False,
+                "task": result.task,
+                "reason": (
+                    "No successful model was produced."
+                ),
+            }
+
+        response = {
+            "available": True,
+            "task": result.task,
+            "model_name": best.model_name,
+            "training_time": getattr(
+                best,
+                "training_time",
+                None,
+            ),
+            "success": bool(
+                getattr(
+                    best,
+                    "success",
+                    False,
+                )
+            ),
         }
 
-    ######################################################
-    # Service Health
-    ######################################################
+        # Add task-specific metrics without exposing the
+        # sklearn estimator itself.
+
+        for field_name in [
+            "accuracy",
+            "precision",
+            "recall",
+            "f1_score",
+            "roc_auc",
+            "r2_score",
+            "mae",
+            "mse",
+            "rmse",
+            "mape",
+            "silhouette_score",
+            "calinski_harabasz_score",
+            "davies_bouldin_score",
+            "outlier_count",
+            "outlier_ratio",
+            "decision_score_mean",
+            "n_components",
+            "explained_variance",
+            "explained_variance_ratio",
+        ]:
+
+            if hasattr(
+                best,
+                field_name,
+            ):
+
+                response[
+                    field_name
+                ] = getattr(
+                    best,
+                    field_name,
+                )
+
+        return _json_safe(
+            response
+        )
+
+    # ============================================================
+    # RECOMMENDATIONS
+    # ============================================================
+
+    def recommendations(
+        self,
+        result: AutoMLResult,
+    ) -> list[str]:
+
+        if result is None:
+            return [
+                "No AutoML result is available."
+            ]
+
+        best = result.best_model
+
+        if best is None:
+            return [
+                "No successful model was produced.",
+                "Review the failed/skipped algorithms "
+                "in the leaderboard.",
+            ]
+
+        recommendations = [
+            f"Best model: {best.model_name}.",
+        ]
+
+        if result.task == "classification":
+
+            if getattr(
+                best,
+                "f1_score",
+                None,
+            ) is not None:
+
+                recommendations.append(
+                    "F1-score was used as the primary "
+                    "classification selection metric."
+                )
+
+        elif result.task == "regression":
+
+            if getattr(
+                best,
+                "r2_score",
+                None,
+            ) is not None:
+
+                recommendations.append(
+                    "R² was used as the primary "
+                    "regression selection metric."
+                )
+
+        elif result.task == "clustering":
+
+            recommendations.append(
+                "Clustering quality is evaluated using "
+                "unsupervised cluster-quality metrics."
+            )
+
+        elif result.task == "anomaly":
+
+            recommendations.append(
+                "Anomaly ratio is descriptive and is not "
+                "treated as ground-truth model quality."
+            )
+
+        elif result.task == "dimensionality":
+
+            recommendations.append(
+                "Explained variance is used to compare "
+                "dimensionality-reduction results."
+            )
+
+        if result.model_artifact is not None:
+
+            recommendations.append(
+                "The best model includes the fitted "
+                "preprocessor and can be used with raw "
+                "prediction data."
+            )
+
+        return recommendations
+
+    # ============================================================
+    # TRAINING STATISTICS
+    # ============================================================
+
+    def training_statistics(
+        self,
+        result: AutoMLResult,
+    ) -> dict[str, Any]:
+
+        if result is None:
+            return {}
+
+        successful = sum(
+            1
+            for item in result.training_results
+            if getattr(
+                item,
+                "success",
+                False,
+            )
+        )
+
+        failed = (
+            len(result.training_results)
+            - successful
+        )
+
+        return _json_safe(
+            {
+                "task": result.task,
+                "models_trained": len(
+                    result.training_results
+                ),
+                "successful_models": successful,
+                "failed_models": failed,
+                "best_model": (
+                    result.best_model.model_name
+                    if result.best_model
+                    else None
+                ),
+                "artifact_available": (
+                    result.model_artifact
+                    is not None
+                ),
+            }
+        )
+
+    # ============================================================
+    # COMPLETE RESPONSE
+    # ============================================================
+
+    def complete_response(
+        self,
+        result: AutoMLResult,
+    ) -> dict[str, Any]:
+
+        if result is None:
+            raise ValueError(
+                "AutoML result cannot be None."
+            )
+
+        response = {
+            "task": result.task,
+
+            "dataset_summary":
+                result.dataset_summary,
+
+            "leaderboard":
+                result.leaderboard,
+
+            "best_model":
+                self.best_model_insights(
+                    result
+                ),
+
+            "training_statistics":
+                self.training_statistics(
+                    result
+                ),
+
+            "recommendations":
+                self.recommendations(
+                    result
+                ),
+
+            "artifact": {
+                "available": (
+                    result.model_artifact
+                    is not None
+                ),
+                "model_name": (
+                    result.model_artifact.model_name
+                    if result.model_artifact
+                    else None
+                ),
+                "artifact_version": (
+                    result.model_artifact.artifact_version
+                    if result.model_artifact
+                    else None
+                ),
+                "task": (
+                    result.model_artifact.task
+                    if result.model_artifact
+                    else None
+                ),
+            },
+
+            "skipped_algorithms":
+                result.skipped_algorithms,
+
+            "excluded_algorithms":
+                result.excluded_algorithms,
+        }
+
+        return _json_safe(
+            response
+        )
+
+    # ============================================================
+    # SUMMARY
+    # ============================================================
+
+    def summary(
+        self,
+        result: AutoMLResult,
+    ) -> dict[str, Any]:
+
+        return _json_safe(
+            self.trainer.automl_summary(
+                result
+            )
+        )
+
+    # ============================================================
+    # HEALTH
+    # ============================================================
 
     def health(
         self,
-    ) -> dict:
-        """
-        Returns the service health status.
-        """
+    ) -> dict[str, Any]:
 
         return {
-
             "status": "healthy",
-
             "model_directory": str(
-
-                self.model_directory,
-
+                self.model_directory
             ),
-
             "saved_models": len(
-
-                self.list_models(),
-
+                self.list_models()
             ),
-
         }
 
-    ######################################################
-    # Service Status
-    ######################################################
+    # ============================================================
+    # STATUS
+    # ============================================================
 
     def status(
         self,
-    ) -> dict:
-        """
-        Returns current service status.
-        """
+    ) -> dict[str, Any]:
 
         return {
-
-            "trainer": self.trainer.__class__.__name__,
-
-            "analyzer": self.analyzer.__class__.__name__,
-
-            "leaderboard": self.leaderboard_engine.__class__.__name__,
-
+            "trainer": (
+                self.trainer.__class__.__name__
+            ),
             "model_directory": str(
-
-                self.model_directory,
-
+                self.model_directory
             ),
-
             "auto_save_best_model": (
-
                 self.config.auto_save_best_model
-
             ),
-
+            "trainer_task_configuration": (
+                self.trainer.config.task.value
+                if isinstance(
+                    self.trainer.config.task,
+                    AutoMLTask,
+                )
+                else str(
+                    self.trainer.config.task
+                )
+            ),
         }
-        ######################################################
-    # Service Metadata
-    ######################################################
+
+    # ============================================================
+    # METADATA
+    # ============================================================
 
     @staticmethod
-    def metadata() -> dict:
-        """
-        Returns service metadata.
-        """
+    def metadata() -> dict[str, Any]:
 
         return {
+            "name":
+                "NxZen AI Studio AutoML Service",
 
-            "name": "NxZen AI Studio AutoML Service",
-
-            "version": "1.0.0",
+            "version":
+                "3.0.0",
 
             "components": [
-
                 "trainer",
-
-                "leaderboard",
-
-                "analyzer",
-
+                "preprocessing",
+                "algorithms",
+                "model_artifact",
             ],
 
             "supported_tasks": [
-
                 "classification",
-
                 "regression",
-
+                "clustering",
+                "anomaly",
+                "dimensionality",
             ],
 
+            "auto_mode": {
+                "with_target":
+                    "classification_or_regression",
+                "without_target":
+                    "clustering",
+            },
         }
 
-    ######################################################
-    # Version
-    ######################################################
+    # ============================================================
+    # VERSION
+    # ============================================================
 
     @staticmethod
     def version() -> str:
-        """
-        Returns service version.
-        """
+        return "3.0.0"
 
-        return "1.0.0"
-
-    ######################################################
-    # Reset Service
-    ######################################################
+    # ============================================================
+    # RESET
+    # ============================================================
 
     def reset(self) -> None:
         """
-        Reinitializes all service components.
+        Reset the trainer instance.
+
+        This does not mutate global state.
         """
 
         self.trainer = AutoMLTrainer(
-
-            self.config.trainer_config,
-
+            self.config.trainer_config
         )
 
-        self.analyzer = AutoMLAnalyzer(
+    # ============================================================
+    # INFORMATION
+    # ============================================================
 
-            self.config.analyzer_config,
+    def information(
+        self,
+    ) -> dict[str, Any]:
 
+        return _json_safe(
+            {
+                "metadata":
+                    self.metadata(),
+
+                "status":
+                    self.status(),
+
+                "health":
+                    self.health(),
+
+                "trainer_information":
+                    self.trainer.information(),
+
+                "saved_models":
+                    self.list_models(),
+            }
         )
 
-        self.leaderboard_engine = LeaderboardEngine(
-
-            self.config.leaderboard_config,
-
-        )
-
-    ######################################################
-    # Service Information
-    ######################################################
-
-    def information(self) -> dict:
-        """
-        Returns complete service information.
-        """
-
-        return {
-
-            "metadata": self.metadata(),
-
-            "status": self.status(),
-
-            "health": self.health(),
-
-            "saved_models": self.list_models(),
-
-        }
-
-    ######################################################
-    # String Representation
-    ######################################################
+    # ============================================================
+    # REPR
+    # ============================================================
 
     def __repr__(self) -> str:
 
         return (
-
             f"{self.__class__.__name__}"
-
             f"(models={len(self.list_models())}, "
-
-            f"auto_save_best_model={self.config.auto_save_best_model})"
-
+            f"auto_save_best_model="
+            f"{self.config.auto_save_best_model})"
         )
 
-    ######################################################
-    # Length
-    ######################################################
+    # ============================================================
+    # LENGTH
+    # ============================================================
 
     def __len__(self) -> int:
-        """
-        Returns the number of saved models.
-        """
 
         return len(
-
-            self.list_models(),
-
+            self.list_models()
         )
-##########################################################
-# Public API
-##########################################################
+
+
+# ================================================================
+# PUBLIC API
+# ================================================================
+
 
 __all__ = [
-
     "AutoMLServiceConfig",
-
     "AutoMLService",
-
 ]
-

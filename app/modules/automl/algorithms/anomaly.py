@@ -1,604 +1,351 @@
 """
 NxZen AI Studio
-
-Anomaly Detection Algorithms
-
-Enterprise anomaly detection algorithms
-supported by NxZen AutoML.
-
-Responsibilities
-----------------
-• Train anomaly detection algorithms
-• Detect outliers
-• Evaluate models
-• Handle failures gracefully
-• Return standardized results
+AutoML Anomaly Detection
 """
 
 from __future__ import annotations
 
 import time
-
-from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any
 
 import numpy as np
 
-##########################################################
-# Models
-##########################################################
-
 from sklearn.ensemble import IsolationForest
-
+from sklearn.neighbors import LocalOutlierFactor
 from sklearn.svm import OneClassSVM
 
-from sklearn.neighbors import LocalOutlierFactor
-
-from sklearn.covariance import EllipticEnvelope
-
 from app.modules.automl.constants import (
-
     DEFAULT_RANDOM_STATE,
-
+    DEFAULT_TIMEOUT_SECONDS,
+    ModelStatus,
 )
-##########################################################
-# Result Object
-##########################################################
+from app.modules.automl.models import AnomalyResult
 
-@dataclass
-class AnomalyModelResult:
-    """
-    Standard result for anomaly detection.
-    """
 
-    model_name: str
-
-    model: Any | None
-
-    outlier_count: int
-
-    outlier_ratio: float
-
-    decision_score_mean: float | None
-
-    labels: Any | None
-
-    training_time: float
-
-    success: bool
-
-    error: str | None = None
-##########################################################
+# ------------------------------------------------------------------
 # Registry
-##########################################################
+# ------------------------------------------------------------------
 
-ANOMALY_MODELS: dict[str, Callable] = {}
-
-
-def register_model(name: str):
-
-    def wrapper(func):
-
-        ANOMALY_MODELS[name] = func
-
-        return func
-
-    return wrapper
-##########################################################
-# Metrics
-##########################################################
-
-def calculate_metrics(
-
-    labels,
-
-    scores=None,
-
-):
-
-    labels = np.asarray(labels)
-
-    ######################################################
-    # sklearn anomaly detectors:
-    #
-    # 1 = Inlier
-    # -1 = Outlier
-    ######################################################
-
-    outliers = np.sum(
-
-        labels == -1
-
-    )
-
-    ratio = outliers / len(labels)
-
-    score = None
-
-    if scores is not None:
-
-        score = float(
-
-            np.mean(scores)
-
-        )
+def anomaly_registry(
+    *,
+    random_state: int = DEFAULT_RANDOM_STATE,
+) -> dict[str, Any]:
 
     return {
-
-        "outlier_count": int(outliers),
-
-        "outlier_ratio": round(ratio, 4),
-
-        "decision_score_mean": (
-
-            None
-
-            if score is None
-
-            else round(score, 4)
-
+        "isolation_forest": IsolationForest(
+            n_estimators=200,
+            contamination="auto",
+            random_state=random_state,
+            n_jobs=1,
         ),
 
+        "local_outlier_factor": LocalOutlierFactor(
+            n_neighbors=20,
+            contamination="auto",
+            novelty=True,
+            n_jobs=1,
+        ),
+
+        "one_class_svm": OneClassSVM(
+            kernel="rbf",
+            gamma="scale",
+            nu=0.05,
+        ),
     }
-##########################################################
-# Generic Trainer
-##########################################################
 
-def train_detector(
 
-    *,
+# ------------------------------------------------------------------
+# Safe training
+# ------------------------------------------------------------------
 
+def safe_train_anomaly(
     model_name: str,
+    model: Any,
+    X: Any,
+    *,
+    timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
+) -> AnomalyResult:
 
-    model,
-
-    X,
-
-) -> AnomalyModelResult:
-
-    ######################################################
-    # LocalOutlierFactor
-    ######################################################
-
-    if isinstance(
-
-        model,
-
-        LocalOutlierFactor,
-
-    ):
-
-        labels = model.fit_predict(
-
-            X,
-
-        )
-
-        scores = None
-
-    ######################################################
-    # Other Models
-    ######################################################
-
-    else:
-
-        model.fit(
-
-            X,
-
-        )
-
-        labels = model.predict(
-
-            X,
-
-        )
-
-        scores = None
-
-        if hasattr(
-
-            model,
-
-            "decision_function",
-
-        ):
-
-            try:
-
-                scores = model.decision_function(
-
-                    X,
-
-                )
-
-            except Exception:
-
-                pass
-
-    metrics = calculate_metrics(
-
-        labels,
-
-        scores,
-
-    )
-
-    return AnomalyModelResult(
-
-        model_name=model_name,
-
-        model=model,
-
-        outlier_count=metrics["outlier_count"],
-
-        outlier_ratio=metrics["outlier_ratio"],
-
-        decision_score_mean=metrics["decision_score_mean"],
-
-        labels=labels,
-
-        training_time=0,
-
-        success=True,
-
-    )
-##########################################################
-# Safe Trainer
-##########################################################
-
-def safe_train(
-
-    model_name,
-
-    trainer,
-
-):
+    start = time.perf_counter()
 
     try:
 
-        start = time.perf_counter()
+        if X is None:
+            raise ValueError(
+                "Anomaly detection input cannot be None."
+            )
 
-        result = trainer()
+        if getattr(X, "shape", (0, 0))[0] < 2:
+            raise ValueError(
+                "At least 2 samples are required for anomaly detection."
+            )
 
-        result.training_time = round(
+        model.fit(X)
 
-            time.perf_counter()-start,
+        labels = model.predict(X)
 
-            4,
+        if hasattr(
+            model,
+            "decision_function",
+        ):
+            scores = model.decision_function(X)
 
+        elif hasattr(
+            model,
+            "score_samples",
+        ):
+            scores = model.score_samples(X)
+
+        else:
+            scores = np.zeros(
+                len(labels),
+                dtype=float,
+            )
+
+        labels_array = np.asarray(
+            labels
         )
 
-        result.success = True
+        scores_array = np.asarray(
+            scores,
+            dtype=float,
+        )
+
+        outlier_count = int(
+            np.sum(
+                labels_array == -1
+            )
+        )
+
+        outlier_ratio = float(
+            outlier_count / len(labels_array)
+        )
+
+        finite_scores = scores_array[
+            np.isfinite(scores_array)
+        ]
+
+        decision_score_mean = (
+            float(
+                np.mean(finite_scores)
+            )
+            if finite_scores.size
+            else None
+        )
+
+        elapsed = (
+            time.perf_counter()
+            - start
+        )
+
+        if (
+            timeout_seconds > 0
+            and elapsed > timeout_seconds
+        ):
+            return AnomalyResult(
+                model_name=model_name,
+                model=None,
+                training_time=float(elapsed),
+                success=False,
+                status=ModelStatus.TIMEOUT,
+                error=(
+                    "Training and evaluation exceeded "
+                    "the configured runtime threshold."
+                ),
+            )
+
+        return AnomalyResult(
+            model_name=model_name,
+            model=model,
+            training_time=float(elapsed),
+            success=True,
+            status=ModelStatus.SUCCESS,
+            outlier_count=outlier_count,
+            outlier_ratio=outlier_ratio,
+            decision_score_mean=decision_score_mean,
+            labels=labels_array.tolist(),
+            decision_scores=scores_array.tolist(),
+            inference_supported=True,
+        )
 
     except Exception as exc:
 
-        return AnomalyModelResult(
+        elapsed = (
+            time.perf_counter()
+            - start
+        )
 
+        return AnomalyResult(
             model_name=model_name,
-
             model=None,
-
-            outlier_count=0,
-
-            outlier_ratio=0,
-
-            decision_score_mean=None,
-
-            labels=None,
-
-            training_time=0,
-
+            training_time=float(elapsed),
             success=False,
-
-            error=f"{type(exc).__name__}: {exc}",
-
+            status=ModelStatus.FAILED,
+            error=(
+                f"{type(exc).__name__}: {exc}"
+            ),
         )
 
 
-def available_models():
-
-    return list(
-
-        ANOMALY_MODELS.keys()
-
-    )
-##########################################################
-# Isolation Forest
-##########################################################
-
-@register_model("Isolation Forest")
-def train_isolation_forest(
-    X,
-) -> AnomalyModelResult:
-    """
-    Isolation Forest.
-
-    Strengths
-    ---------
-    • Fast
-    • Excellent default anomaly detector
-    • Works on high-dimensional data
-    """
-
-    model = IsolationForest(
-
-        n_estimators=100,
-
-        contamination="auto",
-
-        random_state=DEFAULT_RANDOM_STATE,
-
-    )
-
-    return train_detector(
-
-        model_name="Isolation Forest",
-
-        model=model,
-
-        X=X,
-
-    )
-##########################################################
-# One-Class SVM
-##########################################################
-
-@register_model("One-Class SVM")
-def train_oneclass_svm(
-    X,
-) -> AnomalyModelResult:
-    """
-    One-Class Support Vector Machine.
-    """
-
-    model = OneClassSVM(
-
-        kernel="rbf",
-
-        gamma="scale",
-
-        nu=0.05,
-
-    )
-
-    return train_detector(
-
-        model_name="One-Class SVM",
-
-        model=model,
-
-        X=X,
-
-    )
-##########################################################
-# Local Outlier Factor
-##########################################################
-
-@register_model("Local Outlier Factor")
-def train_lof(
-    X,
-) -> AnomalyModelResult:
-    """
-    Local Outlier Factor.
-    """
-
-    model = LocalOutlierFactor(
-
-        n_neighbors=20,
-
-        contamination="auto",
-
-    )
-
-    return train_detector(
-
-        model_name="Local Outlier Factor",
-
-        model=model,
-
-        X=X,
-
-    )
-##########################################################
-# Elliptic Envelope
-##########################################################
-
-@register_model("Elliptic Envelope")
-def train_elliptic_envelope(
-    X,
-) -> AnomalyModelResult:
-    """
-    Elliptic Envelope.
-
-    Assumes Gaussian-distributed data.
-    """
-
-    model = EllipticEnvelope(
-
-        contamination=0.05,
-
-        random_state=DEFAULT_RANDOM_STATE,
-
-    )
-
-    return train_detector(
-
-        model_name="Elliptic Envelope",
-
-        model=model,
-
-        X=X,
-
-    )
-##########################################################
-# Anomaly Trainer
-##########################################################
+# ------------------------------------------------------------------
+# Train all
+# ------------------------------------------------------------------
 
 def train_anomaly_models(
-    X,
-) -> list[AnomalyModelResult]:
+    X: Any,
+    *,
+    random_state: int = DEFAULT_RANDOM_STATE,
+    excluded_algorithms: list[str] | None = None,
+    timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
+) -> list[AnomalyResult]:
 
-    results: list[AnomalyModelResult] = []
-
-    for model_name, trainer in ANOMALY_MODELS.items():
-
-        result = safe_train(
-
-            model_name,
-
-            lambda trainer=trainer: trainer(
-
-                X=X,
-
-            ),
-
+    if X is None:
+        raise ValueError(
+            "Anomaly detection input cannot be None."
         )
 
-        results.append(result)
+    excluded = {
+        str(value).strip().lower()
+        for value in (
+            excluded_algorithms or []
+        )
+    }
 
-    ##################################################
-    # Rank by lowest outlier ratio
-    ##################################################
-
-    results.sort(
-
-        key=lambda result: (
-
-            result.success,
-
-            -result.outlier_ratio,
-
-        ),
-
-        reverse=True,
-
+    registry = anomaly_registry(
+        random_state=random_state
     )
+
+    results: list[AnomalyResult] = []
+
+    for model_name, model in registry.items():
+
+        if model_name.lower() in excluded:
+
+            results.append(
+                AnomalyResult(
+                    model_name=model_name,
+                    success=False,
+                    status=ModelStatus.SKIPPED,
+                    skip_reason=(
+                        "Excluded by user configuration."
+                    ),
+                )
+            )
+
+            continue
+
+        results.append(
+            safe_train_anomaly(
+                model_name=model_name,
+                model=model,
+                X=X,
+                timeout_seconds=timeout_seconds,
+            )
+        )
 
     return results
 
-##########################################################
-# Alias
-##########################################################
 
-def best_model(
-    results: list[AnomalyModelResult],
-) -> AnomalyModelResult | None:
-    """
-    Alias used by AutoML Trainer.
-    """
-
-    return best_anomaly_model(
-        results,
-    )
-##########################################################
-# Best Model
-##########################################################
+# ------------------------------------------------------------------
+# Best
+# ------------------------------------------------------------------
 
 def best_anomaly_model(
-    results: list[AnomalyModelResult],
-) -> AnomalyModelResult | None:
+    results: list[AnomalyResult],
+) -> AnomalyResult | None:
 
-    if not results:
+    successful = [
+        result
+        for result in results
+        if result.success
+        and result.model is not None
+        and result.status == ModelStatus.SUCCESS
+    ]
 
+    if not successful:
         return None
 
-    return results[0]
-
-
-##########################################################
-# Successful Models
-##########################################################
-
-def successful_models(
-    results: list[AnomalyModelResult],
-):
-
-    return [
-
+    # There is no ground truth in unsupervised anomaly detection.
+    #
+    # Therefore we do NOT claim that 5% anomaly ratio means
+    # "better". We use stable score statistics and runtime only.
+    valid = [
         result
-
-        for result in results
-
-        if result.success
-
+        for result in successful
+        if result.decision_score_mean is not None
     ]
 
+    if valid:
+        return min(
+            valid,
+            key=lambda result: (
+                result.training_time
+                if result.training_time is not None
+                else np.inf
+            ),
+        )
 
-##########################################################
-# Failed Models
-##########################################################
+    return min(
+        successful,
+        key=lambda result: (
+            result.training_time
+            if result.training_time is not None
+            else np.inf
+        ),
+    )
 
-def failed_models(
-    results: list[AnomalyModelResult],
-):
 
-    return [
-
-        result
-
-        for result in results
-
-        if not result.success
-
-    ]
-##########################################################
+# ------------------------------------------------------------------
 # Leaderboard
-##########################################################
+# ------------------------------------------------------------------
 
-def leaderboard(
-    results: list[AnomalyModelResult],
-) -> list[dict]:
+def anomaly_leaderboard(
+    results: list[AnomalyResult],
+) -> list[dict[str, Any]]:
 
-    board = []
-
-    rank = 1
+    rows = []
 
     for result in results:
 
-        board.append({
+        rows.append(
+            {
+                "model": result.model_name,
+                "status": result.status.value,
+                "success": bool(result.success),
+                "training_time": result.training_time,
+                "outlier_count": result.outlier_count,
+                "outlier_ratio": result.outlier_ratio,
+                "decision_score_mean": (
+                    result.decision_score_mean
+                ),
+                "error": result.error,
+                "skip_reason": result.skip_reason,
+            }
+        )
 
-            "rank": rank,
+    rows.sort(
+        key=lambda row: (
+            1 if row["success"] else 0,
+            -(
+                row["training_time"]
+                if row["training_time"] is not None
+                else np.inf
+            ),
+        ),
+        reverse=True,
+    )
 
-            "model_name": result.model_name,
+    return rows
 
-            "outlier_count": result.outlier_count,
 
-            "outlier_ratio": result.outlier_ratio,
+leaderboard = anomaly_leaderboard
 
-            "decision_score_mean": result.decision_score_mean,
-
-            "training_time": result.training_time,
-
-            "success": result.success,
-
-            "error": result.error,
-
-        })
-
-        rank += 1
-
-    return board
-##########################################################
-# Public API
-##########################################################
 
 __all__ = [
-
-    "AnomalyModelResult",
-
-    "available_models",
-
+    "anomaly_registry",
+    "safe_train_anomaly",
     "train_anomaly_models",
-
     "best_anomaly_model",
-
-    "best_model",
-
-    "successful_models",
-
-    "failed_models",
-
+    "anomaly_leaderboard",
     "leaderboard",
-
 ]

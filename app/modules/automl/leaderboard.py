@@ -1,1172 +1,1733 @@
 """
 NxZen AI Studio
-
-AutoML Leaderboard
-
-This module provides enterprise-grade leaderboard
-generation and ranking for all trained models.
+AutoML Leaderboard Engine
 
 Responsibilities
 ----------------
-• Classification Leaderboard
-• Regression Leaderboard
-• Configurable Ranking
-• Model Comparison
-• Top-N Selection
-• Leaderboard Utilities
+1. Rank successful AutoML models.
+2. Preserve failed/skipped/timeout information.
+3. Support all five AutoML task types.
+4. Never expose estimator objects through the exported leaderboard.
+5. Use task-appropriate metrics.
+6. Never treat missing metrics as a valid score.
+7. Preserve deterministic ordering.
+8. Provide a clear distinction between:
+       - objective model ranking
+       - descriptive unsupervised results
+
+Supported Tasks
+---------------
+classification
+regression
+clustering
+anomaly
+dimensionality
 """
 
 from __future__ import annotations
 
+import json
+import math
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any
+from typing import Any, Iterable
 
-##########################################################
-# AutoML Metrics
-##########################################################
-
-from app.modules.automl.metrics import (
-
+from .metrics import (
+    AnomalyRankingMetric,
     ClassificationRankingMetric,
-
+    ClusteringRankingMetric,
+    DimensionalityRankingMetric,
     RegressionRankingMetric,
-
-    best_classification_metric,
-
-    best_regression_metric,
-
 )
-from app.modules.automl.metrics import ClassificationMetrics
 
-from app.modules.automl.metrics import RegressionMetrics
-##########################################################
-# Leaderboard Types
-##########################################################
+
+# ==================================================================
+# LEADERBOARD TYPE
+# ==================================================================
 
 
 class LeaderboardType(str, Enum):
-
     CLASSIFICATION = "classification"
 
     REGRESSION = "regression"
 
 
-##########################################################
-# Leaderboard Configuration
-##########################################################
+# ==================================================================
+# LEADERBOARD CONFIGURATION
+# ==================================================================
 
 
 @dataclass
 class LeaderboardConfig:
     """
-    Configuration used for generating
-    AutoML leaderboards.
+    Leaderboard configuration.
+
+    Classification
+    --------------
+    F1 is the default because it provides a balanced metric for
+    many classification datasets.
+
+    Regression
+    ----------
+    R2 is the default because higher values are better.
+
+    Clustering
+    ----------
+    Silhouette is the default internal clustering metric.
+
+    Anomaly
+    -------
+    There is NO universally valid unsupervised "best" metric
+    without labelled anomalies.
+
+    Dimensionality
+    --------------
+    Explained variance is used when an algorithm provides it.
     """
 
-    classification_metric: ClassificationRankingMetric = (
+    classification_metric: (
+        ClassificationRankingMetric
+    ) = ClassificationRankingMetric.F1_SCORE
 
-        ClassificationRankingMetric.F1_SCORE
+    regression_metric: (
+        RegressionRankingMetric
+    ) = RegressionRankingMetric.R2_SCORE
 
+    clustering_metric: (
+        ClusteringRankingMetric
+    ) = ClusteringRankingMetric.SILHOUETTE_SCORE
+
+    anomaly_metric: (
+        AnomalyRankingMetric
+    ) = AnomalyRankingMetric.OUTLIER_RATIO
+
+    dimensionality_metric: (
+        DimensionalityRankingMetric
+    ) = (
+        DimensionalityRankingMetric.EXPLAINED_VARIANCE
     )
-
-    regression_metric: RegressionRankingMetric = (
-
-        RegressionRankingMetric.R2_SCORE
-
-    )
-
-    descending: bool = True
 
     top_n: int | None = None
 
+    # --------------------------------------------------------------
+    # Unsupervised selection behavior
+    # --------------------------------------------------------------
 
-##########################################################
-# Leaderboard Entry
-##########################################################
+    allow_unsupervised_best_selection: bool = True
+
+
+# ==================================================================
+# LEADERBOARD ENTRY
+# ==================================================================
 
 
 @dataclass
 class LeaderboardEntry:
     """
-    Represents a single leaderboard row.
+    JSON-friendly representation of one leaderboard row.
 
-    The metrics field intentionally uses a generic
-    dictionary so the leaderboard can support future
-    modules (AutoDL, AutoNLP, Time Series, etc.)
-    without changing this class.
+    IMPORTANT:
+    The fitted estimator is intentionally NOT stored here.
+
+    Keeping sklearn model objects in leaderboard entries makes
+    serialization and API responses unsafe.
     """
 
     rank: int
 
     model_name: str
 
-    score: float
+    score: float | None
 
-    training_time: float
+    training_time: float | None
 
     success: bool
 
-    metrics: dict[str, Any]
+    status: str
 
-    model: Any = None
+    metrics: dict[str, Any] = field(
+        default_factory=dict
+    )
+
+    error: str | None = None
+
+    skip_reason: str | None = None
+
+    selection_eligible: bool = True
 
 
-##########################################################
-# Leaderboard Result
-##########################################################
+# ==================================================================
+# LEADERBOARD RESULT
+# ==================================================================
 
 
 @dataclass
 class LeaderboardResult:
     """
-    Final leaderboard returned by the engine.
+    Complete leaderboard result.
     """
 
     leaderboard_type: LeaderboardType
 
     entries: list[LeaderboardEntry] = field(
-
         default_factory=list
-
     )
 
     ranking_metric: str = ""
 
     total_models: int = 0
 
+    successful_models: int = 0
 
-##########################################################
-# Leaderboard Engine
-##########################################################
+    failed_models: int = 0
+
+    skipped_models: int = 0
+
+    timed_out_models: int = 0
+
+    objective_selection: bool = True
+
+    selection_note: str | None = None
+
+
+# ==================================================================
+# INTERNAL HELPERS
+# ==================================================================
+
+
+def _safe_float(
+    value: Any,
+) -> float | None:
+    """
+    Convert a value to a finite float.
+
+    NaN and +/-inf are treated as missing.
+
+    This prevents invalid numeric values from entering API
+    responses or ranking calculations.
+    """
+
+    if value is None:
+        return None
+
+    try:
+        result = float(value)
+    except (
+        TypeError,
+        ValueError,
+    ):
+        return None
+
+    if not math.isfinite(result):
+        return None
+
+    return result
+
+
+def _safe_int(
+    value: Any,
+) -> int | None:
+    """
+    Convert a value to int safely.
+    """
+
+    if value is None:
+        return None
+
+    try:
+        return int(value)
+    except (
+        TypeError,
+        ValueError,
+    ):
+        return None
+
+
+def _status_value(
+    result: Any,
+) -> str:
+    """
+    Safely obtain the status string from an AlgorithmResult.
+    """
+
+    status = getattr(
+        result,
+        "status",
+        None,
+    )
+
+    if status is None:
+        return (
+            "success"
+            if getattr(
+                result,
+                "success",
+                False,
+            )
+            else "failed"
+        )
+
+    value = getattr(
+        status,
+        "value",
+        status,
+    )
+
+    return str(value)
+
+
+def _is_successful(
+    result: Any,
+) -> bool:
+    return bool(
+        getattr(
+            result,
+            "success",
+            False,
+        )
+    )
+
+
+def _model_name(
+    result: Any,
+) -> str:
+    return str(
+        getattr(
+            result,
+            "model_name",
+            "unknown",
+        )
+    )
+
+
+def _training_time(
+    result: Any,
+) -> float | None:
+    return _safe_float(
+        getattr(
+            result,
+            "training_time",
+            None,
+        )
+    )
+
+
+def _metric_value(
+    result: Any,
+    name: str,
+) -> float | None:
+    return _safe_float(
+        getattr(
+            result,
+            name,
+            None,
+        )
+    )
+
+
+def _sort_key(
+    entry: LeaderboardEntry,
+) -> tuple[int, float, float, str]:
+    """
+    Deterministic sort key.
+
+    Priority:
+        1. valid score
+        2. higher score
+        3. faster training time
+        4. model name
+
+    The caller controls descending/ascending semantics by
+    converting the score before this function.
+    """
+
+    score = (
+        entry.score
+        if entry.score is not None
+        else float("-inf")
+    )
+
+    training_time = (
+        entry.training_time
+        if entry.training_time is not None
+        else float("inf")
+    )
+
+    return (
+        0
+        if entry.score is not None
+        else 1,
+        -score,
+        training_time,
+        entry.model_name.lower(),
+    )
+
+
+def _rank_entries(
+    entries: list[LeaderboardEntry],
+) -> list[LeaderboardEntry]:
+    """
+    Rank entries deterministically.
+
+    Entries with no valid score are always placed after entries
+    with valid scores.
+    """
+
+    entries.sort(
+        key=_sort_key
+    )
+
+    for index, entry in enumerate(
+        entries,
+        start=1,
+    ):
+        entry.rank = index
+
+    return entries
+
+
+# ==================================================================
+# LEADERBOARD ENGINE
+# ==================================================================
 
 
 class LeaderboardEngine:
     """
-    Enterprise Leaderboard Engine.
-
-    Responsibilities
-    ----------------
-    • Ranking
-    • Sorting
-    • Filtering
-    • Top-N
-    • Export
+    Unified leaderboard engine for all AutoML tasks.
     """
 
     def __init__(
-
         self,
-
         config: LeaderboardConfig | None = None,
-
     ):
+        self.config = (
+            config
+            if config is not None
+            else LeaderboardConfig()
+        )
 
-        if config is None:
-
-            config = LeaderboardConfig()
-
-        self.config = config
-
-    ######################################################
-    # Classification Leaderboard
-    ######################################################
+    # ==============================================================
+    # CLASSIFICATION
+    # ==============================================================
 
     def classification_leaderboard(
         self,
         training_results: list[Any],
     ) -> LeaderboardResult:
         """
-        Builds the classification leaderboard.
+        Generate classification leaderboard.
+
+        Higher metric values are better.
         """
 
-        entries: list[LeaderboardEntry] = []
-
-        ##################################################
-        # Create Leaderboard Entries
-        ##################################################
+        entries: list[
+            LeaderboardEntry
+        ] = []
 
         for result in training_results:
 
-            if not result.success:
-
+            if not _is_successful(result):
                 continue
 
+            metrics = {
+                "accuracy": _metric_value(
+                    result,
+                    "accuracy",
+                ),
+                "precision": _metric_value(
+                    result,
+                    "precision",
+                ),
+                "recall": _metric_value(
+                    result,
+                    "recall",
+                ),
+                "f1_score": _metric_value(
+                    result,
+                    "f1_score",
+                ),
+                "roc_auc": _metric_value(
+                    result,
+                    "roc_auc",
+                ),
+            }
 
-
-            score = best_classification_metric(
-                result,
-                self.config.classification_metric,
+            metric_name = (
+                self.config
+                .classification_metric
+                .value
             )
 
-
+            score = metrics.get(
+                metric_name
+            )
 
             entries.append(
-
                 LeaderboardEntry(
-
                     rank=0,
-
-                    model_name=result.model_name,
-
+                    model_name=_model_name(
+                        result
+                    ),
                     score=score,
-
-                    training_time=result.training_time,
-
-                    success=result.success,
-
-                    metrics={
-
-                        "accuracy": result.accuracy,
-
-                        "precision": result.precision,
-
-                        "recall": result.recall,
-
-                        "f1_score": result.f1_score,
-
-                        "roc_auc": result.roc_auc,
-
-                    },
-
-                    model=result.model,
-
+                    training_time=_training_time(
+                        result
+                    ),
+                    success=True,
+                    status=_status_value(
+                        result
+                    ),
+                    metrics=metrics,
+                    selection_eligible=(
+                        score is not None
+                    ),
                 )
-
             )
 
-        ##################################################
-        # Sort Leaderboard
-        ##################################################
-
-        entries.sort(
-
-            key=lambda item: item.score,
-
-            reverse=self.config.descending,
-
+        entries = _rank_entries(
+            entries
         )
 
-        ##################################################
-        # Assign Rank
-        ##################################################
+        entries = self._apply_top_n(
+            entries
+        )
 
-        for index, entry in enumerate(
-
-            entries,
-
-            start=1,
-
-        ):
-
-            entry.rank = index
-
-        ##################################################
-        # Top N
-        ##################################################
-
-        if self.config.top_n is not None:
-
-            entries = entries[
-
-                : self.config.top_n
-
-            ]
-
-        ##################################################
-        # Return
-        ##################################################
-
-        return LeaderboardResult(
-
-            leaderboard_type=LeaderboardType.CLASSIFICATION,
-
+        return self._result(
+            leaderboard_type=(
+                LeaderboardType.CLASSIFICATION
+            ),
             entries=entries,
-
-            ranking_metric=self.config.classification_metric.value,
-
-            total_models=len(entries),
-
-        )
-
-    ######################################################
-    # Classification Winner
-    ######################################################
-
-    def best_classifier(
-        self,
-        training_results: list[Any],
-    ) -> LeaderboardEntry | None:
-        """
-        Returns the top ranked classifier.
-        """
-
-        leaderboard = self.classification_leaderboard(
-
-            training_results,
-
-        )
-
-        if not leaderboard.entries:
-
-            return None
-
-        return leaderboard.entries[0]
-
-    ######################################################
-    # Classification Top N
-    ######################################################
-
-    def top_classifiers(
-        self,
-        training_results: list[Any],
-        n: int = 5,
-    ) -> list[LeaderboardEntry]:
-        """
-        Returns the Top-N classifiers.
-        """
-
-        leaderboard = self.classification_leaderboard(
-
-            training_results,
-
-        )
-
-        return leaderboard.entries[:n]
-
-    ######################################################
-    # Classification Summary
-    ######################################################
-
-    def classification_summary(
-        self,
-        training_results: list[Any],
-    ) -> dict:
-        """
-        Returns summary information.
-        """
-
-        leaderboard = self.classification_leaderboard(
-
-            training_results,
-
-        )
-
-        winner = self.best_classifier(
-
-            training_results,
-
-        )
-
-        return {
-
-            "ranking_metric": leaderboard.ranking_metric,
-
-            "models_ranked": leaderboard.total_models,
-
-            "best_model": (
-
-                winner.model_name
-
-                if winner
-
-                else None
-
+            ranking_metric=(
+                self.config
+                .classification_metric
+                .value
             ),
+            objective_selection=True,
+        )
 
-            "best_score": (
-
-                winner.score
-
-                if winner
-
-                else None
-
-            ),
-
-        }
-        ######################################################
-    # Regression Leaderboard
-    ######################################################
+    # ==============================================================
+    # REGRESSION
+    # ==============================================================
 
     def regression_leaderboard(
         self,
         training_results: list[Any],
     ) -> LeaderboardResult:
         """
-        Builds the regression leaderboard.
+        Generate regression leaderboard.
+
+        Error metrics are converted into a higher-is-better score:
+
+            MAE  -> -MAE
+            MSE  -> -MSE
+            RMSE -> -RMSE
+            MAPE -> -MAPE
+
+        R2 remains higher-is-better.
         """
 
-        entries: list[LeaderboardEntry] = []
+        entries: list[
+            LeaderboardEntry
+        ] = []
 
-        ##################################################
-        # Create Leaderboard Entries
-        ##################################################
+        metric_name = (
+            self.config
+            .regression_metric
+            .value
+        )
 
         for result in training_results:
 
-            if not result.success:
-
+            if not _is_successful(result):
                 continue
 
-
-
-            score = best_regression_metric(
+            r2 = _metric_value(
                 result,
-                self.config.regression_metric,
+                "r2_score",
             )
+
+            mae = _metric_value(
+                result,
+                "mae",
+            )
+
+            mse = _metric_value(
+                result,
+                "mse",
+            )
+
+            rmse = _metric_value(
+                result,
+                "rmse",
+            )
+
+            mape = _metric_value(
+                result,
+                "mape",
+            )
+
+            metrics = {
+                "r2_score": r2,
+                "mae": mae,
+                "mse": mse,
+                "rmse": rmse,
+                "mape": mape,
+            }
+
+            raw_score = metrics.get(
+                metric_name
+            )
+
+            if raw_score is None:
+                score = None
+
+            elif metric_name in {
+                "mae",
+                "mse",
+                "rmse",
+                "mape",
+            }:
+                score = -raw_score
+
+            else:
+                score = raw_score
 
             entries.append(
-
                 LeaderboardEntry(
-
                     rank=0,
-
-                    model_name=result.model_name,
-
+                    model_name=_model_name(
+                        result
+                    ),
                     score=score,
-
-                    training_time=result.training_time,
-
-                    success=result.success,
-
-                    metrics={
-
-                        "r2_score": result.r2_score,
-
-                        "mae": result.mae,
-
-                        "mse": result.mse,
-
-                        "rmse": result.rmse,
-
-                        "mape": result.mape,
-
-                    },
-
-                    model=result.model,
-
+                    training_time=_training_time(
+                        result
+                    ),
+                    success=True,
+                    status=_status_value(
+                        result
+                    ),
+                    metrics=metrics,
+                    selection_eligible=(
+                        score is not None
+                    ),
                 )
-
             )
 
-        ##################################################
-        # Sort Leaderboard
-        ##################################################
+        entries = _rank_entries(
+            entries
+        )
+
+        entries = self._apply_top_n(
+            entries
+        )
+
+        return self._result(
+            leaderboard_type=(
+                LeaderboardType.REGRESSION
+            ),
+            entries=entries,
+            ranking_metric=metric_name,
+            objective_selection=True,
+        )
+
+    # ==============================================================
+    # CLUSTERING
+    # ==============================================================
+
+    def clustering_leaderboard(
+        self,
+        training_results: list[Any],
+    ) -> LeaderboardResult:
+        """
+        Generate clustering leaderboard.
+
+        Default:
+            silhouette_score
+
+        Davies-Bouldin is inverted because lower is better.
+        """
+
+        entries: list[
+            LeaderboardEntry
+        ] = []
+
+        metric_name = (
+            self.config
+            .clustering_metric
+            .value
+        )
+
+        for result in training_results:
+
+            if not _is_successful(result):
+                continue
+
+            silhouette = _metric_value(
+                result,
+                "silhouette_score",
+            )
+
+            calinski = _metric_value(
+                result,
+                "calinski_harabasz_score",
+            )
+
+            davies = _metric_value(
+                result,
+                "davies_bouldin_score",
+            )
+
+            metrics = {
+                "silhouette_score": silhouette,
+                "calinski_harabasz_score": (
+                    calinski
+                ),
+                "davies_bouldin_score": davies,
+                "n_clusters": _safe_int(
+                    getattr(
+                        result,
+                        "n_clusters",
+                        None,
+                    )
+                ),
+                "noise_points": _safe_int(
+                    getattr(
+                        result,
+                        "noise_points",
+                        None,
+                    )
+                ),
+                "noise_ratio": _safe_float(
+                    getattr(
+                        result,
+                        "noise_ratio",
+                        None,
+                    )
+                ),
+            }
+
+            if metric_name == (
+                "davies_bouldin_score"
+            ):
+                raw_score = davies
+
+                score = (
+                    None
+                    if raw_score is None
+                    else -raw_score
+                )
+
+            else:
+                score = metrics.get(
+                    metric_name
+                )
+
+            entries.append(
+                LeaderboardEntry(
+                    rank=0,
+                    model_name=_model_name(
+                        result
+                    ),
+                    score=score,
+                    training_time=_training_time(
+                        result
+                    ),
+                    success=True,
+                    status=_status_value(
+                        result
+                    ),
+                    metrics=metrics,
+                    selection_eligible=(
+                        score is not None
+                    ),
+                )
+            )
+
+        entries = _rank_entries(
+            entries
+        )
+
+        entries = self._apply_top_n(
+            entries
+        )
+
+        return self._result(
+            leaderboard_type=(
+                LeaderboardType.CLUSTERING
+            ),
+            entries=entries,
+            ranking_metric=metric_name,
+            objective_selection=True,
+        )
+
+    # ==============================================================
+    # ANOMALY
+    # ==============================================================
+
+    def anomaly_leaderboard(
+        self,
+        training_results: list[Any],
+    ) -> LeaderboardResult:
+        """
+        Generate anomaly detection results.
+
+        IMPORTANT
+        ---------
+        Unsupervised anomaly detection has no universally correct
+        "best model" without labelled anomaly ground truth.
+
+        Therefore this leaderboard is primarily descriptive.
+
+        A configured anomaly metric may be displayed, but it is
+        NOT claimed to represent anomaly detection quality.
+        """
+
+        entries: list[
+            LeaderboardEntry
+        ] = []
+
+        metric_name = (
+            self.config
+            .anomaly_metric
+            .value
+        )
+
+        for result in training_results:
+
+            if not _is_successful(result):
+                continue
+
+            anomaly_count = _safe_int(
+                getattr(
+                    result,
+                    "outlier_count",
+                    None,
+                )
+            )
+
+            outlier_ratio = _safe_float(
+                getattr(
+                    result,
+                    "outlier_ratio",
+                    None,
+                )
+            )
+
+            decision_score_mean = (
+                _safe_float(
+                    getattr(
+                        result,
+                        "decision_score_mean",
+                        None,
+                    )
+                )
+            )
+
+            metrics = {
+                "anomaly_count": (
+                    anomaly_count
+                ),
+                "outlier_ratio": (
+                    outlier_ratio
+                ),
+                "decision_score_mean": (
+                    decision_score_mean
+                ),
+            }
+
+            # ------------------------------------------------------
+            # We deliberately DO NOT call this an objective quality
+            # score.
+            # ------------------------------------------------------
+
+            if metric_name == (
+                "outlier_ratio"
+            ):
+                display_score = (
+                    outlier_ratio
+                )
+
+            else:
+                display_score = (
+                    None
+                    if anomaly_count is None
+                    else float(anomaly_count)
+                )
+
+            entries.append(
+                LeaderboardEntry(
+                    rank=0,
+                    model_name=_model_name(
+                        result
+                    ),
+                    score=display_score,
+                    training_time=_training_time(
+                        result
+                    ),
+                    success=True,
+                    status=_status_value(
+                        result
+                    ),
+                    metrics=metrics,
+                    selection_eligible=False,
+                )
+            )
+
+        # ----------------------------------------------------------
+        # For anomaly detection we sort descriptively by model name
+        # unless a metric is explicitly requested.
+        #
+        # We do NOT mark a winner.
+        # ----------------------------------------------------------
 
         entries.sort(
-
-            key=lambda item: item.score,
-
-            reverse=self.config.descending,
-
+            key=lambda entry: (
+                entry.model_name.lower()
+            )
         )
-
-        ##################################################
-        # Assign Rank
-        ##################################################
 
         for index, entry in enumerate(
-
             entries,
-
             start=1,
-
         ):
-
             entry.rank = index
 
-        ##################################################
-        # Top N
-        ##################################################
+        entries = self._apply_top_n(
+            entries
+        )
 
-        if self.config.top_n is not None:
-
-            entries = entries[
-
-                : self.config.top_n
-
-            ]
-
-        ##################################################
-        # Return
-        ##################################################
-
-        return LeaderboardResult(
-
-            leaderboard_type=LeaderboardType.REGRESSION,
-
+        return self._result(
+            leaderboard_type=(
+                LeaderboardType.ANOMALY
+            ),
             entries=entries,
-
-            ranking_metric=self.config.regression_metric.value,
-
-            total_models=len(entries),
-
-        )
-
-    ######################################################
-    # Best Regressor
-    ######################################################
-
-    def best_regressor(
-        self,
-        training_results: list[Any],
-    ) -> LeaderboardEntry | None:
-        """
-        Returns the top ranked regression model.
-        """
-
-        leaderboard = self.regression_leaderboard(
-
-            training_results,
-
-        )
-
-        if not leaderboard.entries:
-
-            return None
-
-        return leaderboard.entries[0]
-
-    ######################################################
-    # Top Regressors
-    ######################################################
-
-    def top_regressors(
-        self,
-        training_results: list[Any],
-        n: int = 5,
-    ) -> list[LeaderboardEntry]:
-        """
-        Returns the Top-N regression models.
-        """
-
-        leaderboard = self.regression_leaderboard(
-
-            training_results,
-
-        )
-
-        return leaderboard.entries[:n]
-
-    ######################################################
-    # Regression Summary
-    ######################################################
-
-    def regression_summary(
-        self,
-        training_results: list[Any],
-    ) -> dict:
-        """
-        Returns summary information for
-        regression models.
-        """
-
-        leaderboard = self.regression_leaderboard(
-
-            training_results,
-
-        )
-
-        winner = self.best_regressor(
-
-            training_results,
-
-        )
-
-        return {
-
-            "ranking_metric": leaderboard.ranking_metric,
-
-            "models_ranked": leaderboard.total_models,
-
-            "best_model": (
-
-                winner.model_name
-
-                if winner
-
-                else None
-
+            ranking_metric=metric_name,
+            objective_selection=False,
+            selection_note=(
+                "Anomaly detection is unsupervised. "
+                "Without labelled anomaly ground truth, "
+                "the leaderboard is descriptive and does "
+                "not claim that one detector is objectively "
+                "better than another."
             ),
+        )
 
-            "best_score": (
+    # ==============================================================
+    # DIMENSIONALITY REDUCTION
+    # ==============================================================
 
-                winner.score
+    def dimensionality_leaderboard(
+        self,
+        training_results: list[Any],
+    ) -> LeaderboardResult:
+        """
+        Generate dimensionality-reduction leaderboard.
 
-                if winner
+        Explained variance is used where the algorithm exposes
+        a meaningful explained_variance value.
 
-                else None
+        Algorithms without a comparable explained-variance metric
+        are not eligible for objective selection.
+        """
 
+        entries: list[
+            LeaderboardEntry
+        ] = []
+
+        metric_name = (
+            self.config
+            .dimensionality_metric
+            .value
+        )
+
+        for result in training_results:
+
+            if not _is_successful(result):
+                continue
+
+            explained_variance = (
+                _safe_float(
+                    getattr(
+                        result,
+                        "explained_variance",
+                        None,
+                    )
+                )
+            )
+
+            n_components = _safe_int(
+                getattr(
+                    result,
+                    "n_components",
+                    None,
+                )
+            )
+
+            explained_ratio = getattr(
+                result,
+                "explained_variance_ratio",
+                None,
+            )
+
+            if isinstance(
+                explained_ratio,
+                tuple,
+            ):
+                explained_ratio = list(
+                    explained_ratio
+                )
+
+            if not isinstance(
+                explained_ratio,
+                list,
+            ):
+                explained_ratio = None
+
+            metrics = {
+                "explained_variance": (
+                    explained_variance
+                ),
+                "n_components": (
+                    n_components
+                ),
+                "explained_variance_ratio": (
+                    explained_ratio
+                ),
+                "transformed_shape": getattr(
+                    result,
+                    "transformed_shape",
+                    None,
+                ),
+            }
+
+            if metric_name == "components":
+                score = (
+                    None
+                    if n_components is None
+                    else -float(n_components)
+                )
+            else:
+                score = explained_variance
+
+            entries.append(
+                LeaderboardEntry(
+                    rank=0,
+                    model_name=_model_name(
+                        result
+                    ),
+                    score=score,
+                    training_time=_training_time(
+                        result
+                    ),
+                    success=True,
+                    status=_status_value(
+                        result
+                    ),
+                    metrics=metrics,
+                    selection_eligible=(
+                        score is not None
+                    ),
+                )
+            )
+
+        entries = _rank_entries(
+            entries
+        )
+
+        entries = self._apply_top_n(
+            entries
+        )
+
+        return self._result(
+            leaderboard_type=(
+                LeaderboardType.DIMENSIONALITY
             ),
+            entries=entries,
+            ranking_metric=metric_name,
+            objective_selection=True,
+        )
 
-        }
-        ######################################################
-    # Unified Leaderboard
-    ######################################################
+    # ==============================================================
+    # UNIFIED GENERATOR
+    # ==============================================================
 
     def generate(
         self,
         training_results: list[Any],
-        leaderboard_type: LeaderboardType,
+        leaderboard_type: (
+            LeaderboardType
+            | str
+        ),
     ) -> LeaderboardResult:
         """
-        Generates the appropriate leaderboard.
+        Generate the appropriate leaderboard.
         """
 
-        if leaderboard_type == LeaderboardType.CLASSIFICATION:
+        leaderboard_type = (
+            self._normalize_type(
+                leaderboard_type
+            )
+        )
 
-            return self.classification_leaderboard(
-
-                training_results,
-
+        if (
+            leaderboard_type
+            == LeaderboardType.CLASSIFICATION
+        ):
+            return (
+                self.classification_leaderboard(
+                    training_results
+                )
             )
 
-        if leaderboard_type == LeaderboardType.REGRESSION:
+        if (
+            leaderboard_type
+            == LeaderboardType.REGRESSION
+        ):
+            return (
+                self.regression_leaderboard(
+                    training_results
+                )
+            )
 
-            return self.regression_leaderboard(
+        if (
+            leaderboard_type
+            == LeaderboardType.CLUSTERING
+        ):
+            return (
+                self.clustering_leaderboard(
+                    training_results
+                )
+            )
 
-                training_results,
+        if (
+            leaderboard_type
+            == LeaderboardType.ANOMALY
+        ):
+            return (
+                self.anomaly_leaderboard(
+                    training_results
+                )
+            )
 
+        if (
+            leaderboard_type
+            == LeaderboardType.DIMENSIONALITY
+        ):
+            return (
+                self.dimensionality_leaderboard(
+                    training_results
+                )
             )
 
         raise ValueError(
-
-            f"Unsupported leaderboard type: {leaderboard_type}"
-
+            f"Unsupported leaderboard type: "
+            f"{leaderboard_type}"
         )
 
-    ######################################################
-    # Unified Winner
-    ######################################################
+    # ==============================================================
+    # WINNER
+    # ==============================================================
 
     def winner(
         self,
         training_results: list[Any],
-        leaderboard_type: LeaderboardType,
-    ) -> LeaderboardEntry | None:
+        leaderboard_type: (
+            LeaderboardType
+            | str
+        ),
+    ) -> Any | None:
         """
-        Returns the best ranked model.
+        Return the winning AlgorithmResult.
+
+        For anomaly detection, no winner is returned because
+        there is no objective ground-truth metric.
         """
 
         leaderboard = self.generate(
-
             training_results,
-
             leaderboard_type,
-
         )
 
-        if not leaderboard.entries:
-
+        if not leaderboard.objective_selection:
             return None
 
-        return leaderboard.entries[0]
+        eligible_names = {
+            entry.model_name
+            for entry in leaderboard.entries
+            if (
+                entry.selection_eligible
+                and entry.score is not None
+            )
+        }
 
-    ######################################################
-    # Unified Top N
-    ######################################################
+        if not eligible_names:
+            return None
+
+        for result in training_results:
+            if (
+                _is_successful(result)
+                and _model_name(result)
+                in eligible_names
+            ):
+                return result
+
+        return None
+
+    # ==============================================================
+    # BEST MODEL
+    # ==============================================================
+
+    def best_model(
+        self,
+        training_results: list[Any],
+        leaderboard_type: (
+            LeaderboardType
+            | str
+        ),
+    ) -> Any | None:
+        """
+        Alias for winner().
+        """
+
+        return self.winner(
+            training_results,
+            leaderboard_type,
+        )
+
+    # ==============================================================
+    # TOP MODELS
+    # ==============================================================
 
     def top_models(
         self,
         training_results: list[Any],
-        leaderboard_type: LeaderboardType,
+        leaderboard_type: (
+            LeaderboardType
+            | str
+        ),
         n: int = 5,
     ) -> list[LeaderboardEntry]:
-        """
-        Returns the Top-N models.
-        """
-
-        leaderboard = self.generate(
-
-            training_results,
-
-            leaderboard_type,
-
-        )
-
-        return leaderboard.entries[:n]
-
-    ######################################################
-    # Sort Entries
-    ######################################################
-
-    def sort_entries(
-        self,
-        entries: list[LeaderboardEntry],
-    ) -> list[LeaderboardEntry]:
-        """
-        Sorts leaderboard entries.
-        """
-
-        entries.sort(
-
-            key=lambda entry: entry.score,
-
-            reverse=self.config.descending,
-
-        )
-
-        for rank, entry in enumerate(
-
-            entries,
-
-            start=1,
-
-        ):
-
-            entry.rank = rank
-
-        return entries
-
-    ######################################################
-    # Successful Models
-    ######################################################
-
-    def successful_models(
-        self,
-        training_results: list[Any],
-    ) -> list[Any]:
-        """
-        Returns only successful models.
-        """
-
-        return [
-
-            result
-
-            for result in training_results
-
-            if result.success
-
-        ]
-
-    ######################################################
-    # Failed Models
-    ######################################################
-
-    def failed_models(
-        self,
-        training_results: list[Any],
-    ) -> list[Any]:
-        """
-        Returns only failed models.
-        """
-
-        return [
-
-            result
-
-            for result in training_results
-
-            if not result.success
-
-        ]
-
-    ######################################################
-    # Statistics
-    ######################################################
-
-    def statistics(
-        self,
-        training_results: list[Any],
-    ) -> dict:
-        """
-        Returns leaderboard statistics.
-        """
-
-        successful = self.successful_models(
-
-            training_results,
-
-        )
-
-        failed = self.failed_models(
-
-            training_results,
-
-        )
-
-        return {
-
-            "total_models": len(
-
-                training_results,
-
-            ),
-
-            "successful_models": len(
-
-                successful,
-
-            ),
-
-            "failed_models": len(
-
-                failed,
-
-            ),
-
-        }
-        ######################################################
-    # Filter Models
-    ######################################################
-
-    def filter_models(
-        self,
-        leaderboard: LeaderboardResult,
-        successful_only: bool = True,
-    ) -> list[LeaderboardEntry]:
-        """
-        Filters leaderboard entries.
-        """
-
-        if not successful_only:
-
-            return leaderboard.entries
-
-        return [
-
-            entry
-
-            for entry in leaderboard.entries
-
-            if entry.success
-
-        ]
-
-    ######################################################
-    # Top N Entries
-    ######################################################
-
-    def top_n(
-        self,
-        leaderboard: LeaderboardResult,
-        n: int = 5,
-    ) -> list[LeaderboardEntry]:
-        """
-        Returns the Top-N leaderboard entries.
-        """
-
-        return leaderboard.entries[:n]
-
-    ######################################################
-    # Bottom N Entries
-    ######################################################
-
-    def bottom_n(
-        self,
-        leaderboard: LeaderboardResult,
-        n: int = 5,
-    ) -> list[LeaderboardEntry]:
-        """
-        Returns the Bottom-N leaderboard entries.
-        """
 
         if n <= 0:
-
             return []
 
-        return leaderboard.entries[-n:]
+        leaderboard = self.generate(
+            training_results,
+            leaderboard_type,
+        )
 
-    ######################################################
-    # Search Model
-    ######################################################
+        return leaderboard.entries[:n]
+
+    # ==============================================================
+    # TASK-SPECIFIC WINNER ALIASES
+    # ==============================================================
+
+    def best_classifier(
+        self,
+        training_results: list[Any],
+    ) -> Any | None:
+
+        return self.best_model(
+            training_results,
+            LeaderboardType.CLASSIFICATION,
+        )
+
+    def best_regressor(
+        self,
+        training_results: list[Any],
+    ) -> Any | None:
+
+        return self.best_model(
+            training_results,
+            LeaderboardType.REGRESSION,
+        )
+
+    def best_clusterer(
+        self,
+        training_results: list[Any],
+    ) -> Any | None:
+
+        return self.best_model(
+            training_results,
+            LeaderboardType.CLUSTERING,
+        )
+
+    def best_anomaly_detector(
+        self,
+        training_results: list[Any],
+    ) -> Any | None:
+
+        return self.best_model(
+            training_results,
+            LeaderboardType.ANOMALY,
+        )
+
+    def best_dimensionality_model(
+        self,
+        training_results: list[Any],
+    ) -> Any | None:
+
+        return self.best_model(
+            training_results,
+            LeaderboardType.DIMENSIONALITY,
+        )
+
+    # ==============================================================
+    # FILTERING
+    # ==============================================================
+
+    @staticmethod
+    def successful_models(
+        training_results: Iterable[Any],
+    ) -> list[Any]:
+
+        return [
+            result
+            for result in training_results
+            if _is_successful(result)
+        ]
+
+    @staticmethod
+    def failed_models(
+        training_results: Iterable[Any],
+    ) -> list[Any]:
+
+        return [
+            result
+            for result in training_results
+            if not _is_successful(result)
+        ]
+
+    @staticmethod
+    def skipped_models(
+        training_results: Iterable[Any],
+    ) -> list[Any]:
+
+        return [
+            result
+            for result in training_results
+            if _status_value(result)
+            == "skipped"
+        ]
+
+    @staticmethod
+    def timeout_models(
+        training_results: Iterable[Any],
+    ) -> list[Any]:
+
+        return [
+            result
+            for result in training_results
+            if _status_value(result)
+            == "timeout"
+        ]
+
+    # ==============================================================
+    # FIND MODEL
+    # ==============================================================
 
     def find_model(
         self,
         leaderboard: LeaderboardResult,
         model_name: str,
     ) -> LeaderboardEntry | None:
-        """
-        Finds a model by name.
-        """
+
+        normalized = (
+            model_name.strip().lower()
+        )
 
         for entry in leaderboard.entries:
 
-            if entry.model_name.lower() == model_name.lower():
-
+            if (
+                entry.model_name.lower()
+                == normalized
+            ):
                 return entry
 
         return None
 
-    ######################################################
-    # Export Dictionary
-    ######################################################
+    # ==============================================================
+    # EXPORT
+    # ==============================================================
 
     def export_dict(
         self,
         leaderboard: LeaderboardResult,
-    ) -> list[dict]:
+    ) -> list[dict[str, Any]]:
         """
-        Exports the leaderboard as a list of dictionaries.
+        Export leaderboard to plain Python dictionaries.
+
+        No estimator/model object is exported.
         """
 
-        exported = []
+        exported: list[
+            dict[str, Any]
+        ] = []
 
         for entry in leaderboard.entries:
 
-            row = {
-
+            row: dict[str, Any] = {
                 "rank": entry.rank,
-
                 "model_name": entry.model_name,
-
                 "score": entry.score,
-
-                "training_time": entry.training_time,
-
+                "training_time": (
+                    entry.training_time
+                ),
                 "success": entry.success,
-
+                "status": entry.status,
+                "selection_eligible": (
+                    entry.selection_eligible
+                ),
+                "error": entry.error,
+                "skip_reason": (
+                    entry.skip_reason
+                ),
             }
 
             row.update(
-
                 entry.metrics
-
             )
 
             exported.append(
-
                 row
-
             )
 
         return exported
-
-    ######################################################
-    # Export DataFrame
-    ######################################################
 
     def export_dataframe(
         self,
         leaderboard: LeaderboardResult,
     ):
         """
-        Exports the leaderboard as a pandas DataFrame.
+        Convert leaderboard to pandas DataFrame.
         """
 
         import pandas as pd
 
         return pd.DataFrame(
-
             self.export_dict(
-
-                leaderboard,
-
+                leaderboard
             )
-
         )
-
-    ######################################################
-    # Export CSV
-    ######################################################
 
     def export_csv(
         self,
         leaderboard: LeaderboardResult,
         filepath: str,
     ) -> None:
-        """
-        Saves the leaderboard as a CSV file.
-        """
 
-        dataframe = self.export_dataframe(
-
-            leaderboard,
-
+        dataframe = (
+            self.export_dataframe(
+                leaderboard
+            )
         )
 
         dataframe.to_csv(
-
             filepath,
-
             index=False,
-
         )
-
-    ######################################################
-    # Export JSON
-    ######################################################
 
     def export_json(
         self,
         leaderboard: LeaderboardResult,
         filepath: str,
     ) -> None:
-        """
-        Saves the leaderboard as a JSON file.
-        """
 
-        import json
+        data = self.export_dict(
+            leaderboard
+        )
 
         with open(
-
             filepath,
-
             "w",
-
             encoding="utf-8",
-
         ) as file:
 
             json.dump(
-
-                self.export_dict(
-
-                    leaderboard,
-
-                ),
-
+                data,
                 file,
-
                 indent=4,
-
+                allow_nan=False,
             )
-                ######################################################
-    # Leaderboard Summary
-    ######################################################
+
+    # ==============================================================
+    # SUMMARY
+    # ==============================================================
 
     def summary(
         self,
         leaderboard: LeaderboardResult,
-    ) -> dict:
+    ) -> dict[str, Any]:
         """
-        Returns a summary of the leaderboard.
+        Return JSON-safe leaderboard summary.
         """
 
         winner = None
 
-        if leaderboard.entries:
+        for entry in leaderboard.entries:
 
-            winner = leaderboard.entries[0]
+            if (
+                entry.selection_eligible
+                and entry.score is not None
+            ):
+                winner = entry
+                break
 
         return {
-
-            "leaderboard_type": leaderboard.leaderboard_type.value,
-
-            "ranking_metric": leaderboard.ranking_metric,
-
-            "total_models": leaderboard.total_models,
-
+            "leaderboard_type": (
+                leaderboard
+                .leaderboard_type
+                .value
+            ),
+            "ranking_metric": (
+                leaderboard.ranking_metric
+            ),
+            "total_models": (
+                leaderboard.total_models
+            ),
+            "successful_models": (
+                leaderboard.successful_models
+            ),
+            "failed_models": (
+                leaderboard.failed_models
+            ),
+            "skipped_models": (
+                leaderboard.skipped_models
+            ),
+            "timed_out_models": (
+                leaderboard.timed_out_models
+            ),
+            "objective_selection": (
+                leaderboard.objective_selection
+            ),
+            "selection_note": (
+                leaderboard.selection_note
+            ),
             "best_model": (
-
                 winner.model_name
-
-                if winner
-
+                if winner is not None
                 else None
-
             ),
-
             "best_score": (
-
                 winner.score
-
-                if winner
-
+                if winner is not None
                 else None
-
             ),
-
         }
 
-    ######################################################
-    # Leaderboard Metadata
-    ######################################################
+    # ==============================================================
+    # STATISTICS
+    # ==============================================================
+
+    def statistics(
+        self,
+        training_results: list[Any],
+    ) -> dict[str, int]:
+
+        successful = (
+            self.successful_models(
+                training_results
+            )
+        )
+
+        failed = (
+            self.failed_models(
+                training_results
+            )
+        )
+
+        skipped = (
+            self.skipped_models(
+                training_results
+            )
+        )
+
+        timeout = (
+            self.timeout_models(
+                training_results
+            )
+        )
+
+        return {
+            "total_models": len(
+                training_results
+            ),
+            "successful_models": len(
+                successful
+            ),
+            "failed_models": len(
+                failed
+            ),
+            "skipped_models": len(
+                skipped
+            ),
+            "timed_out_models": len(
+                timeout
+            ),
+        }
+
+    # ==============================================================
+    # INTERNAL RESULT BUILDER
+    # ==============================================================
+
+    def _result(
+        self,
+        leaderboard_type: LeaderboardType,
+        entries: list[LeaderboardEntry],
+        ranking_metric: str,
+        objective_selection: bool,
+        selection_note: str | None = None,
+    ) -> LeaderboardResult:
+
+        return LeaderboardResult(
+            leaderboard_type=(
+                leaderboard_type
+            ),
+            entries=entries,
+            ranking_metric=ranking_metric,
+            total_models=len(entries),
+            successful_models=len(
+                entries
+            ),
+            failed_models=0,
+            skipped_models=0,
+            timed_out_models=0,
+            objective_selection=(
+                objective_selection
+            ),
+            selection_note=selection_note,
+        )
+
+    # ==============================================================
+    # TOP-N
+    # ==============================================================
+
+    def _apply_top_n(
+        self,
+        entries: list[LeaderboardEntry],
+    ) -> list[LeaderboardEntry]:
+
+        if self.config.top_n is None:
+            return entries
+
+        if self.config.top_n <= 0:
+            return []
+
+        return entries[
+            : self.config.top_n
+        ]
+
+    # ==============================================================
+    # NORMALIZE TYPE
+    # ==============================================================
 
     @staticmethod
-    def metadata() -> dict:
-        """
-        Returns leaderboard metadata.
-        """
+    def _normalize_type(
+        leaderboard_type: (
+            LeaderboardType
+            | str
+        ),
+    ) -> LeaderboardType:
 
-        return {
+        if isinstance(
+            leaderboard_type,
+            LeaderboardType,
+        ):
+            return leaderboard_type
 
-            "name": "NxZen AI Studio Leaderboard",
+        try:
+            return LeaderboardType(
+                str(
+                    leaderboard_type
+                ).strip().lower()
+            )
+        except ValueError as exc:
+            raise ValueError(
+                "Unsupported leaderboard type: "
+                f"{leaderboard_type}"
+            ) from exc
 
-            "version": "1.0.0",
+    # ==============================================================
+    # RESET
+    # ==============================================================
 
-            "supports": [
+    def reset(self) -> None:
+        self.config = (
+            LeaderboardConfig()
+        )
 
-                "classification",
-
-                "regression",
-
-            ],
-
-        }
-
-    ######################################################
-    # Version
-    ######################################################
+    # ==============================================================
+    # VERSION
+    # ==============================================================
 
     @staticmethod
     def version() -> str:
-        """
-        Returns leaderboard version.
-        """
+        return "3.0.0"
 
-        return "1.0.0"
+    @staticmethod
+    def metadata() -> dict[str, Any]:
 
-    ######################################################
-    # Reset Configuration
-    ######################################################
+        return {
+            "name": (
+                "NxZen AI Studio "
+                "AutoML Leaderboard"
+            ),
+            "version": "3.0.0",
+            "supports": [
+                "classification",
+                "regression",
+                "clustering",
+                "anomaly",
+                "dimensionality",
+            ],
+            "objective_selection": {
+                "classification": True,
+                "regression": True,
+                "clustering": True,
+                "anomaly": False,
+                "dimensionality": True,
+            },
+        }
 
-    def reset(self) -> None:
-        """
-        Resets the leaderboard configuration.
-        """
-
-        self.config = LeaderboardConfig()
-
-    ######################################################
-    # String Representation
-    ######################################################
+    # ==============================================================
+    # REPRESENTATION
+    # ==============================================================
 
     def __repr__(self) -> str:
 
         return (
-
-            f"{self.__class__.__name__}"
-
-            f"(classification_metric={self.config.classification_metric.value}, "
-
-            f"regression_metric={self.config.regression_metric.value})"
-
+            "LeaderboardEngine("
+            f"classification_metric="
+            f"{self.config.classification_metric.value}, "
+            f"regression_metric="
+            f"{self.config.regression_metric.value}, "
+            f"clustering_metric="
+            f"{self.config.clustering_metric.value}"
+            ")"
         )
 
-    ######################################################
-    # Length
-    ######################################################
+    # ==============================================================
+    # COUNT
+    # ==============================================================
 
     @staticmethod
     def count(
         leaderboard: LeaderboardResult,
     ) -> int:
-        """
-        Returns the number of entries.
-        """
 
         return len(
-
             leaderboard.entries
-
         )
-##########################################################
-# Public API
-##########################################################
+
+
+# ==================================================================
+# PUBLIC API
+# ==================================================================
+
 
 __all__ = [
-
     "LeaderboardType",
-
     "LeaderboardConfig",
-
     "LeaderboardEntry",
-
     "LeaderboardResult",
-
     "LeaderboardEngine",
-
 ]

@@ -1,14 +1,26 @@
 """
 NxZen AI Studio
-
 AutoML Constants
 
-Defines the enums and constants used throughout the
-AutoML module.
+Central constants for the AutoML runtime.
 
-This module only supports classical machine learning.
+Architecture:
 
-Deep learning models belong to the AutoDL module.
+    Router
+        ↓
+    Service
+        ↓
+    Trainer
+        ↓
+    Preprocessing
+        ↓
+    Algorithm Registry
+        ↓
+    Metrics / Leaderboard
+        ↓
+    Model Artifact
+        ↓
+    Prediction
 """
 
 from __future__ import annotations
@@ -16,184 +28,325 @@ from __future__ import annotations
 from enum import Enum
 
 
-##########################################################
-# Problem Types
-##########################################################
+# ======================================================================
+# TASKS
+# ======================================================================
 
-class ProblemType(str, Enum):
+
+class AutoMLTask(str, Enum):
     """
-    Supported ML problem types.
+    Supported AutoML task types.
+    """
+
+    AUTO = "auto"
+
+    CLASSIFICATION = "classification"
+
+    REGRESSION = "regression"
+
+    CLUSTERING = "clustering"
+
+    ANOMALY = "anomaly"
+
+    DIMENSIONALITY = "dimensionality"
+
+
+# ======================================================================
+# MODEL STATUS
+# ======================================================================
+
+
+class ModelStatus(str, Enum):
+    """
+    Runtime status of an individual algorithm.
+    """
+
+    SUCCESS = "success"
+
+    FAILED = "failed"
+
+    SKIPPED = "skipped"
+
+    TIMEOUT = "timeout"
+
+
+# ======================================================================
+# PREDICTION TYPES
+# ======================================================================
+
+
+class PredictionType(str, Enum):
+    """
+    Supported prediction output categories.
     """
 
     CLASSIFICATION = "classification"
 
     REGRESSION = "regression"
 
+    CLUSTERING = "clustering"
 
-##########################################################
-# Job Status
-##########################################################
+    ANOMALY = "anomaly"
 
-class JobStatus(str, Enum):
-    """
-    AutoML job lifecycle.
-    """
-
-    PENDING = "pending"
-
-    RUNNING = "running"
-
-    COMPLETED = "completed"
-
-    FAILED = "failed"
+    DIMENSIONALITY = "dimensionality"
 
 
-##########################################################
-# Supported Classical Algorithms
-##########################################################
-
-class ClassicalAlgorithm(str, Enum):
-    """
-    Algorithms supported by the AutoML module.
-
-    Neural networks are intentionally excluded.
-    """
-
-    RANDOM_FOREST = "random_forest"
-
-    XGBOOST = "xgboost"
-
-    LOGISTIC_REGRESSION = "logistic_regression"
-
-    SVM = "svm"
-
-    DECISION_TREE = "decision_tree"
-
-    KNN = "knn"
-
-    NAIVE_BAYES = "naive_bayes"
-
-    EXTRA_TREES = "extra_trees"
+# ======================================================================
+# RANKING DIRECTIONS
+# ======================================================================
 
 
-##########################################################
-# Default Algorithms
-##########################################################
+HIGHER_IS_BETTER = "higher"
 
-DEFAULT_CLASSIFICATION_ALGORITHMS = [
-
-    ClassicalAlgorithm.RANDOM_FOREST,
-
-    ClassicalAlgorithm.XGBOOST,
-
-    ClassicalAlgorithm.LOGISTIC_REGRESSION,
-
-    ClassicalAlgorithm.SVM,
-
-]
-
-DEFAULT_REGRESSION_ALGORITHMS = [
-
-    ClassicalAlgorithm.RANDOM_FOREST,
-
-    ClassicalAlgorithm.XGBOOST,
-
-]
+LOWER_IS_BETTER = "lower"
 
 
-##########################################################
-# Queue
-##########################################################
-
-TRAINING_QUEUE = "automl_training_queue"
+# ======================================================================
+# DEFAULT RUNTIME CONFIGURATION
+# ======================================================================
 
 
-##########################################################
-# Training Defaults
-##########################################################
+DEFAULT_RANDOM_STATE = 42
 
 DEFAULT_TEST_SIZE = 0.20
 
-DEFAULT_RANDOM_STATE = 42
+DEFAULT_TIMEOUT_SECONDS = 30
 
-DEFAULT_CV = 5
+DEFAULT_MAX_PREDICTION_ROWS = 100_000
 
-DEFAULT_TIME_LIMIT_MINUTES = 10
 
-MAX_TIME_LIMIT_MINUTES = 60
+# ======================================================================
+# DATA SAFETY LIMITS
+# ======================================================================
 
-##########################################################
-# General Configuration
-##########################################################
 
-DEFAULT_RANDOM_STATE = 42
+DEFAULT_MAX_ROWS_FOR_SPECTRAL = 5_000
 
-DEFAULT_N_JOBS = -1
+DEFAULT_MAX_CLUSTER_COUNT = 10
 
-DEFAULT_TEST_SIZE = 0.2
+DEFAULT_MIN_CLUSTER_COUNT = 2
 
-DEFAULT_CV_FOLDS = 5
+DEFAULT_MAX_TREE_ESTIMATORS = 300
 
-##########################################################
-# Tree Models
-##########################################################
+DEFAULT_MAX_CATEGORICAL_CARDINALITY = 10_000
 
-DEFAULT_RANDOM_FOREST_TREES = 200
+DEFAULT_MAX_DENSE_ELEMENTS = 2_000_000
 
-DEFAULT_EXTRA_TREES = 200
 
-DEFAULT_ADABOOST_TREES = 200
+# ======================================================================
+# MODEL ARTIFACT
+# ======================================================================
 
-DEFAULT_GRADIENT_BOOSTING_TREES = 200
 
-DEFAULT_HIST_GRADIENT_BOOSTING_ITERATIONS = 200
+MODEL_ARTIFACT_VERSION = "3.0"
 
-##########################################################
-# XGBoost
-##########################################################
+MODEL_FILE_EXTENSION = ".joblib"
 
-DEFAULT_XGBOOST_TREES = 300
 
-DEFAULT_XGBOOST_MAX_DEPTH = 6
+# ======================================================================
+# NORMALIZATION
+# ======================================================================
 
-DEFAULT_XGBOOST_LEARNING_RATE = 0.1
 
-##########################################################
-# LightGBM
-##########################################################
+NULL_LIKE_VALUES = {
+    "",
+    "none",
+    "null",
+    "undefined",
+    "nan",
+}
 
-DEFAULT_LIGHTGBM_TREES = 300
 
-DEFAULT_LIGHTGBM_LEAVES = 31
+# ======================================================================
+# FEATURE TYPES
+# ======================================================================
 
-DEFAULT_LIGHTGBM_LEARNING_RATE = 0.1
 
-##########################################################
-# CatBoost
-##########################################################
+FEATURE_TYPE_NUMERIC = "numeric"
 
-DEFAULT_CATBOOST_TREES = 300
+FEATURE_TYPE_CATEGORICAL = "categorical"
 
-DEFAULT_CATBOOST_DEPTH = 6
+FEATURE_TYPE_BOOLEAN = "boolean"
 
-DEFAULT_CATBOOST_LEARNING_RATE = 0.1
+FEATURE_TYPE_DATETIME = "datetime"
 
-##########################################################
-# SVM
-##########################################################
 
-DEFAULT_SVM_C = 1.0
+# ======================================================================
+# CLASSIFICATION ALGORITHMS
+# ======================================================================
 
-##########################################################
-# KNN
-##########################################################
 
-DEFAULT_KNN_NEIGHBORS = 5
+CLASSIFICATION_ALGORITHMS = (
+    "logistic_regression",
+    "ridge_classifier",
+    "sgd_classifier",
+    "passive_aggressive",
+    "decision_tree",
+    "random_forest",
+    "extra_trees",
+    "adaboost",
+    "gradient_boosting",
+    "hist_gradient_boosting",
+    "xgboost",
+    "lightgbm",
+    "catboost",
+    "svc",
+    "linear_svc",
+    "knn",
+    "gaussian_nb",
+    "bernoulli_nb",
+    "multinomial_nb",
+)
 
-##########################################################
-# Model Artifact
-##########################################################
 
-MODEL_FILENAME = "model.pkl"
+# ======================================================================
+# REGRESSION ALGORITHMS
+# ======================================================================
 
-METRICS_FILENAME = "metrics.json"
+
+REGRESSION_ALGORITHMS = (
+    "linear_regression",
+    "ridge",
+    "lasso",
+    "elastic_net",
+    "bayesian_ridge",
+    "sgd_regressor",
+    "decision_tree",
+    "random_forest",
+    "extra_trees",
+    "adaboost",
+    "gradient_boosting",
+    "hist_gradient_boosting",
+    "xgboost",
+    "lightgbm",
+    "catboost",
+    "svr",
+    "knn_regressor",
+)
+
+
+# ======================================================================
+# CLUSTERING ALGORITHMS
+# ======================================================================
+
+
+CLUSTERING_ALGORITHMS = (
+    "kmeans",
+    "minibatch_kmeans",
+    "dbscan",
+    "agglomerative",
+    "spectral",
+    "birch",
+)
+
+
+# ======================================================================
+# ANOMALY DETECTION ALGORITHMS
+# ======================================================================
+
+
+ANOMALY_ALGORITHMS = (
+    "isolation_forest",
+    "one_class_svm",
+    "local_outlier_factor",
+    "elliptic_envelope",
+)
+
+
+# ======================================================================
+# DIMENSIONALITY REDUCTION ALGORITHMS
+# ======================================================================
+
+
+DIMENSIONALITY_ALGORITHMS = (
+    "pca",
+    "truncated_svd",
+    "fast_ica",
+    "factor_analysis",
+)
+
+
+# ======================================================================
+# ALGORITHM GROUPS
+# ======================================================================
+
+
+ALGORITHM_GROUPS = {
+    AutoMLTask.CLASSIFICATION.value: CLASSIFICATION_ALGORITHMS,
+
+    AutoMLTask.REGRESSION.value: REGRESSION_ALGORITHMS,
+
+    AutoMLTask.CLUSTERING.value: CLUSTERING_ALGORITHMS,
+
+    AutoMLTask.ANOMALY.value: ANOMALY_ALGORITHMS,
+
+    AutoMLTask.DIMENSIONALITY.value: DIMENSIONALITY_ALGORITHMS,
+}
+
+
+# ======================================================================
+# COUNTS
+# ======================================================================
+
+
+ALGORITHM_COUNTS = {
+    AutoMLTask.CLASSIFICATION.value: len(
+        CLASSIFICATION_ALGORITHMS
+    ),
+    AutoMLTask.REGRESSION.value: len(
+        REGRESSION_ALGORITHMS
+    ),
+    AutoMLTask.CLUSTERING.value: len(
+        CLUSTERING_ALGORITHMS
+    ),
+    AutoMLTask.ANOMALY.value: len(
+        ANOMALY_ALGORITHMS
+    ),
+    AutoMLTask.DIMENSIONALITY.value: len(
+        DIMENSIONALITY_ALGORITHMS
+    ),
+}
+
+
+TOTAL_ALGORITHM_COUNT = sum(
+    ALGORITHM_COUNTS.values()
+)
+
+
+# ======================================================================
+# PUBLIC API
+# ======================================================================
+
+
+__all__ = [
+    "AutoMLTask",
+    "ModelStatus",
+    "PredictionType",
+    "HIGHER_IS_BETTER",
+    "LOWER_IS_BETTER",
+    "DEFAULT_RANDOM_STATE",
+    "DEFAULT_TEST_SIZE",
+    "DEFAULT_TIMEOUT_SECONDS",
+    "DEFAULT_MAX_PREDICTION_ROWS",
+    "DEFAULT_MAX_ROWS_FOR_SPECTRAL",
+    "DEFAULT_MAX_CLUSTER_COUNT",
+    "DEFAULT_MIN_CLUSTER_COUNT",
+    "DEFAULT_MAX_TREE_ESTIMATORS",
+    "DEFAULT_MAX_CATEGORICAL_CARDINALITY",
+    "DEFAULT_MAX_DENSE_ELEMENTS",
+    "MODEL_ARTIFACT_VERSION",
+    "MODEL_FILE_EXTENSION",
+    "NULL_LIKE_VALUES",
+    "FEATURE_TYPE_NUMERIC",
+    "FEATURE_TYPE_CATEGORICAL",
+    "FEATURE_TYPE_BOOLEAN",
+    "FEATURE_TYPE_DATETIME",
+    "CLASSIFICATION_ALGORITHMS",
+    "REGRESSION_ALGORITHMS",
+    "CLUSTERING_ALGORITHMS",
+    "ANOMALY_ALGORITHMS",
+    "DIMENSIONALITY_ALGORITHMS",
+    "ALGORITHM_GROUPS",
+    "ALGORITHM_COUNTS",
+    "TOTAL_ALGORITHM_COUNT",
+]
