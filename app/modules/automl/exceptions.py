@@ -1,130 +1,136 @@
 """
 NxZen AI Studio
-
 AutoML Exceptions
-
-Custom exceptions used throughout the AutoML module.
 """
 
 from __future__ import annotations
 
-
-##########################################################
-# Base Exception
-##########################################################
 
 class AutoMLException(Exception):
     """
     Base exception for the AutoML module.
     """
 
-    pass
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str = "AUTOML_ERROR",
+    ) -> None:
+        super().__init__(message)
+        self.message = message
+        self.code = code
+
+    def to_dict(self) -> dict:
+        return {
+            "code": self.code,
+            "message": self.message,
+        }
 
 
-##########################################################
-# Dataset Exceptions
-##########################################################
-
-class InvalidDatasetError(AutoMLException):
+class DatasetValidationError(AutoMLException):
     """
-    Raised when the supplied dataset is invalid.
-    """
-
-    pass
-
-
-class DatasetNotFoundError(AutoMLException):
-    """
-    Raised when the dataset cannot be located.
-    """
-
-    pass
-
-
-##########################################################
-# Job Exceptions
-##########################################################
-
-class AutoMLJobNotFoundError(AutoMLException):
-    """
-    Raised when an AutoML job does not exist.
+    Dataset validation failed.
     """
 
-    pass
+    def __init__(self, message: str) -> None:
+        super().__init__(
+            message,
+            code="DATASET_VALIDATION_ERROR",
+        )
 
 
-class InvalidJobStateError(AutoMLException):
+class TargetColumnError(AutoMLException):
     """
-    Raised when an operation is attempted
-    on a job in an invalid state.
-    """
-
-    pass
-
-
-##########################################################
-# Training Exceptions
-##########################################################
-
-class TrainingTimeoutError(AutoMLException):
-    """
-    Raised when training exceeds
-    the configured timeout.
+    Target-column validation failed.
     """
 
-    pass
+    def __init__(self, message: str) -> None:
+        super().__init__(
+            message,
+            code="TARGET_COLUMN_ERROR",
+        )
 
 
-class TrainingFailedError(AutoMLException):
+class TaskValidationError(AutoMLException):
     """
-    Raised when model training fails.
-    """
-
-    pass
-
-
-##########################################################
-# Model Exceptions
-##########################################################
-
-class UnsupportedAlgorithmError(AutoMLException):
-    """
-    Raised when an unsupported algorithm
-    is requested.
+    AutoML task validation failed.
     """
 
-    pass
+    def __init__(self, message: str) -> None:
+        super().__init__(
+            message,
+            code="TASK_VALIDATION_ERROR",
+        )
+
+
+class PreprocessingError(AutoMLException):
+    """
+    Preprocessing failed.
+    """
+
+    def __init__(self, message: str) -> None:
+        super().__init__(
+            message,
+            code="PREPROCESSING_ERROR",
+        )
+
+
+class AlgorithmError(AutoMLException):
+    """
+    Algorithm execution failed.
+    """
+
+    def __init__(self, message: str) -> None:
+        super().__init__(
+            message,
+            code="ALGORITHM_ERROR",
+        )
+
+
+class ModelNotFoundError(AutoMLException):
+    """
+    Requested model artifact was not found.
+    """
+
+    def __init__(self, message: str) -> None:
+        super().__init__(
+            message,
+            code="MODEL_NOT_FOUND",
+        )
 
 
 class ModelArtifactError(AutoMLException):
     """
-    Raised when model artifacts
-    cannot be created or loaded.
+    Saved model artifact is invalid or incompatible.
     """
 
-    pass
+    def __init__(self, message: str) -> None:
+        super().__init__(
+            message,
+            code="MODEL_ARTIFACT_ERROR",
+        )
 
 
-##########################################################
-# Queue Exceptions
-##########################################################
-
-class QueueDispatchError(AutoMLException):
+class PredictionError(AutoMLException):
     """
-    Raised when a training job
-    cannot be dispatched.
-    """
-
-    pass
-
-
-##########################################################
-# Validation Exceptions
-##########################################################
-
-class ValidationError(AutoMLException):
-    """
-    Raised when request validation fails.
+    Prediction failed.
     """
 
-    pass
+    def __init__(self, message: str) -> None:
+        super().__init__(
+            message,
+            code="PREDICTION_ERROR",
+        )
+
+
+class AlgorithmTimeoutError(AutoMLException):
+    """
+    Individual algorithm exceeded its allowed runtime.
+    """
+
+    def __init__(self, message: str) -> None:
+        super().__init__(
+            message,
+            code="ALGORITHM_TIMEOUT",
+        )
