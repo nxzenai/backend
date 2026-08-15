@@ -1,1421 +1,773 @@
 """
 NxZen AI Studio
+AutoML Classification Engine
 
-Classification Algorithms
+Locked contract
+---------------
+This module returns ClassificationResult objects from models.py.
 
-Enterprise Classification Engine
-
-Responsibilities
-----------------
-• Train classification models
-• Compute metrics
-• Rank models
-• Handle failures safely
-• Provide leaderboard support
+Design goals
+------------
+- Deterministic execution.
+- One algorithm failure never stops the run.
+- Optional third-party libraries are isolated.
+- Failed algorithms are never selected as best.
+- Supports binary and multiclass classification.
+- Preserves sparse input where supported.
+- JSON-safe leaderboard output.
 """
 
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
 from typing import Any, Callable
 
 import numpy as np
 
-from sklearn.base import ClassifierMixin
-
+from sklearn.ensemble import (
+    AdaBoostClassifier,
+    ExtraTreesClassifier,
+    GradientBoostingClassifier,
+    HistGradientBoostingClassifier,
+    RandomForestClassifier,
+)
+from sklearn.linear_model import (
+    LogisticRegression,
+    PassiveAggressiveClassifier,
+    RidgeClassifier,
+    SGDClassifier,
+)
 from sklearn.metrics import (
     accuracy_score,
+    confusion_matrix,
+    f1_score,
     precision_score,
     recall_score,
-    f1_score,
     roc_auc_score,
-    confusion_matrix,
 )
+from sklearn.naive_bayes import (
+    BernoulliNB,
+    GaussianNB,
+    MultinomialNB,
+)
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.svm import SVC, LinearSVC
+from sklearn.tree import DecisionTreeClassifier
 
 from app.modules.automl.constants import (
     DEFAULT_RANDOM_STATE,
-    DEFAULT_N_JOBS,
-    DEFAULT_RANDOM_FOREST_TREES,
-    DEFAULT_EXTRA_TREES,
-    DEFAULT_ADABOOST_TREES,
-    DEFAULT_GRADIENT_BOOSTING_TREES,
-    DEFAULT_HIST_GRADIENT_BOOSTING_ITERATIONS,
-    DEFAULT_XGBOOST_TREES,
-    DEFAULT_XGBOOST_MAX_DEPTH,
-    DEFAULT_XGBOOST_LEARNING_RATE,
-    DEFAULT_LIGHTGBM_TREES,
-    DEFAULT_LIGHTGBM_LEAVES,
-    DEFAULT_LIGHTGBM_LEARNING_RATE,
-    DEFAULT_CATBOOST_TREES,
-    DEFAULT_CATBOOST_DEPTH,
-    DEFAULT_CATBOOST_LEARNING_RATE,
-    DEFAULT_KNN_NEIGHBORS,
+    DEFAULT_TIMEOUT_SECONDS,
+    ModelStatus,
 )
-
-##########################################################
-# Result Object
-##########################################################
+from app.modules.automl.models import ClassificationResult
 
 
-@dataclass
-class ModelResult:
-    """
-    Standard result returned by every classifier.
-    """
+# ------------------------------------------------------------------
+# Optional dependencies
+# ------------------------------------------------------------------
 
-    model_name: str
+try:
+    from xgboost import XGBClassifier
+except Exception:
+    XGBClassifier = None
 
-    model: Any | None
+try:
+    from lightgbm import LGBMClassifier
+except Exception:
+    LGBMClassifier = None
 
-    accuracy: float
-
-    precision: float
-
-    recall: float
-
-    f1_score: float
-
-    roc_auc: float | None
-
-    confusion_matrix: Any | None
-
-    training_time: float
-
-    success: bool
-
-    error: str | None = None
+try:
+    from catboost import CatBoostClassifier
+except Exception:
+    CatBoostClassifier = None
 
 
-##########################################################
+# ------------------------------------------------------------------
+# Runtime constants
+# ------------------------------------------------------------------
+
+DEFAULT_N_JOBS = 1
+
+RANDOM_FOREST_TREES = 150
+EXTRA_TREES = 150
+ADABOOST_TREES = 100
+GRADIENT_BOOSTING_TREES = 100
+HIST_GRADIENT_BOOSTING_ITERATIONS = 150
+
+XGBOOST_TREES = 150
+LIGHTGBM_TREES = 150
+CATBOOST_TREES = 150
+
+KNN_NEIGHBORS = 5
+
+
+# ------------------------------------------------------------------
 # Registry
-##########################################################
+# ------------------------------------------------------------------
 
-CLASSIFICATION_MODELS: dict[str, Callable] = {}
-
-
-def register_model(name: str):
+def classification_registry(
+    *,
+    random_state: int = DEFAULT_RANDOM_STATE,
+) -> dict[str, Any]:
     """
-    Registers a classifier.
-    """
+    Build a fresh classifier registry.
 
-    def wrapper(func):
-        CLASSIFICATION_MODELS[name] = func
-        return func
-
-    return wrapper
-
-
-##########################################################
-# Metric Calculation
-##########################################################
-
-
-def calculate_metrics(
-    y_true,
-    predictions,
-    probabilities=None,
-):
-    """
-    Calculates enterprise classification metrics.
+    Optional dependencies are added only when available.
     """
 
-    metrics = {
-
-        "accuracy": accuracy_score(
-            y_true,
-            predictions,
+    registry: dict[str, Any] = {
+        "logistic_regression": LogisticRegression(
+            max_iter=1000,
+            random_state=random_state,
+           
         ),
 
-        "precision": precision_score(
-            y_true,
-            predictions,
-            average="weighted",
-            zero_division=0,
+        "ridge_classifier": RidgeClassifier(
+            alpha=1.0,
         ),
 
-        "recall": recall_score(
-            y_true,
-            predictions,
-            average="weighted",
-            zero_division=0,
+        "sgd_classifier": SGDClassifier(
+            max_iter=1000,
+            tol=1e-3,
+            random_state=random_state,
         ),
 
-        "f1_score": f1_score(
-            y_true,
-            predictions,
-            average="weighted",
-            zero_division=0,
+        "passive_aggressive": SGDClassifier(
+            loss="hinge",
+            penalty=None,
+            learning_rate="pa1",
+            eta0=1.0,
+            max_iter=1000,
+            random_state=random_state,
+        ),
+        "decision_tree": DecisionTreeClassifier(
+            random_state=random_state,
         ),
 
-        "confusion_matrix": confusion_matrix(
-            y_true,
-            predictions,
+        "random_forest": RandomForestClassifier(
+            n_estimators=RANDOM_FOREST_TREES,
+            random_state=random_state,
+            n_jobs=DEFAULT_N_JOBS,
         ),
 
-        "roc_auc": None,
+        "extra_trees": ExtraTreesClassifier(
+            n_estimators=EXTRA_TREES,
+            random_state=random_state,
+            n_jobs=DEFAULT_N_JOBS,
+        ),
 
+        "adaboost": AdaBoostClassifier(
+            n_estimators=ADABOOST_TREES,
+            random_state=random_state,
+        ),
+
+        "gradient_boosting": GradientBoostingClassifier(
+            n_estimators=GRADIENT_BOOSTING_TREES,
+            learning_rate=0.1,
+            max_depth=3,
+            random_state=random_state,
+        ),
+
+        "hist_gradient_boosting": HistGradientBoostingClassifier(
+            max_iter=HIST_GRADIENT_BOOSTING_ITERATIONS,
+            learning_rate=0.1,
+            max_depth=6,
+            random_state=random_state,
+        ),
+
+        "svc": SVC(
+            kernel="rbf",
+            
+            random_state=random_state,
+        ),
+
+        "linear_svc": LinearSVC(
+            max_iter=2000,
+            random_state=random_state,
+        ),
+
+        "knn": KNeighborsClassifier(
+            n_neighbors=KNN_NEIGHBORS,
+            n_jobs=DEFAULT_N_JOBS,
+        ),
+
+        "gaussian_nb": GaussianNB(),
+
+        "bernoulli_nb": BernoulliNB(),
+
+        "multinomial_nb": MultinomialNB(),
     }
 
-    if probabilities is None:
-        return metrics
-
-    try:
-
-        classes = np.unique(y_true)
-
-        if len(classes) == 2:
-
-            if probabilities.ndim == 2:
-
-                metrics["roc_auc"] = roc_auc_score(
-                    y_true,
-                    probabilities[:, 1],
-                )
-
-            else:
-
-                metrics["roc_auc"] = roc_auc_score(
-                    y_true,
-                    probabilities,
-                )
-
-        else:
-
-            metrics["roc_auc"] = roc_auc_score(
-                y_true,
-                probabilities,
-                multi_class="ovr",
-            )
-
-    except Exception:
-
-        metrics["roc_auc"] = None
-
-    return metrics
-
-
-##########################################################
-# Generic Trainer
-##########################################################
-
-
-def train_classifier(
-    *,
-    model_name: str,
-    model: ClassifierMixin,
-    X_train,
-    X_test,
-    y_train,
-    y_test,
-) -> ModelResult:
-    """
-    Generic trainer used by every classifier.
-    """
-
-    model.fit(
-        X_train,
-        y_train,
-    )
-
-    predictions = model.predict(
-        X_test,
-    )
-
-    probabilities = None
-
-    if hasattr(model, "predict_proba"):
-
-        try:
-
-            probabilities = model.predict_proba(
-                X_test,
-            )
-
-        except Exception:
-
-            probabilities = None
-
-    metrics = calculate_metrics(
-        y_test,
-        predictions,
-        probabilities,
-    )
-
-    return ModelResult(
-
-        model_name=model_name,
-
-        model=model,
-
-        accuracy=round(
-            metrics["accuracy"],
-            4,
-        ),
-
-        precision=round(
-            metrics["precision"],
-            4,
-        ),
-
-        recall=round(
-            metrics["recall"],
-            4,
-        ),
-
-        f1_score=round(
-            metrics["f1_score"],
-            4,
-        ),
-
-        roc_auc=(
-            None
-            if metrics["roc_auc"] is None
-            else round(
-                metrics["roc_auc"],
-                4,
-            )
-        ),
-
-        confusion_matrix=metrics["confusion_matrix"],
-
-        training_time=0,
-
-        success=True,
-
-        error=None,
-    )
-
-
-##########################################################
-# Safe Trainer
-##########################################################
-
-
-def safe_train(
-    model_name: str,
-    trainer: Callable,
-) -> ModelResult:
-    """
-    Executes one model safely.
-    """
-
-    try:
-
-        start = time.perf_counter()
-
-        result = trainer()
-
-        result.training_time = round(
-            time.perf_counter() - start,
-            4,
+    if XGBClassifier is not None:
+        registry["xgboost"] = XGBClassifier(
+            n_estimators=XGBOOST_TREES,
+            max_depth=6,
+            learning_rate=0.08,
+            objective="binary:logistic",
+            eval_metric="logloss",
+            random_state=random_state,
+            n_jobs=DEFAULT_N_JOBS,
+            tree_method="hist",
+            verbosity=0,
         )
 
-        result.success = True
+    if LGBMClassifier is not None:
+        registry["lightgbm"] = LGBMClassifier(
+            n_estimators=LIGHTGBM_TREES,
+            num_leaves=31,
+            learning_rate=0.08,
+            random_state=random_state,
+            n_jobs=DEFAULT_N_JOBS,
+            verbosity=-1,
+        )
 
-        return result
+    if CatBoostClassifier is not None:
+        registry["catboost"] = CatBoostClassifier(
+            iterations=CATBOOST_TREES,
+            depth=6,
+            learning_rate=0.08,
+            random_seed=random_state,
+            verbose=False,
+            allow_writing_files=False,
+        )
+
+    return registry
+
+
+# Backwards-compatible aliases.
+CLASSIFICATION_MODELS = classification_registry
+
+
+# ------------------------------------------------------------------
+# Validation
+# ------------------------------------------------------------------
+
+def _validate_target(
+    y_train: Any,
+    y_test: Any,
+) -> int:
+
+    train = np.asarray(y_train)
+    test = np.asarray(y_test)
+
+    if train.size == 0:
+        raise ValueError(
+            "Classification training target is empty."
+        )
+
+    if test.size == 0:
+        raise ValueError(
+            "Classification test target is empty."
+        )
+
+    train_classes = np.unique(train)
+    test_classes = np.unique(test)
+
+    if len(train_classes) < 2:
+        raise ValueError(
+            "Classification requires at least two classes "
+            "in the training data."
+        )
+
+    if len(test_classes) < 1:
+        raise ValueError(
+            "Classification test data contains no classes."
+        )
+
+    return int(len(train_classes))
+
+
+# ------------------------------------------------------------------
+# ROC-AUC
+# ------------------------------------------------------------------
+
+def _safe_roc_auc(
+    y_true: Any,
+    scores: Any,
+    classes: Any,
+) -> float | None:
+
+    if scores is None:
+        return None
+
+    try:
+        y = np.asarray(y_true)
+        score_array = np.asarray(scores)
+
+        if len(np.unique(y)) < 2:
+            return None
+
+        class_array = np.asarray(classes)
+
+        if len(class_array) == 2:
+
+            if score_array.ndim == 2:
+                if score_array.shape[1] != 2:
+                    return None
+
+                return float(
+                    roc_auc_score(
+                        y,
+                        score_array[:, 1],
+                    )
+                )
+
+            if score_array.ndim == 1:
+                return float(
+                    roc_auc_score(
+                        y,
+                        score_array,
+                    )
+                )
+
+            return None
+
+        if score_array.ndim != 2:
+            return None
+
+        if score_array.shape[1] != len(class_array):
+            return None
+
+        return float(
+            roc_auc_score(
+                y,
+                score_array,
+                multi_class="ovr",
+                labels=class_array,
+            )
+        )
+
+    except Exception:
+        return None
+
+
+# ------------------------------------------------------------------
+# Prediction scores
+# ------------------------------------------------------------------
+
+def _prediction_scores(
+    model: Any,
+    X: Any,
+) -> Any:
+
+    if hasattr(model, "predict_proba"):
+        try:
+            return model.predict_proba(X)
+        except Exception:
+            pass
+
+    if hasattr(model, "decision_function"):
+        try:
+            return model.decision_function(X)
+        except Exception:
+            pass
+
+    return None
+
+
+# ------------------------------------------------------------------
+# Metrics
+# ------------------------------------------------------------------
+
+def calculate_metrics(
+    y_true: Any,
+    predictions: Any,
+    scores: Any = None,
+    classes: Any = None,
+) -> dict[str, Any]:
+
+    y_true = np.asarray(y_true)
+    predictions = np.asarray(predictions)
+
+    if classes is None:
+        classes = np.unique(y_true)
+
+    accuracy = accuracy_score(
+        y_true,
+        predictions,
+    )
+
+    precision = precision_score(
+        y_true,
+        predictions,
+        average="weighted",
+        zero_division=0,
+    )
+
+    recall = recall_score(
+        y_true,
+        predictions,
+        average="weighted",
+        zero_division=0,
+    )
+
+    f1 = f1_score(
+        y_true,
+        predictions,
+        average="weighted",
+        zero_division=0,
+    )
+
+    matrix = confusion_matrix(
+        y_true,
+        predictions,
+        labels=classes,
+    )
+
+    roc_auc = _safe_roc_auc(
+        y_true,
+        scores,
+        classes,
+    )
+
+    return {
+        "accuracy": float(accuracy),
+        "precision": float(precision),
+        "recall": float(recall),
+        "f1_score": float(f1),
+        "roc_auc": roc_auc,
+        "confusion_matrix": matrix,
+    }
+
+
+# ------------------------------------------------------------------
+# Single model training
+# ------------------------------------------------------------------
+
+def _train_single(
+    model_name: str,
+    model: Any,
+    X_train: Any,
+    X_test: Any,
+    y_train: Any,
+    y_test: Any,
+    *,
+    timeout_seconds: int,
+) -> ClassificationResult:
+
+    start = time.perf_counter()
+
+    try:
+        _validate_target(
+            y_train,
+            y_test,
+        )
+
+        # KNN cannot use more neighbors than training rows.
+        if isinstance(model, KNeighborsClassifier):
+            n_neighbors = min(
+                model.n_neighbors,
+                len(y_train),
+            )
+
+            if n_neighbors < 1:
+                raise ValueError(
+                    "KNN requires at least one training sample."
+                )
+
+            model.set_params(
+                n_neighbors=n_neighbors
+            )
+
+        # GaussianNB and HistGradientBoosting require dense input.
+        X_train_model = X_train
+        X_test_model = X_test
+
+        if isinstance(
+            model,
+            (
+                GaussianNB,
+                HistGradientBoostingClassifier,
+            ),
+        ):
+            if hasattr(X_train, "toarray"):
+                X_train_model = X_train.toarray()
+
+            if hasattr(X_test, "toarray"):
+                X_test_model = X_test.toarray()
+
+        # XGBoost can be problematic with non-numeric labels.
+        # Allow the model to fail safely rather than fabricating
+        # a label mapping that is not stored in ModelArtifact.
+        model.fit(
+            X_train_model,
+            y_train,
+        )
+
+        predictions = model.predict(
+            X_test_model
+        )
+
+        classes = getattr(
+            model,
+            "classes_",
+            np.unique(y_train),
+        )
+
+        scores = _prediction_scores(
+            model,
+            X_test_model,
+        )
+
+        metrics = calculate_metrics(
+            y_test,
+            predictions,
+            scores,
+            classes,
+        )
+
+        elapsed = (
+            time.perf_counter()
+            - start
+        )
+
+        status = ModelStatus.SUCCESS
+        error = None
+
+        if (
+            timeout_seconds > 0
+            and elapsed > timeout_seconds
+        ):
+            status = ModelStatus.TIMEOUT
+            error = (
+                "Training and evaluation exceeded the "
+                "configured runtime threshold."
+            )
+
+        if status == ModelStatus.TIMEOUT:
+            return ClassificationResult(
+                model_name=model_name,
+                model=None,
+                training_time=float(elapsed),
+                success=False,
+                status=status,
+                error=error,
+            )
+
+        return ClassificationResult(
+            model_name=model_name,
+            model=model,
+            training_time=float(elapsed),
+            success=True,
+            status=ModelStatus.SUCCESS,
+            accuracy=metrics["accuracy"],
+            precision=metrics["precision"],
+            recall=metrics["recall"],
+            f1_score=metrics["f1_score"],
+            roc_auc=metrics["roc_auc"],
+            confusion_matrix=metrics["confusion_matrix"].tolist(),
+            classes=np.asarray(classes).tolist(),
+        )
 
     except Exception as exc:
 
-        return ModelResult(
+        elapsed = (
+            time.perf_counter()
+            - start
+        )
 
+        return ClassificationResult(
             model_name=model_name,
-
             model=None,
-
-            accuracy=0.0,
-
-            precision=0.0,
-
-            recall=0.0,
-
-            f1_score=0.0,
-
-            roc_auc=None,
-
-            confusion_matrix=None,
-
-            training_time=0.0,
-
+            training_time=float(elapsed),
             success=False,
-
-            error=f"{type(exc).__name__}: {exc}",
+            status=ModelStatus.FAILED,
+            error=(
+                f"{type(exc).__name__}: {exc}"
+            ),
         )
 
 
-##########################################################
-# Public Helpers
-##########################################################
+# ------------------------------------------------------------------
+# Public safe trainer
+# ------------------------------------------------------------------
 
+def safe_train_classifier(
+    model_name: str,
+    model: Any,
+    X_train: Any,
+    X_test: Any,
+    y_train: Any,
+    y_test: Any,
+    *,
+    timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
+) -> ClassificationResult:
 
-def available_models() -> list[str]:
-    """
-    Returns all registered models.
-    """
-
-    return sorted(
-        CLASSIFICATION_MODELS.keys()
-    )
-##########################################################
-# Linear Models
-##########################################################
-
-from sklearn.linear_model import (
-    LogisticRegression,
-    RidgeClassifier,
-    SGDClassifier,
-    PassiveAggressiveClassifier,
-)
-
-
-@register_model("Logistic Regression")
-def train_logistic_regression(
-    X_train,
-    X_test,
-    y_train,
-    y_test,
-) -> ModelResult:
-
-    model = LogisticRegression(
-
-        random_state=DEFAULT_RANDOM_STATE,
-
-        max_iter=1000,
-
-        solver="lbfgs",
-
-    )
-
-    return train_classifier(
-
-        model_name="Logistic Regression",
-
+    return _train_single(
+        model_name=model_name,
         model=model,
-
         X_train=X_train,
-
         X_test=X_test,
-
         y_train=y_train,
-
         y_test=y_test,
-
+        timeout_seconds=timeout_seconds,
     )
 
 
-##########################################################
-
-
-@register_model("Ridge Classifier")
-def train_ridge_classifier(
-    X_train,
-    X_test,
-    y_train,
-    y_test,
-) -> ModelResult:
-
-    model = RidgeClassifier(
-
-        alpha=1.0,
-
-        random_state=DEFAULT_RANDOM_STATE,
-
-    )
-
-    return train_classifier(
-
-        model_name="Ridge Classifier",
-
-        model=model,
-
-        X_train=X_train,
-
-        X_test=X_test,
-
-        y_train=y_train,
-
-        y_test=y_test,
-
-    )
-
-
-##########################################################
-
-
-@register_model("SGD Classifier")
-def train_sgd_classifier(
-    X_train,
-    X_test,
-    y_train,
-    y_test,
-) -> ModelResult:
-
-    model = SGDClassifier(
-
-        loss="log_loss",
-
-        alpha=0.0001,
-
-        penalty="l2",
-
-        max_iter=1000,
-
-        tol=1e-3,
-
-        random_state=DEFAULT_RANDOM_STATE,
-
-    )
-
-    return train_classifier(
-
-        model_name="SGD Classifier",
-
-        model=model,
-
-        X_train=X_train,
-
-        X_test=X_test,
-
-        y_train=y_train,
-
-        y_test=y_test,
-
-    )
-
-
-##########################################################
-
-
-@register_model("Passive Aggressive Classifier")
-def train_passive_aggressive_classifier(
-    X_train,
-    X_test,
-    y_train,
-    y_test,
-) -> ModelResult:
-
-    model = PassiveAggressiveClassifier(
-
-        C=1.0,
-
-        max_iter=1000,
-
-        tol=1e-3,
-
-        random_state=DEFAULT_RANDOM_STATE,
-
-    )
-
-    return train_classifier(
-
-        model_name="Passive Aggressive Classifier",
-
-        model=model,
-
-        X_train=X_train,
-
-        X_test=X_test,
-
-        y_train=y_train,
-
-        y_test=y_test,
-
-    )
-
-
-##########################################################
-# Tree Models
-##########################################################
-
-from sklearn.tree import (
-    DecisionTreeClassifier,
-)
-
-from sklearn.ensemble import (
-    RandomForestClassifier,
-    ExtraTreesClassifier,
-)
-
-
-##########################################################
-
-
-@register_model("Decision Tree")
-def train_decision_tree(
-    X_train,
-    X_test,
-    y_train,
-    y_test,
-) -> ModelResult:
-
-    model = DecisionTreeClassifier(
-
-        criterion="gini",
-
-        splitter="best",
-
-        max_depth=None,
-
-        min_samples_split=2,
-
-        min_samples_leaf=1,
-
-        random_state=DEFAULT_RANDOM_STATE,
-
-    )
-
-    return train_classifier(
-
-        model_name="Decision Tree",
-
-        model=model,
-
-        X_train=X_train,
-
-        X_test=X_test,
-
-        y_train=y_train,
-
-        y_test=y_test,
-
-    )
-
-
-##########################################################
-
-
-@register_model("Random Forest")
-def train_random_forest(
-    X_train,
-    X_test,
-    y_train,
-    y_test,
-) -> ModelResult:
-
-    model = RandomForestClassifier(
-
-        n_estimators=DEFAULT_RANDOM_FOREST_TREES,
-
-        criterion="gini",
-
-        max_depth=None,
-
-        min_samples_split=2,
-
-        min_samples_leaf=1,
-
-        max_features="sqrt",
-
-        bootstrap=True,
-
-        n_jobs=DEFAULT_N_JOBS,
-
-        random_state=DEFAULT_RANDOM_STATE,
-
-    )
-
-    return train_classifier(
-
-        model_name="Random Forest",
-
-        model=model,
-
-        X_train=X_train,
-
-        X_test=X_test,
-
-        y_train=y_train,
-
-        y_test=y_test,
-
-    )
-
-
-##########################################################
-
-
-@register_model("Extra Trees")
-def train_extra_trees(
-    X_train,
-    X_test,
-    y_train,
-    y_test,
-) -> ModelResult:
-
-    model = ExtraTreesClassifier(
-
-        n_estimators=DEFAULT_EXTRA_TREES,
-
-        criterion="gini",
-
-        max_depth=None,
-
-        min_samples_split=2,
-
-        min_samples_leaf=1,
-
-        max_features="sqrt",
-
-        bootstrap=False,
-
-        n_jobs=DEFAULT_N_JOBS,
-
-        random_state=DEFAULT_RANDOM_STATE,
-
-    )
-
-    return train_classifier(
-
-        model_name="Extra Trees",
-
-        model=model,
-
-        X_train=X_train,
-
-        X_test=X_test,
-
-        y_train=y_train,
-
-        y_test=y_test,
-
-    )
-##########################################################
-# Boosting Models
-##########################################################
-
-from sklearn.ensemble import (
-    AdaBoostClassifier,
-    GradientBoostingClassifier,
-    HistGradientBoostingClassifier,
-)
-
-
-##########################################################
-# AdaBoost
-##########################################################
-
-@register_model("AdaBoost")
-def train_adaboost(
-    X_train,
-    X_test,
-    y_train,
-    y_test,
-) -> ModelResult:
-
-    model = AdaBoostClassifier(
-
-        n_estimators=DEFAULT_ADABOOST_TREES,
-
-        learning_rate=1.0,
-
-        random_state=DEFAULT_RANDOM_STATE,
-
-    )
-
-    return train_classifier(
-
-        model_name="AdaBoost",
-
-        model=model,
-
-        X_train=X_train,
-
-        X_test=X_test,
-
-        y_train=y_train,
-
-        y_test=y_test,
-
-    )
-
-
-##########################################################
-# Gradient Boosting
-##########################################################
-
-@register_model("Gradient Boosting")
-def train_gradient_boosting(
-    X_train,
-    X_test,
-    y_train,
-    y_test,
-) -> ModelResult:
-
-    model = GradientBoostingClassifier(
-
-        n_estimators=DEFAULT_GRADIENT_BOOSTING_TREES,
-
-        learning_rate=0.1,
-
-        max_depth=3,
-
-        random_state=DEFAULT_RANDOM_STATE,
-
-    )
-
-    return train_classifier(
-
-        model_name="Gradient Boosting",
-
-        model=model,
-
-        X_train=X_train,
-
-        X_test=X_test,
-
-        y_train=y_train,
-
-        y_test=y_test,
-
-    )
-
-
-##########################################################
-# Histogram Gradient Boosting
-##########################################################
-
-@register_model("Histogram Gradient Boosting")
-def train_hist_gradient_boosting(
-    X_train,
-    X_test,
-    y_train,
-    y_test,
-) -> ModelResult:
-
-    model = HistGradientBoostingClassifier(
-
-        max_iter=DEFAULT_HIST_GRADIENT_BOOSTING_ITERATIONS,
-
-        learning_rate=0.1,
-
-        max_depth=6,
-
-        random_state=DEFAULT_RANDOM_STATE,
-
-    )
-
-    return train_classifier(
-
-        model_name="Histogram Gradient Boosting",
-
-        model=model,
-
-        X_train=X_train,
-
-        X_test=X_test,
-
-        y_train=y_train,
-
-        y_test=y_test,
-
-    )
-
-
-##########################################################
-# XGBoost
-##########################################################
-
-from xgboost import XGBClassifier
-
-
-@register_model("XGBoost")
-def train_xgboost(
-    X_train,
-    X_test,
-    y_train,
-    y_test,
-) -> ModelResult:
-
-    model = XGBClassifier(
-
-        n_estimators=DEFAULT_XGBOOST_TREES,
-
-        max_depth=DEFAULT_XGBOOST_MAX_DEPTH,
-
-        learning_rate=DEFAULT_XGBOOST_LEARNING_RATE,
-
-        objective="multi:softprob",
-
-        eval_metric="mlogloss",
-
-        random_state=DEFAULT_RANDOM_STATE,
-
-        n_jobs=DEFAULT_N_JOBS,
-
-        tree_method="hist",
-
-        verbosity=0,
-
-    )
-
-    return train_classifier(
-
-        model_name="XGBoost",
-
-        model=model,
-
-        X_train=X_train,
-
-        X_test=X_test,
-
-        y_train=y_train,
-
-        y_test=y_test,
-
-    )
-
-
-##########################################################
-# LightGBM
-##########################################################
-
-from lightgbm import LGBMClassifier
-
-
-@register_model("LightGBM")
-def train_lightgbm(
-    X_train,
-    X_test,
-    y_train,
-    y_test,
-) -> ModelResult:
-
-    model = LGBMClassifier(
-
-        n_estimators=DEFAULT_LIGHTGBM_TREES,
-
-        learning_rate=DEFAULT_LIGHTGBM_LEARNING_RATE,
-
-        num_leaves=DEFAULT_LIGHTGBM_LEAVES,
-
-        random_state=DEFAULT_RANDOM_STATE,
-
-        n_jobs=DEFAULT_N_JOBS,
-
-        verbose=-1,
-
-    )
-
-    return train_classifier(
-
-        model_name="LightGBM",
-
-        model=model,
-
-        X_train=X_train,
-
-        X_test=X_test,
-
-        y_train=y_train,
-
-        y_test=y_test,
-
-    )
-
-
-##########################################################
-# CatBoost
-##########################################################
-
-from catboost import CatBoostClassifier
-
-
-@register_model("CatBoost")
-def train_catboost(
-    X_train,
-    X_test,
-    y_train,
-    y_test,
-) -> ModelResult:
-
-    model = CatBoostClassifier(
-
-        iterations=DEFAULT_CATBOOST_TREES,
-
-        depth=DEFAULT_CATBOOST_DEPTH,
-
-        learning_rate=DEFAULT_CATBOOST_LEARNING_RATE,
-
-        random_seed=DEFAULT_RANDOM_STATE,
-
-        verbose=False,
-
-    )
-
-    return train_classifier(
-
-        model_name="CatBoost",
-
-        model=model,
-
-        X_train=X_train,
-
-        X_test=X_test,
-
-        y_train=y_train,
-
-        y_test=y_test,
-
-    )
-
-
-##########################################################
-# Kernel Methods
-##########################################################
-
-from sklearn.svm import (
-    SVC,
-    LinearSVC,
-)
-
-
-##########################################################
-# Support Vector Classifier
-##########################################################
-
-@register_model("Support Vector Classifier")
-def train_svc(
-    X_train,
-    X_test,
-    y_train,
-    y_test,
-) -> ModelResult:
-
-    model = SVC(
-
-        kernel="rbf",
-
-        C=1.0,
-
-        gamma="scale",
-
-        probability=True,
-
-        random_state=DEFAULT_RANDOM_STATE,
-
-    )
-
-    return train_classifier(
-
-        model_name="Support Vector Classifier",
-
-        model=model,
-
-        X_train=X_train,
-
-        X_test=X_test,
-
-        y_train=y_train,
-
-        y_test=y_test,
-
-    )
-
-
-##########################################################
-# Linear SVC
-##########################################################
-
-@register_model("Linear SVC")
-def train_linear_svc(
-    X_train,
-    X_test,
-    y_train,
-    y_test,
-) -> ModelResult:
-
-    model = LinearSVC(
-
-        C=1.0,
-
-        max_iter=5000,
-
-        random_state=DEFAULT_RANDOM_STATE,
-
-    )
-
-    return train_classifier(
-
-        model_name="Linear SVC",
-
-        model=model,
-
-        X_train=X_train,
-
-        X_test=X_test,
-
-        y_train=y_train,
-
-        y_test=y_test,
-
-    )
-
-
-##########################################################
-# K-Nearest Neighbors
-##########################################################
-
-from sklearn.neighbors import KNeighborsClassifier
-
-
-@register_model("K-Nearest Neighbors")
-def train_knn(
-    X_train,
-    X_test,
-    y_train,
-    y_test,
-) -> ModelResult:
-
-    model = KNeighborsClassifier(
-
-        n_neighbors=DEFAULT_KNN_NEIGHBORS,
-
-        weights="uniform",
-
-        algorithm="auto",
-
-        metric="minkowski",
-
-        p=2,
-
-    )
-
-    return train_classifier(
-
-        model_name="K-Nearest Neighbors",
-
-        model=model,
-
-        X_train=X_train,
-
-        X_test=X_test,
-
-        y_train=y_train,
-
-        y_test=y_test,
-
-    )
-##########################################################
-# Naive Bayes Models
-##########################################################
-
-from sklearn.naive_bayes import (
-    GaussianNB,
-    BernoulliNB,
-    MultinomialNB,
-)
-
-
-##########################################################
-# Gaussian Naive Bayes
-##########################################################
-
-@register_model("Gaussian Naive Bayes")
-def train_gaussian_nb(
-    X_train,
-    X_test,
-    y_train,
-    y_test,
-) -> ModelResult:
-
-    model = GaussianNB()
-
-    return train_classifier(
-
-        model_name="Gaussian Naive Bayes",
-
-        model=model,
-
-        X_train=X_train,
-
-        X_test=X_test,
-
-        y_train=y_train,
-
-        y_test=y_test,
-
-    )
-
-
-##########################################################
-# Bernoulli Naive Bayes
-##########################################################
-
-@register_model("Bernoulli Naive Bayes")
-def train_bernoulli_nb(
-    X_train,
-    X_test,
-    y_train,
-    y_test,
-) -> ModelResult:
-
-    model = BernoulliNB()
-
-    return train_classifier(
-
-        model_name="Bernoulli Naive Bayes",
-
-        model=model,
-
-        X_train=X_train,
-
-        X_test=X_test,
-
-        y_train=y_train,
-
-        y_test=y_test,
-
-    )
-
-
-##########################################################
-# Multinomial Naive Bayes
-##########################################################
-
-@register_model("Multinomial Naive Bayes")
-def train_multinomial_nb(
-    X_train,
-    X_test,
-    y_train,
-    y_test,
-) -> ModelResult:
-
-    X_train_positive = np.maximum(
-        X_train,
-        0,
-    )
-
-    X_test_positive = np.maximum(
-        X_test,
-        0,
-    )
-
-    model = MultinomialNB()
-
-    return train_classifier(
-
-        model_name="Multinomial Naive Bayes",
-
-        model=model,
-
-        X_train=X_train_positive,
-
-        X_test=X_test_positive,
-
-        y_train=y_train,
-
-        y_test=y_test,
-
-    )
-
-
-##########################################################
-# Classification Trainer
-##########################################################
+# ------------------------------------------------------------------
+# Train all
+# ------------------------------------------------------------------
 
 def train_classification_models(
-    X_train,
-    X_test,
-    y_train,
-    y_test,
-) -> list[ModelResult]:
-    """
-    Train every registered classifier.
-    """
+    X_train: Any,
+    X_test: Any,
+    y_train: Any,
+    y_test: Any,
+    *,
+    random_state: int = DEFAULT_RANDOM_STATE,
+    excluded_algorithms: list[str] | None = None,
+    timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
+) -> list[ClassificationResult]:
 
-    results: list[ModelResult] = []
+    _validate_target(
+        y_train,
+        y_test,
+    )
 
-    for model_name, trainer in CLASSIFICATION_MODELS.items():
+    excluded = {
+        str(value).strip().lower()
+        for value in (
+            excluded_algorithms or []
+        )
+    }
 
-        result = safe_train(
+    registry = classification_registry(
+        random_state=random_state
+    )
 
-            model_name,
+    results: list[ClassificationResult] = []
 
-            lambda trainer=trainer: trainer(
+    for model_name, model in registry.items():
 
+        if model_name.lower() in excluded:
+
+            results.append(
+                ClassificationResult(
+                    model_name=model_name,
+                    success=False,
+                    status=ModelStatus.SKIPPED,
+                    skip_reason=(
+                        "Excluded by user configuration."
+                    ),
+                )
+            )
+
+            continue
+
+        results.append(
+            safe_train_classifier(
+                model_name=model_name,
+                model=model,
                 X_train=X_train,
-
                 X_test=X_test,
-
                 y_train=y_train,
-
                 y_test=y_test,
-
-            ),
-
+                timeout_seconds=timeout_seconds,
+            )
         )
 
-        results.append(result)
-
-    ######################################################
-    # Sort
-    ######################################################
-
     results.sort(
-
         key=lambda result: (
-
-            result.success,
-
-            result.f1_score,
-
-            result.accuracy,
-
-            result.precision,
-
+            1 if result.success else 0,
+            result.f1_score
+            if result.f1_score is not None
+            else -np.inf,
+            result.accuracy
+            if result.accuracy is not None
+            else -np.inf,
+            result.roc_auc
+            if result.roc_auc is not None
+            else -np.inf,
         ),
-
         reverse=True,
-
     )
 
     return results
 
 
-##########################################################
-# Best Model
-##########################################################
+# ------------------------------------------------------------------
+# Best model
+# ------------------------------------------------------------------
 
 def best_classification_model(
-    results: list[ModelResult],
-) -> ModelResult | None:
+    results: list[ClassificationResult],
+) -> ClassificationResult | None:
 
     successful = [
-
         result
-
         for result in results
-
         if result.success
-
+        and result.model is not None
+        and result.status == ModelStatus.SUCCESS
     ]
 
     if not successful:
-
         return None
 
-    return successful[0]
+    return max(
+        successful,
+        key=lambda result: (
+            result.f1_score
+            if result.f1_score is not None
+            else -np.inf,
+            result.accuracy
+            if result.accuracy is not None
+            else -np.inf,
+            result.roc_auc
+            if result.roc_auc is not None
+            else -np.inf,
+        ),
+    )
 
 
-##########################################################
-# Successful Models
-##########################################################
-
-def successful_models(
-    results: list[ModelResult],
-) -> list[ModelResult]:
-
-    return [
-
-        result
-
-        for result in results
-
-        if result.success
-
-    ]
-
-
-##########################################################
-# Failed Models
-##########################################################
-
-def failed_models(
-    results: list[ModelResult],
-) -> list[ModelResult]:
-
-    return [
-
-        result
-
-        for result in results
-
-        if not result.success
-
-    ]
-
-
-##########################################################
+# ------------------------------------------------------------------
 # Leaderboard
-##########################################################
+# ------------------------------------------------------------------
 
-def leaderboard(
-    results: list[ModelResult],
-) -> list[dict]:
+def classification_leaderboard(
+    results: list[ClassificationResult],
+) -> list[dict[str, Any]]:
 
-    board = []
+    rows: list[dict[str, Any]] = []
 
-    successful = successful_models(results)
+    for rank, result in enumerate(
+        results,
+        start=1,
+    ):
 
-    for rank, result in enumerate(successful, start=1):
-
-        board.append(
-
+        rows.append(
             {
-
                 "rank": rank,
-
+                "model": result.model_name,
                 "model_name": result.model_name,
-
-                "score": result.f1_score,
-
-                "training_time": result.training_time,
-
-                "success": result.success,
-
+                "status": result.status.value,
+                "success": bool(result.success),
                 "accuracy": result.accuracy,
-
                 "precision": result.precision,
-
                 "recall": result.recall,
-
                 "f1_score": result.f1_score,
-
                 "roc_auc": result.roc_auc,
-
-                "confusion_matrix": (
-                    result.confusion_matrix.tolist()
-                    if result.confusion_matrix is not None
-                    else None
-                ),
-
+                "confusion_matrix": result.confusion_matrix,
+                "classes": result.classes,
+                "training_time": result.training_time,
                 "error": result.error,
-
+                "skip_reason": result.skip_reason,
             }
-
         )
 
-    return board
+    return rows
 
 
-##########################################################
-# Public API
-##########################################################
+leaderboard = classification_leaderboard
+
 
 __all__ = [
-
-    "ModelResult",
-
+    "classification_registry",
     "CLASSIFICATION_MODELS",
-
-    "register_model",
-
-    "available_models",
-
-    "calculate_metrics",
-
-    "train_classifier",
-
-    "safe_train",
-
+    "safe_train_classifier",
     "train_classification_models",
-
     "best_classification_model",
-
-    "successful_models",
-
-    "failed_models",
-
+    "classification_leaderboard",
     "leaderboard",
-
+    "calculate_metrics",
 ]
