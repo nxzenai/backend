@@ -1,31 +1,32 @@
 """
 NxZen AI Studio
-
 AutoML Router
 
-REST API endpoints for the AutoML module.
+REST API for the synchronous AutoML module.
 
 Responsibilities
 ----------------
-• Dataset Upload
-• AutoML Training
-• Prediction
-• Analysis
-• Leaderboard
-• Model Management
+- Dataset upload
+- Training
+- Local-file training
+- Prediction
+- Analysis
+- Leaderboard
+- Model management
+- Service information
 """
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
-from typing import Any
+from typing import Optional
 
 import pandas as pd
 
 from fastapi import (
 
     APIRouter,
-
     Depends,
 
     File,
@@ -35,16 +36,9 @@ from fastapi import (
     HTTPException,
 
     UploadFile,
-
     status,
 
 )
-
-from fastapi.responses import JSONResponse
-from fastapi.encoders import jsonable_encoder
-##########################################################
-# AutoML Modules
-##########################################################
 
 from app.modules.automl.service import (
 
@@ -54,21 +48,10 @@ from app.modules.automl.service import (
 
 )
 
-def sanitize_dataframe(
-    dataframe: pd.DataFrame,
-) -> pd.DataFrame:
-    """
-    Replace NaN values with None so the
-    DataFrame can be serialized to JSON.
-    """
 
-    return dataframe.where(
-        pd.notnull(dataframe),
-        None,
-    )
-##########################################################
-# Router
-##########################################################
+# ================================================================
+# ROUTER
+# ================================================================
 
 router = APIRouter(
 
@@ -82,51 +65,99 @@ router = APIRouter(
 
 )
 
-##########################################################
-# Dependency
-##########################################################
+
+# ================================================================
+# CONSTANTS
+# ================================================================
+
+ALLOWED_EXTENSIONS = {
+    ".csv",
+    ".xlsx",
+    ".xls",
+}
+
+NULL_VALUES = {
+    "",
+    "none",
+    "null",
+    "undefined",
+}
+
+
+# ================================================================
+# SERVICE DEPENDENCY
+# ================================================================
+
 
 
 def get_automl_service() -> AutoMLService:
-    """
-    Returns an AutoMLService instance.
-    """
-
-    config = AutoMLServiceConfig()
 
     return AutoMLService(
-
-        config,
-
+        AutoMLServiceConfig()
     )
 
 
-##########################################################
-# Helpers
-##########################################################
+# ================================================================
+# NORMALIZATION
+# ================================================================
 
-ALLOWED_EXTENSIONS = {
 
-    ".csv",
+def normalize_target_column(
+    target_column: Optional[str],
+) -> Optional[str]:
 
-    ".xlsx",
+    if target_column is None:
+        return None
 
-    ".xls",
+    normalized = (
+        target_column
+        .strip()
+    )
 
-}
+    if normalized.lower() in NULL_VALUES:
+        return None
+
+    return normalized
+
+
+def normalize_task(
+    task: Optional[str],
+) -> Optional[str]:
+
+    if task is None:
+        return None
+
+    normalized = (
+        task
+        .strip()
+        .lower()
+    )
+
+    if normalized in NULL_VALUES:
+        return None
+
+    return normalized
+
+
+# ================================================================
+# FILE VALIDATION
+# ================================================================
 
 
 def validate_upload_file(
     filename: str,
 ) -> None:
-    """
-    Validates uploaded dataset.
-    """
+
+    if not filename:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "Uploaded file must have a filename."
+            ),
+        )
 
     extension = Path(
-
-        filename,
-
+        filename
     ).suffix.lower()
 
     if extension not in ALLOWED_EXTENSIONS:
@@ -136,54 +167,172 @@ def validate_upload_file(
             status_code=status.HTTP_400_BAD_REQUEST,
 
             detail=(
-
                 "Only CSV and Excel files "
-
                 "are supported."
-
             ),
 
         )
 
 
+# ================================================================
+# FILE → DATAFRAME
+# ================================================================
+
+
 async def dataframe_from_upload(
     upload: UploadFile,
 ) -> pd.DataFrame:
-    """
-    Converts an uploaded file into
-    a pandas DataFrame.
-    """
 
-    validate_upload_file(
+    filename = upload.filename or ""
 
-        upload.filename,
-
-    )
+    validate_upload_file(filename)
 
     extension = Path(
-
-        upload.filename,
-
+        filename
     ).suffix.lower()
 
-    if extension == ".csv":
+    try:
 
-        return pd.read_csv(
+        # --------------------------------------------------------
+        # Reset file pointer
+        # --------------------------------------------------------
 
-            upload.file,
+        await upload.seek(0)
 
-        )
+        # --------------------------------------------------------
+        # CSV
+        # --------------------------------------------------------
 
-    return pd.read_excel(
+        if extension == ".csv":
 
-        upload.file,
+            def read_csv():
+                upload.file.seek(0)
 
+                try:
+                    return pd.read_csv(
+                        upload.file,
+                        encoding="utf-8",
+                    )
+
+                except UnicodeDecodeError:
+
+                    upload.file.seek(0)
+
+                    return pd.read_csv(
+                        upload.file,
+                        encoding="latin1",
+                    )
+
+            dataframe = await asyncio.to_thread(
+                read_csv
+            )
+
+        # --------------------------------------------------------
+        # Excel
+        # --------------------------------------------------------
+
+        elif extension in {
+            ".xls",
+            ".xlsx",
+        }:
+
+            def read_excel():
+                upload.file.seek(0)
+
+                return pd.read_excel(
+                    upload.file
+                )
+
+            dataframe = await asyncio.to_thread(
+                read_excel
+            )
+
+        # --------------------------------------------------------
+        # Unsupported
+        # --------------------------------------------------------
+
+        else:
+
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    "Unsupported dataset format. "
+                    "Only CSV, XLS, and XLSX files are supported."
+                ),
+            )
+
+        # --------------------------------------------------------
+        # Validate dataframe
+        # --------------------------------------------------------
+
+        if dataframe is None:
+            raise ValueError(
+                "Dataset could not be loaded."
+            )
+
+        if dataframe.empty:
+            raise ValueError(
+                "Dataset is empty."
+            )
+
+        if len(dataframe.columns) == 0:
+            raise ValueError(
+                "Dataset contains no columns."
+            )
+
+        # --------------------------------------------------------
+        # Normalize column names
+        #
+        # IMPORTANT:
+        # Don't modify the user's actual column names.
+        # Only convert them safely to strings.
+        # --------------------------------------------------------
+
+        dataframe.columns = [
+            str(column).strip()
+            for column in dataframe.columns
+        ]
+
+        return dataframe
+
+    except HTTPException:
+        raise
+
+    except Exception as exc:
+
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "Unable to read uploaded dataset: "
+                f"{type(exc).__name__}: {exc}"
+            ),
+        ) from exc
+
+
+# ================================================================
+# CPU-BOUND TRAINING
+# ================================================================
+
+
+async def train_service(
+    service: AutoMLService,
+    dataframe: pd.DataFrame,
+    target_column: Optional[str],
+    task: Optional[str],
+):
+
+    return await asyncio.to_thread(
+        service.train,
+        dataframe,
+        target_column,
+        task=task,
     )
 
 
-##########################################################
-# Dataset Upload & Training
-##########################################################
+# ================================================================
+# TRAIN
+# ================================================================
+
 
 @router.post(
     "/train",
@@ -191,41 +340,50 @@ async def dataframe_from_upload(
 )
 async def train_dataset(
     file: UploadFile = File(...),
-    target_column: str = "",
+    target_column: Optional[str] = Form(
+        default=None
+    ),
+    task: Optional[str] = Form(
+        default=None
+    ),
     service: AutoMLService = Depends(
         get_automl_service,
     ),
 ):
-    """
-    Uploads a dataset and executes the
-    complete AutoML pipeline.
-    """
 
     try:
 
-        dataframe = await dataframe_from_upload(
-
-            file,
-
-        )
-
-        result = service.train(
-
-            dataframe,
-
-            target_column,
-
-        )
-
-        return JSONResponse(
-
-            content=service.complete_response(
-
-                result,
-
+        dataframe = (
+            await dataframe_from_upload(
+                file
             )
-
         )
+
+        normalized_target = (
+            normalize_target_column(
+                target_column
+            )
+        )
+
+        normalized_task = (
+            normalize_task(
+                task
+            )
+        )
+
+        result = await train_service(
+            service,
+            dataframe,
+            normalized_target,
+            normalized_task,
+        )
+
+        return service.complete_response(
+            result
+        )
+
+    except HTTPException:
+        raise
 
     except Exception as exc:
 
@@ -234,13 +392,13 @@ async def train_dataset(
             status_code=status.HTTP_400_BAD_REQUEST,
 
             detail=str(exc),
+        ) from exc
 
-        )
 
+# ================================================================
+# TRAIN FROM LOCAL FILE
+# ================================================================
 
-##########################################################
-# Train From Local File
-##########################################################
 
 @router.post(
     "/train/file",
@@ -248,35 +406,40 @@ async def train_dataset(
 )
 async def train_from_file(
     filepath: str,
-    target_column: str,
+    target_column: Optional[str] = None,
+    task: Optional[str] = None,
     service: AutoMLService = Depends(
         get_automl_service,
     ),
 ):
-    """
-    Trains an AutoML model using
-    a dataset already present on disk.
-    """
 
     try:
 
-        result = service.train_from_file(
-
-            filepath,
-
-            target_column,
-
-        )
-
-        return JSONResponse(
-
-            content=service.complete_response(
-
-                result,
-
+        normalized_target = (
+            normalize_target_column(
+                target_column
             )
-
         )
+
+        normalized_task = (
+            normalize_task(
+                task
+            )
+        )
+
+        result = await asyncio.to_thread(
+            service.train_from_file,
+            filepath,
+            normalized_target,
+            task=normalized_task,
+        )
+
+        return service.complete_response(
+            result
+        )
+
+    except HTTPException:
+        raise
 
     except Exception as exc:
 
@@ -285,35 +448,31 @@ async def train_from_file(
             status_code=status.HTTP_400_BAD_REQUEST,
 
             detail=str(exc),
+        ) from exc
 
-        )
 
+# ================================================================
+# DATASET INFORMATION
+# ================================================================
 
-##########################################################
-# Dataset Information
-##########################################################
 
 @router.post(
-    "/dataset/info",
+    "/inspect",
     status_code=status.HTTP_200_OK,
 )
-async def dataset_information(
+async def inspect_dataset(
     file: UploadFile = File(...),
     service: AutoMLService = Depends(
         get_automl_service,
     ),
 ):
-    """
-    Returns metadata about
-    the uploaded dataset.
-    """
 
     try:
 
-        dataframe = await dataframe_from_upload(
-
-            file,
-
+        dataframe = (
+            await dataframe_from_upload(
+                file
+            )
         )
 
         return service.dataset_information(
@@ -322,6 +481,9 @@ async def dataset_information(
 
         )
 
+    except HTTPException:
+        raise
+
     except Exception as exc:
 
         raise HTTPException(
@@ -329,37 +491,64 @@ async def dataset_information(
             status_code=status.HTTP_400_BAD_REQUEST,
 
             detail=str(exc),
+        ) from exc
 
-        )
 
+# ================================================================
+# PREVIEW
+# ================================================================
 
-##########################################################
-# Dataset Preview
-##########################################################
 
 @router.post(
-    "/dataset/preview",
+    "/preview",
     status_code=status.HTTP_200_OK,
 )
-async def dataset_preview(
+async def preview_dataset(
     file: UploadFile = File(...),
-    rows: int = 5,
+    rows: int = Form(default=5),
     service: AutoMLService = Depends(
         get_automl_service,
     ),
 ):
     """
-    Returns the first rows
-    of the uploaded dataset.
+    Preview an uploaded dataset.
+
+    Supports:
+        - CSV
+        - XLS
+        - XLSX
+
+    Missing values are converted to JSON null so that
+    datasets such as House_Price.csv can be returned safely.
     """
 
     try:
 
-        dataframe = await dataframe_from_upload(
+        # --------------------------------------------------------
+        # Validate requested preview size
+        # --------------------------------------------------------
 
-            file,
+        if rows < 1:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="rows must be at least 1.",
+            )
 
-        )
+        if rows > 100:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="rows cannot exceed 100.",
+            )
+
+        # --------------------------------------------------------
+        # Read uploaded file
+        # --------------------------------------------------------
+
+        dataframe = await dataframe_from_upload(file)
+
+        # --------------------------------------------------------
+        # Generate preview
+        # --------------------------------------------------------
 
         preview = service.preview_dataset(
 
@@ -369,534 +558,84 @@ async def dataset_preview(
 
         )
 
-        records = preview.replace(
-            {float("nan"): None}
-        ).to_dict(
-            orient="records",
-        )
+        # --------------------------------------------------------
+        # IMPORTANT:
+        #
+        # pandas DataFrames can contain NaN / NaT values.
+        #
+        # NaN is not valid JSON.
+        #
+        # Using pandas JSON serialization converts missing
+        # values into JSON null safely.
+        # --------------------------------------------------------
 
-        return JSONResponse(
-            content=records,
-        )
+        import json
 
-
-    
-
-    except Exception as exc:
-
-        raise HTTPException(
-
-            status_code=status.HTTP_400_BAD_REQUEST,
-
-            detail=str(exc),
-
-        )
-
-
-##########################################################
-# Dataset Columns
-##########################################################
-
-@router.post(
-    "/dataset/columns",
-    status_code=status.HTTP_200_OK,
-)
-async def dataset_columns(
-    file: UploadFile = File(...),
-    service: AutoMLService = Depends(
-        get_automl_service,
-    ),
-):
-    """
-    Returns all dataset columns.
-    """
-
-    try:
-
-        dataframe = await dataframe_from_upload(
-
-            file,
-
-        )
-
-        return {
-
-            "columns": service.dataset_columns(
-
-                dataframe,
-
+        preview_rows = json.loads(
+            preview.to_json(
+                orient="records",
+                date_format="iso",
             )
-
-        }
-
-    except Exception as exc:
-
-        raise HTTPException(
-
-            status_code=status.HTTP_400_BAD_REQUEST,
-
-            detail=str(exc),
-
         )
 
-
-##########################################################
-# Dataset Shape
-##########################################################
-
-@router.post(
-    "/dataset/shape",
-    status_code=status.HTTP_200_OK,
-)
-async def dataset_shape(
-    file: UploadFile = File(...),
-    service: AutoMLService = Depends(
-        get_automl_service,
-    ),
-):
-    """
-    Returns dataset dimensions.
-    """
-
-    try:
-
-        dataframe = await dataframe_from_upload(
-
-            file,
-
-        )
-
-        rows, columns = service.dataset_shape(
-
-            dataframe,
-
-        )
+        # --------------------------------------------------------
+        # Response
+        # --------------------------------------------------------
 
         return {
-
-            "rows": rows,
-
-            "columns": columns,
-
+            "rows": preview_rows,
+            "count": len(preview_rows),
         }
 
-    except Exception as exc:
-
-        raise HTTPException(
-
-            status_code=status.HTTP_400_BAD_REQUEST,
-
-            detail=str(exc),
-
-        )
-    ##########################################################
-# Analysis
-##########################################################
-
-@router.post(
-    "/analysis",
-    status_code=status.HTTP_200_OK,
-)
-async def analyze_dataset(
-    file: UploadFile = File(...),
-    target_column: str = "",
-    service: AutoMLService = Depends(
-        get_automl_service,
-    ),
-):
-    """
-    Trains a dataset and returns
-    the complete AutoML analysis.
-    """
-
-    try:
-
-        dataframe = await dataframe_from_upload(
-
-            file,
-
-        )
-
-        result = service.train(
-
-            dataframe,
-
-            target_column,
-
-        )
-
-        analysis = service.analyze(
-
-            result,
-
-        )
-
-        return {
-
-            "summary": analysis.summary,
-
-            "comparison": analysis.comparison,
-
-            "recommendations": analysis.recommendations,
-
-        }
+    except HTTPException:
+        raise
 
     except Exception as exc:
 
-        raise HTTPException(
-
-            status_code=status.HTTP_400_BAD_REQUEST,
-
-            detail=str(exc),
-
+        logger.exception(
+            "AutoML dataset preview failed"
         )
-
-
-##########################################################
-# Executive Summary
-##########################################################
-
-@router.post(
-    "/summary",
-    status_code=status.HTTP_200_OK,
-)
-async def executive_summary(
-    file: UploadFile = File(...),
-    target_column: str = "",
-    service: AutoMLService = Depends(
-        get_automl_service,
-    ),
-):
-    """
-    Returns the AutoML executive summary.
-    """
-
-    try:
-
-        dataframe = await dataframe_from_upload(
-
-            file,
-
-        )
-
-        result = service.train(
-
-            dataframe,
-
-            target_column,
-
-        )
-
-        return service.executive_summary(
-
-            result,
-
-        )
-
-    except Exception as exc:
-
-        raise HTTPException(
-
-            status_code=status.HTTP_400_BAD_REQUEST,
-
-            detail=str(exc),
-
-        )
-
-
-##########################################################
-# Leaderboard
-##########################################################
-
-@router.post(
-    "/leaderboard",
-    status_code=status.HTTP_200_OK,
-)
-async def leaderboard(
-    file: UploadFile = File(...),
-    target_column: str = "",
-    service: AutoMLService = Depends(
-        get_automl_service,
-    ),
-):
-    """
-    Returns the AutoML leaderboard.
-    """
-
-    try:
-
-        dataframe = await dataframe_from_upload(
-
-            file,
-
-        )
-
-        result = service.train(
-
-            dataframe,
-
-            target_column,
-
-        )
-
-        board = service.leaderboard(
-
-            result,
-
-        )
-
-        return service.leaderboard.export_dict(
-
-            board,
-
-        )
-
-    except Exception as exc:
-
-        raise HTTPException(
-
-            status_code=status.HTTP_400_BAD_REQUEST,
-
-            detail=str(exc),
-
-        )
-
-
-##########################################################
-# Best Model
-##########################################################
-
-@router.post(
-    "/best-model",
-    status_code=status.HTTP_200_OK,
-)
-async def best_model(
-    file: UploadFile = File(...),
-    target_column: str = "",
-    service: AutoMLService = Depends(
-        get_automl_service,
-    ),
-):
-    """
-    Returns the best trained model.
-    """
-
-    try:
-
-        dataframe = await dataframe_from_upload(
-
-            file,
-
-        )
-
-        result = service.train(
-
-            dataframe,
-
-            target_column,
-
-        )
-
-        return service.best_model_insights(
-
-            result,
-
-        )
-
-    except Exception as exc:
-
-        raise HTTPException(
-
-            status_code=status.HTTP_400_BAD_REQUEST,
-
-            detail=str(exc),
-
-        )
-
-
-##########################################################
-# Recommendations
-##########################################################
-
-@router.post(
-    "/recommendations",
-    status_code=status.HTTP_200_OK,
-)
-async def recommendations(
-    file: UploadFile = File(...),
-    target_column: str = "",
-    service: AutoMLService = Depends(
-        get_automl_service,
-    ),
-):
-    """
-    Returns AutoML recommendations.
-    """
-
-    try:
-
-        dataframe = await dataframe_from_upload(
-
-            file,
-
-        )
-
-        result = service.train(
-
-            dataframe,
-
-            target_column,
-
-        )
-
-        return {
-
-            "recommendations": service.recommendations(
-
-                result,
-
-            )
-
-        }
-
-    except Exception as exc:
-
-        raise HTTPException(
-
-            status_code=status.HTTP_400_BAD_REQUEST,
-
-            detail=str(exc),
-
-        )
-
-
-##########################################################
-# Training Statistics
-##########################################################
-
-@router.post(
-    "/statistics",
-    status_code=status.HTTP_200_OK,
-)
-async def training_statistics(
-    file: UploadFile = File(...),
-    target_column: str = "",
-    service: AutoMLService = Depends(
-        get_automl_service,
-    ),
-):
-    """
-    Returns AutoML training statistics.
-    """
-
-    try:
-
-        dataframe = await dataframe_from_upload(
-
-            file,
-
-        )
-
-        result = service.train(
-
-            dataframe,
-
-            target_column,
-
-        )
-
-        return service.training_statistics(
-
-            result,
-
-        )
-
-    except Exception as exc:
-
-        raise HTTPException(
-
-            status_code=status.HTTP_400_BAD_REQUEST,
-
-            detail=str(exc),
-
-        )
-
-
-##########################################################
-# Complete Response
-##########################################################
-
-@router.post(
-    "/complete",
-    status_code=status.HTTP_200_OK,
-)
-async def complete_response(
-    file: UploadFile = File(...),
-    target_column: str = Form(...),   # <-- CHANGE THIS
-    service: AutoMLService = Depends(
-        get_automl_service,
-    ),
-):
-    """
-    Returns the complete AutoML response.
-    """
-
-    try:
-
-        print("=" * 60)
-        print("TARGET COLUMN:", target_column)
-        print("=" * 60)
-
-        dataframe = await dataframe_from_upload(file)
-
-        result = service.train(
-            dataframe,
-            target_column,
-        )
-
-        return service.complete_response(result)
-
-    except Exception as exc:
 
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=str(exc),
-        )
-    ##########################################################
-# Prediction
-##########################################################
+            detail=(
+                "Unable to preview uploaded dataset: "
+                f"{type(exc).__name__}: {exc}"
+            ),
+        ) from exc
+
+
+# ================================================================
+# PREDICTION FROM SAVED MODEL
+# ================================================================
+
 
 @router.post(
     "/predict",
     status_code=status.HTTP_200_OK,
 )
 async def predict(
-    model_name: str,
+    model_filename: str = Form(...),
     file: UploadFile = File(...),
     service: AutoMLService = Depends(
         get_automl_service,
     ),
 ):
-    """
-    Generates predictions using a saved model.
-    """
 
     try:
 
-        dataframe = await dataframe_from_upload(
-
-            file,
-
+        dataframe = (
+            await dataframe_from_upload(
+                file
+            )
         )
 
         model = service.load_model(
-
-            model_name,
-
+            model_filename
         )
 
-        predictions = service.predict(
-
+        predictions = await asyncio.to_thread(
+            service.predict,
             model,
 
             dataframe,
@@ -904,12 +643,13 @@ async def predict(
         )
 
         return {
-
-            "model": model_name,
-
-            "predictions": predictions.tolist(),
-
+            "model": model_filename,
+            "rows": len(dataframe),
+            "predictions": predictions,
         }
+
+    except HTTPException:
+        raise
 
     except Exception as exc:
 
@@ -918,177 +658,13 @@ async def predict(
             status_code=status.HTTP_400_BAD_REQUEST,
 
             detail=str(exc),
-
-        )
-
-
-##########################################################
-# Batch Prediction
-##########################################################
-
-@router.post(
-    "/predict/batch",
-    status_code=status.HTTP_200_OK,
-)
-async def predict_batch(
-    model_name: str,
-    file: UploadFile = File(...),
-    service: AutoMLService = Depends(
-        get_automl_service,
-    ),
-):
-    """
-    Generates batch predictions.
-    """
-
-    try:
-
-        dataframe = await dataframe_from_upload(
-
-            file,
-
-        )
-
-        model = service.load_model(
-
-            model_name,
-
-        )
-
-        predictions = service.predict_batch(
-
-            model,
-
-            dataframe,
-
-        )
-
-        return {
-
-            "model": model_name,
-
-            "total_predictions": len(
-
-                predictions,
-
-            ),
-
-            "predictions": predictions.tolist(),
-
-        }
-
-    except Exception as exc:
-
-        raise HTTPException(
-
-            status_code=status.HTTP_400_BAD_REQUEST,
-
-            detail=str(exc),
-
-        )
+        ) from exc
 
 
-##########################################################
-# Model Information
-##########################################################
+# ================================================================
+# MODEL LIST
+# ================================================================
 
-@router.get(
-    "/models/{model_name}",
-    status_code=status.HTTP_200_OK,
-)
-async def model_information(
-    model_name: str,
-    service: AutoMLService = Depends(
-        get_automl_service,
-    ),
-):
-    """
-    Returns metadata of a saved model.
-    """
-
-    try:
-
-        return service.saved_model_information(
-
-            model_name,
-
-        )
-
-    except Exception as exc:
-
-        raise HTTPException(
-
-            status_code=status.HTTP_404_NOT_FOUND,
-
-            detail=str(exc),
-
-        )
-
-
-##########################################################
-# Check Model Exists
-##########################################################
-
-@router.get(
-    "/models/{model_name}/exists",
-    status_code=status.HTTP_200_OK,
-)
-async def model_exists(
-    model_name: str,
-    service: AutoMLService = Depends(
-        get_automl_service,
-    ),
-):
-    """
-    Checks whether a model exists.
-    """
-
-    return {
-
-        "model": model_name,
-
-        "exists": service.model_exists(
-
-            model_name,
-
-        ),
-
-    }
-
-
-##########################################################
-# Prediction Health Check
-##########################################################
-
-@router.get(
-    "/predict/health",
-    status_code=status.HTTP_200_OK,
-)
-async def prediction_health(
-    service: AutoMLService = Depends(
-        get_automl_service,
-    ),
-):
-    """
-    Returns prediction service status.
-    """
-
-    return {
-
-        "prediction_available": True,
-
-        "saved_models": len(
-
-            service.list_models(),
-
-        ),
-
-        "status": "ready",
-
-    }
-##########################################################
-# Model Management
-##########################################################
 
 @router.get(
     "/models",
@@ -1099,486 +675,112 @@ async def list_models(
         get_automl_service,
     ),
 ):
-    """
-    Lists all saved AutoML models.
-    """
+
+    return {
+        "models": service.list_models(),
+        "count": len(
+            service.list_models()
+        ),
+    }
+
+
+# ================================================================
+# MODEL INFORMATION
+# ================================================================
+
+
+@router.get(
+    "/models/{filename}",
+    status_code=status.HTTP_200_OK,
+)
+async def model_information(
+    filename: str,
+    service: AutoMLService = Depends(
+        get_automl_service
+    ),
+):
 
     try:
 
-        return {
-
-            "count": len(
-
-                service.list_models(),
-
-            ),
-
-            "models": service.list_models(),
-
-        }
-
-    except Exception as exc:
-
-        raise HTTPException(
-
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-
-            detail=str(exc),
-
+        return service.saved_model_information(
+            filename
         )
 
+    except FileNotFoundError as exc:
 
-##########################################################
-# Delete Model
-##########################################################
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(exc),
+        ) from exc
+
+
+# ================================================================
+# DELETE MODEL
+# ================================================================
+
 
 @router.delete(
-    "/models/{model_name}",
+    "/models/{filename}",
     status_code=status.HTTP_200_OK,
 )
 async def delete_model(
-    model_name: str,
+    filename: str,
     service: AutoMLService = Depends(
         get_automl_service,
     ),
 ):
-    """
-    Deletes a saved model.
-    """
 
-    try:
+    deleted = service.delete_model(
+        filename
+    )
 
-        deleted = service.delete_model(
-
-            model_name,
-
-        )
-
-        if not deleted:
-
-            raise HTTPException(
-
-                status_code=status.HTTP_404_NOT_FOUND,
-
-                detail=f"Model '{model_name}' not found.",
-
-            )
-
-        return {
-
-            "message": "Model deleted successfully.",
-
-            "model": model_name,
-
-        }
-
-    except HTTPException:
-
-        raise
-
-    except Exception as exc:
+    if not deleted:
 
         raise HTTPException(
-
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-
-            detail=str(exc),
-
-        )
-
-
-##########################################################
-# Clear All Models
-##########################################################
-
-@router.delete(
-    "/models",
-    status_code=status.HTTP_200_OK,
-)
-async def clear_models(
-    service: AutoMLService = Depends(
-        get_automl_service,
-    ),
-):
-    """
-    Deletes all saved models.
-    """
-
-    try:
-
-        deleted = service.clear_models()
-
-        return {
-
-            "message": "All models deleted successfully.",
-
-            "deleted_models": deleted,
-
-        }
-
-    except Exception as exc:
-
-        raise HTTPException(
-
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-
-            detail=str(exc),
-
-        )
-
-
-##########################################################
-# Model Path
-##########################################################
-
-@router.get(
-    "/models/{model_name}/path",
-    status_code=status.HTTP_200_OK,
-)
-async def model_path(
-    model_name: str,
-    service: AutoMLService = Depends(
-        get_automl_service,
-    ),
-):
-    """
-    Returns the filesystem path
-    of a saved model.
-    """
-
-    try:
-
-        if not service.model_exists(
-
-            model_name,
-
-        ):
-
-            raise HTTPException(
-
-                status_code=status.HTTP_404_NOT_FOUND,
-
-                detail=f"Model '{model_name}' not found.",
-
-            )
-
-        return {
-
-            "model": model_name,
-
-            "path": str(
-
-                service.model_path(
-
-                    model_name,
-
-                )
-
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=(
+                f"Model '{filename}' "
+                "was not found."
             ),
-
-        }
-
-    except HTTPException:
-
-        raise
-
-    except Exception as exc:
-
-        raise HTTPException(
-
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-
-            detail=str(exc),
-
         )
 
+    return {
+        "deleted": True,
+        "filename": filename,
+    }
 
-##########################################################
-# Service Status
-##########################################################
+
+# ================================================================
+# SERVICE INFORMATION
+# ================================================================
+
 
 @router.get(
-    "/status",
+    "/info",
     status_code=status.HTTP_200_OK,
 )
-async def service_status(
+async def automl_information(
     service: AutoMLService = Depends(
         get_automl_service,
     ),
 ):
-    """
-    Returns AutoML service status.
-    """
 
-    try:
-
-        return service.status()
-
-    except Exception as exc:
-
-        raise HTTPException(
-
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-
-            detail=str(exc),
-
-        )
+    return service.information()
 
 
-##########################################################
-# Service Information
-##########################################################
+# ================================================================
+# HEALTH
+# ================================================================
 
-@router.get(
-    "/information",
-    status_code=status.HTTP_200_OK,
-)
-async def service_information(
-    service: AutoMLService = Depends(
-        get_automl_service,
-    ),
-):
-    """
-    Returns complete AutoML service information.
-    """
-
-    try:
-
-        return service.information()
-
-    except Exception as exc:
-
-        raise HTTPException(
-
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-
-            detail=str(exc),
-
-        )
-    ##########################################################
-# Health
-##########################################################
 
 @router.get(
     "/health",
     status_code=status.HTTP_200_OK,
 )
-async def health(
+async def automl_health(
     service: AutoMLService = Depends(
         get_automl_service,
     ),
 ):
-    """
-    Returns the AutoML service health.
-    """
 
-    try:
-
-        return service.health()
-
-    except Exception as exc:
-
-        raise HTTPException(
-
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-
-            detail=str(exc),
-
-        )
-
-
-##########################################################
-# Metadata
-##########################################################
-
-@router.get(
-    "/metadata",
-    status_code=status.HTTP_200_OK,
-)
-async def metadata(
-    service: AutoMLService = Depends(
-        get_automl_service,
-    ),
-):
-    """
-    Returns AutoML service metadata.
-    """
-
-    try:
-
-        return service.metadata()
-
-    except Exception as exc:
-
-        raise HTTPException(
-
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-
-            detail=str(exc),
-
-        )
-
-
-##########################################################
-# Version
-##########################################################
-
-@router.get(
-    "/version",
-    status_code=status.HTTP_200_OK,
-)
-async def version(
-    service: AutoMLService = Depends(
-        get_automl_service,
-    ),
-):
-    """
-    Returns AutoML service version.
-    """
-
-    try:
-
-        return {
-
-            "version": service.version(),
-
-        }
-
-    except Exception as exc:
-
-        raise HTTPException(
-
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-
-            detail=str(exc),
-
-        )
-
-
-##########################################################
-# Root Endpoint
-##########################################################
-
-@router.get(
-    "/",
-    status_code=status.HTTP_200_OK,
-)
-async def root():
-    """
-    AutoML API root endpoint.
-    """
-
-    return {
-
-        "service": "NxZen AI Studio AutoML",
-
-        "version": "1.0.0",
-
-        "status": "running",
-
-        "documentation": "/docs",
-
-        "health": "/automl/health",
-
-    }
-
-
-##########################################################
-# Available Endpoints
-##########################################################
-
-@router.get(
-    "/endpoints",
-    status_code=status.HTTP_200_OK,
-)
-async def endpoints():
-    """
-    Returns all available AutoML endpoints.
-    """
-
-    return {
-
-        "training": [
-
-            "/automl/train",
-
-            "/automl/train/file",
-
-        ],
-
-        "dataset": [
-
-            "/automl/dataset/info",
-
-            "/automl/dataset/preview",
-
-            "/automl/dataset/columns",
-
-            "/automl/dataset/shape",
-
-        ],
-
-        "analysis": [
-
-            "/automl/analysis",
-
-            "/automl/summary",
-
-            "/automl/leaderboard",
-
-            "/automl/best-model",
-
-            "/automl/recommendations",
-
-            "/automl/statistics",
-
-            "/automl/complete",
-
-        ],
-
-        "prediction": [
-
-            "/automl/predict",
-
-            "/automl/predict/batch",
-
-        ],
-
-        "models": [
-
-            "/automl/models",
-
-            "/automl/models/{model_name}",
-
-            "/automl/models/{model_name}/exists",
-
-            "/automl/models/{model_name}/path",
-
-        ],
-
-        "service": [
-
-            "/automl/status",
-
-            "/automl/information",
-
-            "/automl/health",
-
-            "/automl/metadata",
-
-            "/automl/version",
-
-        ],
-
-    }
-
-
-##########################################################
-# Public API
-##########################################################
-
-__all__ = [
-
-    "router",
-
-]
+    return service.health()

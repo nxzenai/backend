@@ -1,1805 +1,2210 @@
 """
 NxZen AI Studio
-
-AutoML Preprocessing
-
-This module is responsible for preparing datasets
-before training machine learning models.
+AutoML Preprocessing Engine
 
 Responsibilities
 ----------------
-• Feature type detection
-• Missing value handling
-• Feature encoding
-• Feature scaling
-• Pipeline construction
-• Train/Test splitting
+1. Separate target from features.
+2. Prevent target leakage.
+3. Detect feature types.
+4. Handle numeric/categorical/boolean/datetime data.
+5. Fit preprocessing exactly once during training.
+6. Reuse the fitted preprocessor during prediction.
+7. Preserve sparse representations where possible.
+8. Preserve the exact training feature schema.
+9. Reproduce datetime transformations deterministically.
+10. Never silently modify the prediction schema.
+
+Important
+---------
+The preprocessing stage is responsible for producing a fitted
+transformer that can safely be serialized together with the model.
+
+Training flow:
+
+    Raw Dataset
+        |
+        +--> Target separation
+        |
+        +--> Raw feature schema
+        |
+        +--> Datetime expansion
+        |
+        +--> Train/Test split
+        |
+        +--> FIT preprocessor on X_train ONLY
+        |
+        +--> Transform X_train
+        |
+        +--> Transform X_test
+        |
+        +--> Build ModelArtifact
+
+Prediction flow:
+
+    Raw Prediction Data
+        |
+        +--> Validate raw schema
+        |
+        +--> Apply stored datetime rules
+        |
+        +--> Transform using fitted preprocessor
+        |
+        +--> Model.predict()
+
+No fitting is performed during prediction.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from enum import Enum
 from typing import Any
 
-import pandas as pd
 import numpy as np
-
-##########################################################
-# sklearn
-##########################################################
-
-from sklearn.pipeline import Pipeline
+import pandas as pd
 
 from sklearn.compose import ColumnTransformer
-
+from sklearn.impute import SimpleImputer
 from sklearn.model_selection import train_test_split
-
-##########################################################
-# Missing Value Imputation
-##########################################################
-
-from sklearn.impute import (
-
-    SimpleImputer,
-
-)
-
-##########################################################
-# Feature Encoding
-##########################################################
-
+from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import (
-
+    FunctionTransformer,
     OneHotEncoder,
-
-    OrdinalEncoder,
-
-    LabelEncoder,
-
-)
-
-##########################################################
-# Feature Scaling
-##########################################################
-
-from sklearn.preprocessing import (
-
     StandardScaler,
-
-    MinMaxScaler,
-
-    RobustScaler,
-
-    Normalizer,
-
 )
 
-##########################################################
-# Feature Types
-##########################################################
+from .constants import (
+    DEFAULT_RANDOM_STATE,
+    DEFAULT_TEST_SIZE,
+)
+from .exceptions import PreprocessingError
+from .models import ProcessedDataset
 
 
-class FeatureType(str, Enum):
-
-    NUMERIC = "numeric"
-
-    CATEGORICAL = "categorical"
-
-    BOOLEAN = "boolean"
-
-    DATETIME = "datetime"
-
-    TARGET = "target"
-
-
-##########################################################
-# Scaling Strategy
-##########################################################
-
-
-class ScalingStrategy(str, Enum):
-
-    NONE = "none"
-
-    STANDARD = "standard"
-
-    MINMAX = "minmax"
-
-    ROBUST = "robust"
-
-    NORMALIZER = "normalizer"
-
-
-##########################################################
-# Encoding Strategy
-##########################################################
-
-
-class EncodingStrategy(str, Enum):
-
-    ONEHOT = "onehot"
-
-    ORDINAL = "ordinal"
-
-    LABEL = "label"
-
-
-##########################################################
-# Missing Value Strategy
-##########################################################
-
-
-class MissingValueStrategy(str, Enum):
-
-    MEAN = "mean"
-
-    MEDIAN = "median"
-
-    MOST_FREQUENT = "most_frequent"
-
-    CONSTANT = "constant"
-
-
-##########################################################
-# Configuration
-##########################################################
+# ======================================================================
+# CONFIGURATION
+# ======================================================================
 
 
 @dataclass
 class PreprocessingConfig:
     """
-    Configuration used throughout preprocessing.
+    Configuration for the preprocessing engine.
+
+    Parameters
+    ----------
+    test_size:
+        Fraction of supervised data reserved for testing.
+
+    random_state:
+        Deterministic random seed.
+
+    scale_numeric:
+        Whether numeric features should be standardized.
+
+    boolean_as_numeric:
+        If True:
+            False -> 0
+            True  -> 1
+
+        If False:
+            booleans are one-hot encoded.
+
+    datetime_components:
+        Components generated from datetime columns.
+
+    sparse_threshold:
+        ColumnTransformer sparse output threshold.
     """
 
-    test_size: float = 0.20
+    test_size: float = DEFAULT_TEST_SIZE
 
-    random_state: int = 42
+    random_state: int = DEFAULT_RANDOM_STATE
 
-    scaling: ScalingStrategy = ScalingStrategy.STANDARD
+    scale_numeric: bool = True
 
-    encoding: EncodingStrategy = EncodingStrategy.ONEHOT
+    boolean_as_numeric: bool = True
 
-    numeric_missing: MissingValueStrategy = (
-        MissingValueStrategy.MEAN
+    datetime_components: tuple[str, ...] = (
+        "year",
+        "month",
+        "day",
+        "dayofweek",
+        "hour",
     )
 
-    categorical_missing: MissingValueStrategy = (
-        MissingValueStrategy.MOST_FREQUENT
-    )
-
-    shuffle: bool = True
+    sparse_threshold: float = 0.3
 
 
-##########################################################
-# Dataset Container
-##########################################################
+# ======================================================================
+# VALIDATION HELPERS
+# ======================================================================
 
 
-@dataclass
-class ProcessedDataset:
+def _validate_config(
+    config: PreprocessingConfig,
+) -> None:
     """
-    Output returned after preprocessing.
+    Validate preprocessing configuration.
+
+    Fail early instead of allowing sklearn to fail later with
+    less understandable errors.
     """
 
-    X_train: Any
+    if not (
+        0.0 < float(config.test_size) < 1.0
+    ):
+        raise PreprocessingError(
+            "test_size must be greater than 0 "
+            "and less than 1."
+        )
 
-    X_test: Any
+    if not (
+        0.0 <= float(config.sparse_threshold) <= 1.0
+    ):
+        raise PreprocessingError(
+            "sparse_threshold must be between "
+            "0 and 1."
+        )
 
-    y_train: Any
+    allowed_components = {
+        "year",
+        "month",
+        "day",
+        "dayofweek",
+        "hour",
+    }
 
-    y_test: Any
+    invalid_components = [
+        component
+        for component in config.datetime_components
+        if component not in allowed_components
+    ]
 
-    feature_names: list[str]
+    if invalid_components:
+        raise PreprocessingError(
+            "Unsupported datetime components: "
+            f"{invalid_components}. "
+            f"Supported components are: "
+            f"{sorted(allowed_components)}."
+        )
 
-    target_column: str
-
-    preprocessor: ColumnTransformer
-
-
-##########################################################
-# Helpers
-##########################################################
+    if not config.datetime_components:
+        raise PreprocessingError(
+            "At least one datetime component "
+            "must be configured."
+        )
 
 
-def copy_dataframe(
+def _validate_dataframe(
     dataframe: pd.DataFrame,
-) -> pd.DataFrame:
+    name: str = "Dataset",
+) -> None:
     """
-    Returns a defensive copy of a dataframe.
-    """
-
-    return dataframe.copy(deep=True)
-
-
-def validate_dataframe(
-    dataframe: pd.DataFrame,
-):
-    """
-    Basic dataframe validation.
+    Validate basic DataFrame requirements.
     """
 
     if dataframe is None:
+        raise PreprocessingError(
+            f"{name} cannot be None."
+        )
 
-        raise ValueError(
-            "Dataframe cannot be None."
+    if not isinstance(
+        dataframe,
+        pd.DataFrame,
+    ):
+        raise PreprocessingError(
+            f"{name} must be a pandas DataFrame."
         )
 
     if dataframe.empty:
+        raise PreprocessingError(
+            f"{name} cannot be empty."
+        )
 
-        raise ValueError(
-            "Dataset is empty."
+    if len(dataframe.columns) == 0:
+        raise PreprocessingError(
+            f"{name} contains no columns."
+        )
+
+    if dataframe.columns.has_duplicates:
+        duplicates = (
+            dataframe.columns[
+                dataframe.columns.duplicated()
+            ]
+            .astype(str)
+            .tolist()
+        )
+
+        raise PreprocessingError(
+            "Dataset contains duplicate column "
+            f"names: {duplicates}"
         )
 
 
-##########################################################
-# Feature Detection
-##########################################################
-
-def numeric_columns(
-    dataframe: pd.DataFrame,
-) -> list[str]:
+def _validate_feature_names(
+    feature_names: list[str],
+) -> None:
     """
-    Returns all numeric columns.
+    Validate that the feature schema is usable.
     """
 
-    return dataframe.select_dtypes(
+    if not feature_names:
+        raise PreprocessingError(
+            "No feature columns were found."
+        )
 
-        include=[
-
-            "number",
-
-        ],
-
-    ).columns.tolist()
-
-
-def categorical_columns(
-    dataframe: pd.DataFrame,
-) -> list[str]:
-    """
-    Returns all categorical columns.
-    """
-
-    return dataframe.select_dtypes(
-
-        include=[
-
-            "object",
-
-            "category",
-
-        ],
-
-    ).columns.tolist()
-
-
-def boolean_columns(
-    dataframe: pd.DataFrame,
-) -> list[str]:
-    """
-    Returns all boolean columns.
-    """
-
-    return dataframe.select_dtypes(
-
-        include=[
-
-            "bool",
-
-        ],
-
-    ).columns.tolist()
-
-
-def datetime_columns(
-    dataframe: pd.DataFrame,
-) -> list[str]:
-    """
-    Returns all datetime columns.
-    """
-
-    return dataframe.select_dtypes(
-
-        include=[
-
-            "datetime64",
-
-            "datetime64[ns]",
-
-            "datetimetz",
-
-        ],
-
-    ).columns.tolist()
-
-
-##########################################################
-# Target Validation
-##########################################################
-
-def validate_target_column(
-    dataframe: pd.DataFrame,
-    target_column: str,
-):
-    """
-    Validates the target column.
-    """
-
-    if target_column not in dataframe.columns:
-
-        raise ValueError(
-
-            f"Target column '{target_column}' does not exist."
-
+    if len(feature_names) != len(
+        set(feature_names)
+    ):
+        raise PreprocessingError(
+            "Feature schema contains duplicate "
+            "column names."
         )
 
 
-##########################################################
-# Feature Columns
-##########################################################
+# ======================================================================
+# DATETIME DETECTION
+# ======================================================================
 
-def feature_columns(
+
+def _is_datetime_series(
+    series: pd.Series,
+) -> bool:
+    """
+    Detect whether a Series should be treated as datetime.
+
+    Existing pandas datetime dtypes are always accepted.
+
+    Object/string columns are detected conservatively.
+
+    Important:
+    We do NOT classify ordinary categorical strings as dates unless
+    at least 90% of a sample can be parsed successfully.
+    """
+
+    if pd.api.types.is_datetime64_any_dtype(
+        series
+    ):
+        return True
+
+    if not (
+        pd.api.types.is_object_dtype(series)
+        or pd.api.types.is_string_dtype(series)
+    ):
+        return False
+
+    non_null = series.dropna()
+
+    if non_null.empty:
+        return False
+
+    sample = non_null.head(100)
+
+    try:
+        parsed = pd.to_datetime(
+            sample,
+            errors="coerce",
+            format="mixed",
+        )
+    except Exception:
+        return False
+
+    if len(parsed) == 0:
+        return False
+
+    success_ratio = float(
+        parsed.notna().mean()
+    )
+
+    return success_ratio >= 0.90
+
+
+# ======================================================================
+# DATETIME EXPANSION
+# ======================================================================
+
+
+def _convert_datetime_columns(
     dataframe: pd.DataFrame,
-    target_column: str,
-) -> list[str]:
+    datetime_features: list[str],
+    components: tuple[str, ...],
+) -> tuple[
+    pd.DataFrame,
+    list[str],
+]:
     """
-    Returns all feature columns.
+    Expand datetime columns into deterministic numeric components.
+
+    Original datetime columns are removed.
+
+    Example:
+
+        order_date
+
+    becomes:
+
+        order_date__year
+        order_date__month
+        order_date__day
+        order_date__dayofweek
+        order_date__hour
     """
 
-    return [
+    result = dataframe.copy()
 
-        column
+    generated_columns: list[str] = []
 
-        for column in dataframe.columns
+    for column in datetime_features:
 
-        if column != target_column
+        if column not in result.columns:
+            raise PreprocessingError(
+                "Datetime column "
+                f"'{column}' does not exist."
+            )
 
-    ]
+        try:
+            parsed = pd.to_datetime(
+                result[column],
+                errors="coerce",
+                format="mixed",
+            )
+        except Exception as exc:
+            raise PreprocessingError(
+                "Failed to parse datetime "
+                f"column '{column}': {exc}"
+            ) from exc
+
+        # --------------------------------------------------------------
+        # If a column was detected as datetime during training but
+        # contains completely invalid values, do not silently continue.
+        # --------------------------------------------------------------
+
+        original_non_null = (
+            result[column]
+            .notna()
+            .sum()
+        )
+
+        parsed_non_null = (
+            parsed.notna()
+            .sum()
+        )
+
+        if (
+            original_non_null > 0
+            and parsed_non_null == 0
+        ):
+            raise PreprocessingError(
+                f"Datetime column '{column}' "
+                "contains no parseable datetime values."
+            )
+
+        for component in components:
+
+            generated_name = (
+                f"{column}__{component}"
+            )
+
+            if component == "year":
+                values = parsed.dt.year
+
+            elif component == "month":
+                values = parsed.dt.month
+
+            elif component == "day":
+                values = parsed.dt.day
+
+            elif component == "dayofweek":
+                values = parsed.dt.dayofweek
+
+            elif component == "hour":
+                values = parsed.dt.hour
+
+            else:
+                raise PreprocessingError(
+                    "Unsupported datetime "
+                    f"component '{component}'."
+                )
+
+            result[generated_name] = (
+                values.astype("float64")
+            )
+
+            generated_columns.append(
+                generated_name
+            )
+
+        result.drop(
+            columns=[column],
+            inplace=True,
+        )
+
+    return (
+        result,
+        generated_columns,
+    )
 
 
-##########################################################
-# Feature Summary
-##########################################################
-
-def feature_summary(
+def _expand_known_datetime_columns(
     dataframe: pd.DataFrame,
-    target_column: str,
-) -> dict:
+    datetime_features: list[str],
+    components: tuple[str, ...],
+) -> pd.DataFrame:
     """
-    Generates a complete feature summary.
+    Expand datetime columns using the EXACT datetime schema stored
+    during training.
+
+    This function does not re-detect datetime columns.
+
+    That distinction is important.
+
+    Example:
+        Training:
+            "2026-01-01" -> datetime
+
+        Prediction:
+            "ABC123" in a different column
+
+    We must follow the stored training schema rather than guessing
+    again during inference.
     """
 
-    validate_dataframe(
+    if not datetime_features:
+        return dataframe.copy()
 
-        dataframe,
-
+    prepared, _ = _convert_datetime_columns(
+        dataframe=dataframe,
+        datetime_features=datetime_features,
+        components=components,
     )
 
-    validate_target_column(
-
-        dataframe,
-
-        target_column,
-
-    )
-
-    numeric = numeric_columns(
-
-        dataframe,
-
-    )
-
-    categorical = categorical_columns(
-
-        dataframe,
-
-    )
-
-    boolean = boolean_columns(
-
-        dataframe,
-
-    )
-
-    datetime = datetime_columns(
-
-        dataframe,
-
-    )
-
-    features = feature_columns(
-
-        dataframe,
-
-        target_column,
-
-    )
-
-    ######################################################
-    # Remove target column from each feature category
-    ######################################################
-
-    numeric = [
-
-        column
-
-        for column in numeric
-
-        if column != target_column
-
-    ]
-
-    categorical = [
-
-        column
-
-        for column in categorical
-
-        if column != target_column
-
-    ]
-
-    boolean = [
-
-        column
-
-        for column in boolean
-
-        if column != target_column
-
-    ]
-
-    datetime = [
-
-        column
-
-        for column in datetime
-
-        if column != target_column
-
-    ]
-
-    return {
-
-        "rows": len(dataframe),
-
-        "columns": len(dataframe.columns),
-
-        "target": target_column,
-
-        "features": features,
-
-        "numeric": numeric,
-
-        "categorical": categorical,
-
-        "boolean": boolean,
-
-        "datetime": datetime,
-
-        "numeric_count": len(numeric),
-
-        "categorical_count": len(categorical),
-
-        "boolean_count": len(boolean),
-
-        "datetime_count": len(datetime),
-
-        "feature_count": len(features),
-
-    }
+    return prepared
 
 
-##########################################################
-# Feature Matrix
-##########################################################
+# ======================================================================
+# FEATURE TYPE DETECTION
+# ======================================================================
 
-def split_features_target(
+
+def detect_feature_types(
     dataframe: pd.DataFrame,
-    target_column: str,
-):
+) -> dict[str, list[str]]:
     """
-    Splits the dataframe into features (X)
-    and target (y).
+    Detect numeric, categorical, boolean and datetime columns.
+
+    Detection priority:
+
+        boolean
+        datetime
+        numeric
+        categorical
+
+    This prevents boolean columns from being treated as numeric.
     """
 
-    validate_target_column(
-
+    _validate_dataframe(
         dataframe,
-
-        target_column,
-
+        "Feature DataFrame",
     )
 
-    X = dataframe.drop(
+    numeric_features: list[str] = []
 
-        columns=[
+    categorical_features: list[str] = []
 
-            target_column,
+    boolean_features: list[str] = []
 
-        ],
-
-    )
-
-    y = dataframe[
-
-        target_column
-
-    ]
-
-    return X, y
-##########################################################
-# Missing Value Handling
-##########################################################
-
-def numeric_imputer(
-    strategy: MissingValueStrategy,
-) -> SimpleImputer:
-    """
-    Creates an imputer for numeric features.
-    """
-
-    if strategy == MissingValueStrategy.MEAN:
-
-        return SimpleImputer(
-
-            strategy="mean",
-
-        )
-
-    if strategy == MissingValueStrategy.MEDIAN:
-
-        return SimpleImputer(
-
-            strategy="median",
-
-        )
-
-    if strategy == MissingValueStrategy.CONSTANT:
-
-        return SimpleImputer(
-
-            strategy="constant",
-
-            fill_value=0,
-
-        )
-
-    raise ValueError(
-
-        f"Unsupported numeric strategy: {strategy}"
-
-    )
-
-
-##########################################################
-# Categorical Imputer
-##########################################################
-
-def categorical_imputer(
-    strategy: MissingValueStrategy,
-) -> SimpleImputer:
-    """
-    Creates an imputer for categorical features.
-    """
-
-    if strategy == MissingValueStrategy.MOST_FREQUENT:
-
-        return SimpleImputer(
-
-            strategy="most_frequent",
-
-        )
-
-    if strategy == MissingValueStrategy.CONSTANT:
-
-        return SimpleImputer(
-
-            strategy="constant",
-
-            fill_value="Unknown",
-
-        )
-
-    raise ValueError(
-
-        f"Unsupported categorical strategy: {strategy}"
-
-    )
-
-
-##########################################################
-# Missing Value Summary
-##########################################################
-
-def missing_value_summary(
-    dataframe: pd.DataFrame,
-) -> dict:
-    """
-    Returns missing value statistics.
-    """
-
-    validate_dataframe(
-
-        dataframe,
-
-    )
-
-    missing = dataframe.isnull().sum()
-
-    summary = {}
+    datetime_features: list[str] = []
 
     for column in dataframe.columns:
 
-        count = int(
+        series = dataframe[column]
 
-            missing[column]
+        # --------------------------------------------------------------
+        # Boolean
+        # --------------------------------------------------------------
 
+        if pd.api.types.is_bool_dtype(
+            series
+        ):
+            boolean_features.append(
+                str(column)
+            )
+
+            continue
+
+        # --------------------------------------------------------------
+        # Existing datetime dtype
+        # --------------------------------------------------------------
+
+        if pd.api.types.is_datetime64_any_dtype(
+            series
+        ):
+            datetime_features.append(
+                str(column)
+            )
+
+            continue
+
+        # --------------------------------------------------------------
+        # String/object datetime detection
+        # --------------------------------------------------------------
+
+        if _is_datetime_series(
+            series
+        ):
+            datetime_features.append(
+                str(column)
+            )
+
+            continue
+
+        # --------------------------------------------------------------
+        # Numeric
+        # --------------------------------------------------------------
+
+        if pd.api.types.is_numeric_dtype(
+            series
+        ):
+            numeric_features.append(
+                str(column)
+            )
+
+            continue
+
+        # --------------------------------------------------------------
+        # Everything else is categorical.
+        # --------------------------------------------------------------
+
+        categorical_features.append(
+            str(column)
         )
-
-        percentage = round(
-
-            (count / len(dataframe)) * 100,
-
-            2,
-
-        )
-
-        summary[column] = {
-
-            "missing": count,
-
-            "percentage": percentage,
-
-        }
-
-    return summary
-
-
-##########################################################
-# Columns With Missing Values
-##########################################################
-
-def columns_with_missing_values(
-    dataframe: pd.DataFrame,
-) -> list[str]:
-    """
-    Returns columns containing
-    one or more missing values.
-    """
-
-    validate_dataframe(
-
-        dataframe,
-
-    )
-
-    return [
-
-        column
-
-        for column in dataframe.columns
-
-        if dataframe[column].isnull().any()
-
-    ]
-
-
-##########################################################
-# Dataset Missing Values
-##########################################################
-
-def has_missing_values(
-    dataframe: pd.DataFrame,
-) -> bool:
-    """
-    Returns True if the dataset
-    contains missing values.
-    """
-
-    validate_dataframe(
-
-        dataframe,
-
-    )
-
-    return bool(
-
-        dataframe.isnull().values.any()
-
-    )
-
-
-##########################################################
-# Numeric Columns With Missing Values
-##########################################################
-
-def numeric_missing_columns(
-    dataframe: pd.DataFrame,
-) -> list[str]:
-    """
-    Numeric columns containing
-    missing values.
-    """
-
-    numeric = numeric_columns(
-
-        dataframe,
-
-    )
-
-    return [
-
-        column
-
-        for column in numeric
-
-        if dataframe[column].isnull().any()
-
-    ]
-
-
-##########################################################
-# Categorical Columns With Missing Values
-##########################################################
-
-def categorical_missing_columns(
-    dataframe: pd.DataFrame,
-) -> list[str]:
-    """
-    Categorical columns containing
-    missing values.
-    """
-
-    categorical = categorical_columns(
-
-        dataframe,
-
-    )
-
-    return [
-
-        column
-
-        for column in categorical
-
-        if dataframe[column].isnull().any()
-
-    ]
-##########################################################
-# Encoding
-##########################################################
-
-def onehot_encoder() -> OneHotEncoder:
-    """
-    Creates a OneHotEncoder.
-
-    Returns
-    -------
-    OneHotEncoder
-    """
-
-    return OneHotEncoder(
-
-        handle_unknown="ignore",
-
-        sparse_output=False,
-
-    )
-
-
-##########################################################
-# Ordinal Encoder
-##########################################################
-
-def ordinal_encoder() -> OrdinalEncoder:
-    """
-    Creates an OrdinalEncoder.
-
-    Returns
-    -------
-    OrdinalEncoder
-    """
-
-    return OrdinalEncoder(
-
-        handle_unknown="use_encoded_value",
-
-        unknown_value=-1,
-
-    )
-
-
-##########################################################
-# Label Encoder
-##########################################################
-
-def label_encoder() -> LabelEncoder:
-    """
-    Creates a LabelEncoder.
-
-    Returns
-    -------
-    LabelEncoder
-    """
-
-    return LabelEncoder()
-
-
-##########################################################
-# Encoder Factory
-##########################################################
-
-def build_encoder(
-    strategy: EncodingStrategy,
-):
-    """
-    Returns the requested encoder.
-    """
-
-    if strategy == EncodingStrategy.ONEHOT:
-
-        return onehot_encoder()
-
-    if strategy == EncodingStrategy.ORDINAL:
-
-        return ordinal_encoder()
-
-    if strategy == EncodingStrategy.LABEL:
-
-        return label_encoder()
-
-    raise ValueError(
-
-        f"Unsupported encoding strategy: {strategy}"
-
-    )
-
-
-##########################################################
-# Encode Target
-##########################################################
-
-def encode_target(
-    target,
-):
-    """
-    Encodes the target labels.
-
-    Returns
-    -------
-    encoded_target
-    encoder
-    """
-
-    encoder = label_encoder()
-
-    encoded = encoder.fit_transform(
-
-        target,
-
-    )
-
-    return encoded, encoder
-
-
-##########################################################
-# Detect Target Encoding Requirement
-##########################################################
-
-def target_requires_encoding(
-    target,
-) -> bool:
-    """
-    Determines whether the target
-    needs label encoding.
-    """
-
-    return (
-
-        target.dtype == "object"
-
-        or
-
-        str(target.dtype) == "category"
-
-    )
-
-
-##########################################################
-# Encoder Summary
-##########################################################
-
-def encoder_summary(
-    config: PreprocessingConfig,
-) -> dict:
-    """
-    Returns encoding configuration.
-    """
 
     return {
-
-        "strategy": config.encoding.value,
-
-        "encoder": build_encoder(
-
-            config.encoding,
-
-        ).__class__.__name__,
-
+        "numeric": numeric_features,
+        "categorical": categorical_features,
+        "boolean": boolean_features,
+        "datetime": datetime_features,
     }
 
 
-##########################################################
-# Feature Name Extraction
-##########################################################
+# ======================================================================
+# ONE-HOT ENCODER
+# ======================================================================
 
-def transformed_feature_names(
-    transformer: ColumnTransformer,
+
+def _make_one_hot_encoder() -> OneHotEncoder:
+    """
+    Create an OneHotEncoder compatible with different sklearn versions.
+
+    Unknown categories are ignored during prediction.
+
+    This is essential for production inference.
+    """
+
+    try:
+        return OneHotEncoder(
+            handle_unknown="ignore",
+            sparse_output=True,
+        )
+
+    except TypeError:
+        return OneHotEncoder(
+            handle_unknown="ignore",
+            sparse=True,
+        )
+
+
+# ======================================================================
+# NUMERIC PIPELINE
+# ======================================================================
+
+
+def _make_numeric_pipeline(
+    scale_numeric: bool,
+) -> Pipeline:
+    """
+    Numeric preprocessing.
+
+    Steps:
+        1. Median imputation
+        2. Optional scaling
+
+    StandardScaler uses with_mean=False so sparse-compatible
+    transformations remain possible downstream.
+    """
+
+    steps: list[
+        tuple[str, Any]
+    ] = [
+        (
+            "imputer",
+            SimpleImputer(
+                strategy="median",
+            ),
+        )
+    ]
+
+    if scale_numeric:
+
+        steps.append(
+            (
+                "scaler",
+                StandardScaler(
+                    with_mean=False,
+                ),
+            )
+        )
+
+    return Pipeline(
+        steps
+    )
+
+
+# ======================================================================
+# CATEGORICAL PIPELINE
+# ======================================================================
+
+
+def _make_categorical_pipeline() -> Pipeline:
+    """
+    Categorical preprocessing.
+
+    Steps:
+        1. Most-frequent imputation
+        2. One-hot encoding
+    """
+
+    return Pipeline(
+        [
+            (
+                "imputer",
+                SimpleImputer(
+                    strategy="most_frequent",
+                ),
+            ),
+            (
+                "encoder",
+                _make_one_hot_encoder(),
+            ),
+        ]
+    )
+
+
+# ======================================================================
+# BOOLEAN PIPELINE
+# ======================================================================
+
+def _boolean_to_numeric(
+    value: Any,
+) -> Any:
+    """
+    Convert boolean values to numeric 0/1.
+
+    True  -> 1.0
+    False -> 0.0
+    """
+
+    if isinstance(value, pd.DataFrame):
+        return value.astype(float)
+
+    if isinstance(value, pd.Series):
+        return value.astype(float)
+
+    return np.asarray(value).astype(float)
+
+
+def _boolean_to_string(
+    value: Any,
+) -> Any:
+    """
+    Convert boolean values to strings for categorical processing.
+    """
+
+    if isinstance(value, pd.DataFrame):
+        return value.astype(str)
+
+    if isinstance(value, pd.Series):
+        return value.astype(str)
+
+    return np.asarray(value).astype(str)
+
+
+def _make_boolean_pipeline(
+    boolean_as_numeric: bool,
+    scale_numeric: bool,
+) -> Pipeline:
+    """
+    Boolean preprocessing.
+
+    Numeric mode:
+        False -> 0.0
+        True  -> 1.0
+
+    Categorical mode:
+        False -> "False"
+        True  -> "True"
+    """
+
+    # ==============================================================
+    # NUMERIC BOOLEAN MODE
+    # ==============================================================
+
+    if boolean_as_numeric:
+
+        steps: list[
+            tuple[str, Any]
+        ] = [
+            (
+                "boolean_to_numeric",
+                FunctionTransformer(
+                    _boolean_to_numeric,
+                    validate=False,
+                ),
+            ),
+            (
+                "imputer",
+                SimpleImputer(
+                    strategy="most_frequent",
+                ),
+            ),
+        ]
+
+        if scale_numeric:
+
+            steps.append(
+                (
+                    "scaler",
+                    StandardScaler(
+                        with_mean=False,
+                    ),
+                )
+            )
+
+        return Pipeline(
+            steps
+        )
+
+    # ==============================================================
+    # CATEGORICAL BOOLEAN MODE
+    # ==============================================================
+
+    return Pipeline(
+        [
+            (
+                "boolean_to_string",
+                FunctionTransformer(
+                    _boolean_to_string,
+                    validate=False,
+                ),
+            ),
+            (
+                "imputer",
+                SimpleImputer(
+                    strategy="most_frequent",
+                ),
+            ),
+            (
+                "encoder",
+                _make_one_hot_encoder(),
+            ),
+        ]
+    )
+
+
+# ======================================================================
+# PREPROCESSOR CONSTRUCTION
+# ======================================================================
+
+
+def build_preprocessor(
+    dataframe: pd.DataFrame,
+    config: PreprocessingConfig | None = None,
+) -> tuple[
+    ColumnTransformer,
+    dict[str, list[str]],
+]:
+    """
+    Build an unfitted ColumnTransformer.
+
+    Datetime columns MUST already have been expanded before this
+    function is called.
+    """
+
+    _validate_dataframe(
+        dataframe,
+        "Preprocessor input",
+    )
+
+    if config is None:
+        config = PreprocessingConfig()
+
+    _validate_config(
+        config
+    )
+
+    feature_types = detect_feature_types(
+        dataframe
+    )
+
+    datetime_features = list(
+        feature_types["datetime"]
+    )
+
+    if datetime_features:
+
+        raise PreprocessingError(
+            "Datetime columns must be expanded "
+            "before building the ColumnTransformer. "
+            f"Detected datetime columns: "
+            f"{datetime_features}"
+        )
+
+    numeric_features = list(
+        feature_types["numeric"]
+    )
+
+    categorical_features = list(
+        feature_types["categorical"]
+    )
+
+    boolean_features = list(
+        feature_types["boolean"]
+    )
+
+    transformers: list[
+        tuple[str, Any, list[str]]
+    ] = []
+
+    # --------------------------------------------------------------
+    # Numeric
+    # --------------------------------------------------------------
+
+    if numeric_features:
+
+        transformers.append(
+            (
+                "numeric",
+                _make_numeric_pipeline(
+                    config.scale_numeric
+                ),
+                numeric_features,
+            )
+        )
+
+    # --------------------------------------------------------------
+    # Categorical
+    # --------------------------------------------------------------
+
+    if categorical_features:
+
+        transformers.append(
+            (
+                "categorical",
+                _make_categorical_pipeline(),
+                categorical_features,
+            )
+        )
+
+    # --------------------------------------------------------------
+    # Boolean
+    # --------------------------------------------------------------
+
+    if boolean_features:
+
+        transformers.append(
+            (
+                "boolean",
+                _make_boolean_pipeline(
+                    boolean_as_numeric=(
+                        config.boolean_as_numeric
+                    ),
+                    scale_numeric=(
+                        config.scale_numeric
+                    ),
+                ),
+                boolean_features,
+            )
+        )
+
+    if not transformers:
+
+        raise PreprocessingError(
+            "No usable feature columns were found "
+            "after preprocessing."
+        )
+
+    preprocessor = ColumnTransformer(
+        transformers=transformers,
+        remainder="drop",
+        sparse_threshold=(
+            config.sparse_threshold
+        ),
+    )
+
+    return (
+        preprocessor,
+        feature_types,
+    )
+
+
+# ======================================================================
+# TRAINING FEATURE PREPARATION
+# ======================================================================
+
+
+def _prepare_raw_features(
+    dataframe: pd.DataFrame,
+    config: PreprocessingConfig,
+) -> tuple[
+    pd.DataFrame,
+    dict[str, list[str]],
+]:
+    """
+    Prepare raw training features.
+
+    Datetime columns are detected once and expanded.
+
+    The returned feature_types represents the RAW training schema.
+    """
+
+    _validate_dataframe(
+        dataframe,
+        "Raw feature data",
+    )
+
+    feature_types = detect_feature_types(
+        dataframe
+    )
+
+    datetime_features = list(
+        feature_types["datetime"]
+    )
+
+    prepared = dataframe.copy()
+
+    generated_datetime_columns: list[
+        str
+    ] = []
+
+    if datetime_features:
+
+        (
+            prepared,
+            generated_datetime_columns,
+        ) = _convert_datetime_columns(
+            dataframe=prepared,
+            datetime_features=datetime_features,
+            components=(
+                config.datetime_components
+            ),
+        )
+
+    # --------------------------------------------------------------
+    # Re-detect prepared feature types.
+    # --------------------------------------------------------------
+
+    prepared_feature_types = (
+        detect_feature_types(
+            prepared
+        )
+    )
+
+    # Generated datetime components are numeric.
+    for column in generated_datetime_columns:
+
+        if column not in (
+            prepared_feature_types[
+                "numeric"
+            ]
+        ):
+
+            prepared_feature_types[
+                "numeric"
+            ].append(column)
+
+    # Original datetime columns no longer exist in prepared data.
+    prepared_feature_types[
+        "datetime"
+    ] = []
+
+    return (
+        prepared,
+        {
+            "numeric": list(
+                prepared_feature_types[
+                    "numeric"
+                ]
+            ),
+            "categorical": list(
+                prepared_feature_types[
+                    "categorical"
+                ]
+            ),
+            "boolean": list(
+                prepared_feature_types[
+                    "boolean"
+                ]
+            ),
+            "datetime": datetime_features,
+        },
+    )
+
+
+# ======================================================================
+# FEATURE NAME EXTRACTION
+# ======================================================================
+
+
+def _get_feature_names(
+    preprocessor: ColumnTransformer,
 ) -> list[str]:
     """
-    Returns transformed feature names.
+    Obtain transformed feature names.
 
-    Works after the transformer
-    has been fitted.
+    sklearn's get_feature_names_out is preferred.
+
+    A conservative fallback is provided for compatibility.
     """
 
     try:
 
-        return transformer.get_feature_names_out().tolist()
+        names = (
+            preprocessor.get_feature_names_out()
+        )
+
+        return [
+            str(name)
+            for name in names
+        ]
 
     except Exception:
 
-        return []
+        names: list[str] = []
+
+        for (
+            name,
+            transformer,
+            columns,
+        ) in preprocessor.transformers_:
+
+            if transformer == "drop":
+                continue
+
+            if transformer == "passthrough":
+
+                names.extend(
+                    str(column)
+                    for column in columns
+                )
+
+                continue
+
+            try:
+
+                transformer_names = (
+                    transformer.get_feature_names_out(
+                        columns
+                    )
+                )
+
+                names.extend(
+                    str(value)
+                    for value in transformer_names
+                )
+
+            except Exception:
+
+                names.extend(
+                    str(column)
+                    for column in columns
+                )
+
+        return names
 
 
-##########################################################
-# Categorical Feature Detector
-##########################################################
+# ======================================================================
+# MATRIX HELPERS
+# ======================================================================
 
-def has_categorical_features(
-    dataframe: pd.DataFrame,
+
+def _is_sparse_matrix(
+    matrix: Any,
 ) -> bool:
     """
-    Returns True if the dataset
-    contains categorical features.
+    Determine whether transformed output is sparse.
     """
 
-    return len(
+    if matrix is None:
+        return False
 
-        categorical_columns(
+    return hasattr(
+        matrix,
+        "tocsr",
+    )
 
-            dataframe,
 
+def _matrix_shape(
+    matrix: Any,
+) -> tuple[int, int]:
+    """
+    Safely obtain transformed matrix shape.
+    """
+
+    if matrix is None:
+        return (
+            0,
+            0,
         )
 
-    ) > 0
+    try:
 
+        shape = matrix.shape
 
-##########################################################
-# Encoding Required
-##########################################################
+        if len(shape) != 2:
 
-def requires_encoding(
-    dataframe: pd.DataFrame,
-) -> bool:
-    """
-    Determines whether feature
-    encoding is required.
-    """
-
-    return has_categorical_features(
-
-        dataframe,
-
-    )
-##########################################################
-# Scaling
-##########################################################
-
-def standard_scaler() -> StandardScaler:
-    """
-    Creates a StandardScaler.
-    """
-
-    return StandardScaler()
-
-
-##########################################################
-# MinMax Scaler
-##########################################################
-
-def minmax_scaler() -> MinMaxScaler:
-    """
-    Creates a MinMaxScaler.
-    """
-
-    return MinMaxScaler()
-
-
-##########################################################
-# Robust Scaler
-##########################################################
-
-def robust_scaler() -> RobustScaler:
-    """
-    Creates a RobustScaler.
-    """
-
-    return RobustScaler()
-
-
-##########################################################
-# Normalizer
-##########################################################
-
-def normalizer() -> Normalizer:
-    """
-    Creates a Normalizer.
-    """
-
-    return Normalizer()
-
-
-##########################################################
-# Scaler Factory
-##########################################################
-
-def build_scaler(
-    strategy: ScalingStrategy,
-):
-    """
-    Returns the requested scaler.
-    """
-
-    if strategy == ScalingStrategy.NONE:
-
-        return "passthrough"
-
-    if strategy == ScalingStrategy.STANDARD:
-
-        return standard_scaler()
-
-    if strategy == ScalingStrategy.MINMAX:
-
-        return minmax_scaler()
-
-    if strategy == ScalingStrategy.ROBUST:
-
-        return robust_scaler()
-
-    if strategy == ScalingStrategy.NORMALIZER:
-
-        return normalizer()
-
-    raise ValueError(
-
-        f"Unsupported scaling strategy: {strategy}"
-
-    )
-
-
-##########################################################
-# Scaling Required
-##########################################################
-
-def requires_scaling(
-    config: PreprocessingConfig,
-) -> bool:
-    """
-    Determines whether feature scaling
-    should be applied.
-    """
-
-    return config.scaling != ScalingStrategy.NONE
-
-
-##########################################################
-# Numeric Feature Detector
-##########################################################
-
-def has_numeric_features(
-    dataframe: pd.DataFrame,
-) -> bool:
-    """
-    Returns True if the dataset contains
-    one or more numeric features.
-    """
-
-    return len(
-
-        numeric_columns(
-
-            dataframe,
-
-        )
-
-    ) > 0
-
-
-##########################################################
-# Scaler Summary
-##########################################################
-
-def scaler_summary(
-    config: PreprocessingConfig,
-) -> dict:
-    """
-    Returns the active scaling configuration.
-    """
-
-    scaler = build_scaler(
-
-        config.scaling,
-
-    )
-
-    if scaler == "passthrough":
-
-        scaler_name = "None"
-
-    else:
-
-        scaler_name = scaler.__class__.__name__
-
-    return {
-
-        "strategy": config.scaling.value,
-
-        "scaler": scaler_name,
-
-    }
-
-
-##########################################################
-# Numeric Feature Statistics
-##########################################################
-
-def numeric_statistics(
-    dataframe: pd.DataFrame,
-) -> dict:
-    """
-    Returns descriptive statistics
-    for numeric columns.
-    """
-
-    numeric = numeric_columns(
-
-        dataframe,
-
-    )
-
-    if not numeric:
-
-        return {}
-
-    statistics = {}
-
-    description = dataframe[
-
-        numeric
-
-    ].describe().T
-
-    for column in numeric:
-
-        statistics[column] = {
-
-            "count": float(description.loc[column, "count"]),
-
-            "mean": float(description.loc[column, "mean"]),
-
-            "std": float(description.loc[column, "std"]),
-
-            "min": float(description.loc[column, "min"]),
-
-            "max": float(description.loc[column, "max"]),
-
-        }
-
-    return statistics
-
-
-##########################################################
-# Scaling Information
-##########################################################
-
-def scaling_information(
-    dataframe: pd.DataFrame,
-    config: PreprocessingConfig,
-) -> dict:
-    """
-    Returns scaling metadata for the dataset.
-    """
-
-    return {
-
-        "requires_scaling": requires_scaling(
-
-            config,
-
-        ),
-
-        "numeric_columns": numeric_columns(
-
-            dataframe,
-
-        ),
-
-        "numeric_feature_count": len(
-
-            numeric_columns(
-
-                dataframe,
-
+            raise PreprocessingError(
+                "Preprocessed feature matrix "
+                "must be two-dimensional."
             )
 
-        ),
-
-        "scaler": scaler_summary(
-
-            config,
-
-        ),
-
-    }
-##########################################################
-# Pipeline Builder
-##########################################################
-
-def build_numeric_pipeline(
-    config: PreprocessingConfig,
-) -> Pipeline:
-    """
-    Builds the preprocessing pipeline for
-    numeric features.
-    """
-
-    steps = [
-
-        (
-
-            "imputer",
-
-            numeric_imputer(
-
-                config.numeric_missing,
-
-            ),
-
-        ),
-
-    ]
-
-    scaler = build_scaler(
-
-        config.scaling,
-
-    )
-
-    if scaler != "passthrough":
-
-        steps.append(
-
-            (
-
-                "scaler",
-
-                scaler,
-
-            )
-
+        return (
+            int(shape[0]),
+            int(shape[1]),
         )
 
-    return Pipeline(
+    except PreprocessingError:
+        raise
 
-        steps,
+    except Exception as exc:
 
-    )
+        raise PreprocessingError(
+            "Unable to determine the shape "
+            "of the transformed feature matrix."
+        ) from exc
 
 
-##########################################################
-# Categorical Pipeline
-##########################################################
+# ======================================================================
+# SUPERVISED SPLIT
+# ======================================================================
 
-def build_categorical_pipeline(
+
+def _split_supervised_data(
+    X: pd.DataFrame,
+    y: pd.Series,
+    task: str | None,
     config: PreprocessingConfig,
-) -> Pipeline:
+) -> tuple[
+    pd.DataFrame,
+    pd.DataFrame,
+    pd.Series,
+    pd.Series,
+]:
     """
-    Builds the preprocessing pipeline
-    for categorical features.
-    """
+    Perform a deterministic supervised train/test split.
 
-    return Pipeline(
+    Classification uses stratification when valid.
 
-        [
+    If stratification is impossible because the dataset is too small
+    or a class has insufficient members, we fall back to an ordinary
+    deterministic split.
 
-            (
-
-                "imputer",
-
-                categorical_imputer(
-
-                    config.categorical_missing,
-
-                ),
-
-            ),
-
-            (
-
-                "encoder",
-
-                build_encoder(
-
-                    config.encoding,
-
-                ),
-
-            ),
-
-        ]
-
-    )
-
-
-##########################################################
-# Column Transformer
-##########################################################
-
-def build_preprocessor(
-    dataframe: pd.DataFrame,
-    target_column: str,
-    config: PreprocessingConfig,
-) -> ColumnTransformer:
-    """
-    Builds the complete preprocessing
-    pipeline.
+    We do NOT silently alter the dataset or duplicate rows.
     """
 
-    summary = feature_summary(
+    stratify_values = None
 
-        dataframe,
+    if task == "classification":
 
-        target_column,
-
-    )
-
-    numeric = summary["numeric"]
-
-    categorical = summary["categorical"]
-
-    boolean = summary["boolean"]
-
-    ######################################################
-    # Treat booleans as categorical
-    ######################################################
-
-    categorical = categorical + boolean
-
-    transformers = []
-
-    ######################################################
-    # Numeric Pipeline
-    ######################################################
-
-    if numeric:
-
-        transformers.append(
-
-            (
-
-                "numeric",
-
-                build_numeric_pipeline(
-
-                    config,
-
-                ),
-
-                numeric,
-
+        unique_classes = (
+            y.nunique(
+                dropna=True
             )
-
         )
 
-    ######################################################
-    # Categorical Pipeline
-    ######################################################
+        if unique_classes > 1:
 
-    if categorical:
-
-        transformers.append(
-
-            (
-
-                "categorical",
-
-                build_categorical_pipeline(
-
-                    config,
-
-                ),
-
-                categorical,
-
+            class_counts = (
+                y.value_counts(
+                    dropna=False
+                )
             )
 
+            # Stratification requires at least two samples in every
+            # class and enough samples for the resulting partitions.
+            if (
+                len(class_counts) > 1
+                and int(
+                    class_counts.min()
+                ) >= 2
+            ):
+
+                stratify_values = y
+
+    try:
+
+        return train_test_split(
+            X,
+            y,
+            test_size=config.test_size,
+            random_state=config.random_state,
+            stratify=stratify_values,
         )
 
-    return ColumnTransformer(
+    except ValueError as first_error:
 
-        transformers=transformers,
+        # ----------------------------------------------------------
+        # Only retry without stratification when stratification
+        # itself was the likely cause.
+        # ----------------------------------------------------------
 
-        remainder="drop",
+        if stratify_values is None:
 
-    )
+            raise PreprocessingError(
+                "Unable to split the dataset into "
+                f"training and test sets: "
+                f"{first_error}"
+            ) from first_error
 
+        try:
 
-##########################################################
-# Fit Transformer
-##########################################################
+            return train_test_split(
+                X,
+                y,
+                test_size=config.test_size,
+                random_state=config.random_state,
+                stratify=None,
+            )
 
-def fit_preprocessor(
-    preprocessor: ColumnTransformer,
-    X_train: pd.DataFrame,
-):
-    """
-    Fits the preprocessing pipeline.
-    """
+        except ValueError as second_error:
 
-    return preprocessor.fit(
-
-        X_train,
-
-    )
-
-
-##########################################################
-# Transform Dataset
-##########################################################
-
-def transform_dataset(
-    preprocessor: ColumnTransformer,
-    X,
-):
-    """
-    Transforms a dataset.
-    """
-
-    return preprocessor.transform(
-
-        X,
-
-    )
+            raise PreprocessingError(
+                "Unable to split the supervised "
+                "dataset into training and test "
+                f"sets: {second_error}"
+            ) from second_error
 
 
-##########################################################
-# Fit + Transform
-##########################################################
+# ======================================================================
+# MAIN PREPROCESSING
+# ======================================================================
 
-def fit_transform_dataset(
-    preprocessor: ColumnTransformer,
-    X_train,
-    X_test,
-):
-    """
-    Fits the preprocessing pipeline and
-    transforms both datasets.
-    """
-
-    X_train_processed = preprocessor.fit_transform(
-
-        X_train,
-
-    )
-
-    X_test_processed = preprocessor.transform(
-
-        X_test,
-
-    )
-
-    return (
-
-        X_train_processed,
-
-        X_test_processed,
-
-    )
-
-
-##########################################################
-# Pipeline Summary
-##########################################################
-
-def pipeline_summary(
-    dataframe: pd.DataFrame,
-    target_column: str,
-    config: PreprocessingConfig,
-) -> dict:
-    """
-    Returns pipeline information.
-    """
-
-    summary = feature_summary(
-
-        dataframe,
-
-        target_column,
-
-    )
-
-    return {
-
-        "numeric_pipeline": bool(
-
-            summary["numeric"],
-
-        ),
-
-        "categorical_pipeline": bool(
-
-            summary["categorical"]
-
-            or
-
-            summary["boolean"],
-
-        ),
-
-        "scaling": config.scaling.value,
-
-        "encoding": config.encoding.value,
-
-        "numeric_features": summary["numeric_count"],
-
-        "categorical_features": (
-
-            summary["categorical_count"]
-
-            +
-
-            summary["boolean_count"]
-
-        ),
-
-    }
-##########################################################
-# Preprocess Dataset
-##########################################################
 
 def preprocess_dataset(
     dataframe: pd.DataFrame,
-    target_column: str,
+    target_column: str | None = None,
+    task: str | None = None,
     config: PreprocessingConfig | None = None,
 ) -> ProcessedDataset:
     """
-    Complete preprocessing pipeline.
+    Main preprocessing entry point.
 
-    Steps
-    -----
-    1. Validate dataset
-    2. Split X / y
-    3. Encode target (classification only)
-    4. Train/Test Split
-    5. Build preprocessing pipeline
-    6. Fit transformer
-    7. Transform datasets
-    8. Return processed dataset
+    Supervised:
+        1. Validate dataset.
+        2. Separate target.
+        3. Remove rows with missing target.
+        4. Detect and expand datetime features.
+        5. Split raw features and target.
+        6. Fit preprocessor ONLY on X_train.
+        7. Transform X_train.
+        8. Transform X_test.
+        9. Transform full dataset using fitted transformer.
+
+    Unsupervised:
+        1. Treat entire dataframe as X.
+        2. Detect and expand datetime features.
+        3. Fit preprocessor once on full data.
+        4. Transform full data.
+
+    Critical invariant
+    ------------------
+    The target column is NEVER passed into the preprocessor.
     """
 
-    validate_dataframe(
-        dataframe,
-    )
-
-    validate_target_column(
-        dataframe,
-        target_column,
-    )
-
     if config is None:
-
         config = PreprocessingConfig()
 
-    ######################################################
-    # Split Features & Target
-    ######################################################
-
-    X, y = split_features_target(
-
-        dataframe,
-
-        target_column,
-
+    _validate_config(
+        config
     )
 
-    ######################################################
-    # Encode Target (If Needed)
-    ######################################################
+    _validate_dataframe(
+        dataframe,
+        "Dataset",
+    )
 
-    if target_requires_encoding(
+    working = dataframe.copy()
 
-        y,
+    # ==================================================================
+    # TARGET SEPARATION
+    # ==================================================================
 
+    target = target_column
+
+    if target is not None:
+
+        if target not in working.columns:
+
+            raise PreprocessingError(
+                f"Target column '{target}' "
+                "does not exist."
+            )
+
+        y = working[target].copy()
+
+        X = working.drop(
+            columns=[target]
+        ).copy()
+
+        # --------------------------------------------------------------
+        # Target values are never imputed.
+        # Rows with missing targets are removed.
+        # --------------------------------------------------------------
+
+        valid_target_mask = ~y.isna()
+
+        X = (
+            X.loc[
+                valid_target_mask
+            ]
+            .reset_index(
+                drop=True
+            )
+        )
+
+        y = (
+            y.loc[
+                valid_target_mask
+            ]
+            .reset_index(
+                drop=True
+            )
+        )
+
+        if len(y) == 0:
+
+            raise PreprocessingError(
+                "No rows remain after removing "
+                "missing target values."
+            )
+
+    else:
+
+        # --------------------------------------------------------------
+        # Unsupervised task.
+        # There is deliberately no target.
+        # --------------------------------------------------------------
+
+        X = working.copy()
+
+        y = None
+
+    # ==================================================================
+    # RAW FEATURE SCHEMA
+    # ==================================================================
+
+    original_feature_names = [
+        str(column)
+        for column in X.columns
+    ]
+
+    _validate_feature_names(
+        original_feature_names
+    )
+
+    if not original_feature_names:
+
+        raise PreprocessingError(
+            "No feature columns remain after "
+            "target separation."
+        )
+
+    # ==================================================================
+    # DATETIME PREPARATION
+    # ==================================================================
+
+    (
+        X_prepared,
+        feature_types,
+    ) = _prepare_raw_features(
+        X,
+        config,
+    )
+
+    datetime_features = list(
+        feature_types["datetime"]
+    )
+
+    # The preprocessor only sees the prepared data.
+    transformer_input = (
+        X_prepared.copy()
+    )
+
+    prepared_feature_names = [
+        str(column)
+        for column in transformer_input.columns
+    ]
+
+    _validate_feature_names(
+        prepared_feature_names
+    )
+
+    if not prepared_feature_names:
+
+        raise PreprocessingError(
+            "No feature columns remain after "
+            "datetime preprocessing."
+        )
+
+    # ==================================================================
+    # BUILD PREPROCESSOR
+    # ==================================================================
+
+    (
+        preprocessor,
+        transformer_feature_types,
+    ) = build_preprocessor(
+        transformer_input,
+        config,
+    )
+
+    # ==================================================================
+    # SUPERVISED TRAINING
+    # ==================================================================
+
+    if y is not None:
+
+        (
+            X_train_raw,
+            X_test_raw,
+            y_train,
+            y_test,
+        ) = _split_supervised_data(
+            X=transformer_input,
+            y=y,
+            task=task,
+            config=config,
+        )
+
+        # --------------------------------------------------------------
+        # CRITICAL:
+        #
+        # Fit ONLY on X_train.
+        #
+        # This prevents:
+        # - imputation leakage
+        # - scaling leakage
+        # - category vocabulary leakage
+        # - statistical leakage
+        # --------------------------------------------------------------
+
+        try:
+
+            preprocessor.fit(
+                X_train_raw
+            )
+
+        except Exception as exc:
+
+            raise PreprocessingError(
+                "Failed to fit the preprocessing "
+                f"pipeline: {exc}"
+            ) from exc
+
+        # --------------------------------------------------------------
+        # Transform training set.
+        # --------------------------------------------------------------
+
+        try:
+
+            X_train = (
+                preprocessor.transform(
+                    X_train_raw
+                )
+            )
+
+        except Exception as exc:
+
+            raise PreprocessingError(
+                "Failed to transform training "
+                f"data: {exc}"
+            ) from exc
+
+        # --------------------------------------------------------------
+        # Transform test set.
+        # --------------------------------------------------------------
+
+        try:
+
+            X_test = (
+                preprocessor.transform(
+                    X_test_raw
+                )
+            )
+
+        except Exception as exc:
+
+            raise PreprocessingError(
+                "Failed to transform test "
+                f"data: {exc}"
+            ) from exc
+
+        # --------------------------------------------------------------
+        # Full transformed data.
+        #
+        # IMPORTANT:
+        # This uses the already-fitted transformer.
+        #
+        # There is NO fit_transform here.
+        # --------------------------------------------------------------
+
+        try:
+
+            X_full = (
+                preprocessor.transform(
+                    transformer_input
+                )
+            )
+
+        except Exception as exc:
+
+            raise PreprocessingError(
+                "Failed to transform the complete "
+                f"dataset: {exc}"
+            ) from exc
+
+    # ==================================================================
+    # UNSUPERVISED
+    # ==================================================================
+
+    else:
+
+        # --------------------------------------------------------------
+        # For unsupervised workflows there is no train/test target
+        # split. The transformer is fitted once on the available
+        # feature data.
+        # --------------------------------------------------------------
+
+        try:
+
+            preprocessor.fit(
+                transformer_input
+            )
+
+        except Exception as exc:
+
+            raise PreprocessingError(
+                "Failed to fit the unsupervised "
+                f"preprocessing pipeline: {exc}"
+            ) from exc
+
+        try:
+
+            X_full = (
+                preprocessor.transform(
+                    transformer_input
+                )
+            )
+
+        except Exception as exc:
+
+            raise PreprocessingError(
+                "Failed to transform the "
+                f"unsupervised dataset: {exc}"
+            ) from exc
+
+        X_train = X_full
+
+        X_test = None
+
+        y_train = None
+
+        y_test = None
+
+    # ==================================================================
+    # TRANSFORMED FEATURE NAMES
+    # ==================================================================
+
+    feature_names = _get_feature_names(
+        preprocessor
+    )
+
+    if not feature_names:
+
+        raise PreprocessingError(
+            "The preprocessing pipeline produced "
+            "no transformed feature names."
+        )
+
+    # ==================================================================
+    # MATRIX VALIDATION
+    # ==================================================================
+
+    full_rows, full_columns = (
+        _matrix_shape(
+            X_full
+        )
+    )
+
+    if full_rows != len(X):
+
+        raise PreprocessingError(
+            "Internal preprocessing error: "
+            "transformed row count does not "
+            "match the source dataset."
+        )
+
+    if full_columns != len(
+        feature_names
     ):
 
-        y, _ = encode_target(
-
-            y,
-
+        raise PreprocessingError(
+            "Internal preprocessing error: "
+            "transformed feature count does "
+            "not match feature names."
         )
 
-    ######################################################
-    # Train / Test Split
-    ######################################################
-
-    X_train, X_test, y_train, y_test = train_test_split(
-
-        X,
-
-        y,
-
-        test_size=config.test_size,
-
-        random_state=config.random_state,
-
-        shuffle=config.shuffle,
-
-    )
-
-    ######################################################
-    # Build Pipeline
-    ######################################################
-
-    preprocessor = build_preprocessor(
-
-        dataframe,
-
-        target_column,
-
-        config,
-
-    )
-
-    ######################################################
-    # Fit & Transform
-    ######################################################
-
-    X_train_processed, X_test_processed = (
-
-        fit_transform_dataset(
-
-            preprocessor,
-
-            X_train,
-
-            X_test,
-
+    sparse_output = (
+        _is_sparse_matrix(
+            X_full
         )
-
     )
 
-    ######################################################
-    # Feature Names
-    ######################################################
+    # ==================================================================
+    # FINAL FEATURE TYPE INFORMATION
+    # ==================================================================
 
-    feature_names = transformed_feature_names(
-
-        preprocessor,
-
+    numeric_features = list(
+        transformer_feature_types[
+            "numeric"
+        ]
     )
 
-    ######################################################
-    # Return
-    ######################################################
+    categorical_features = list(
+        transformer_feature_types[
+            "categorical"
+        ]
+    )
+
+    boolean_features = list(
+        transformer_feature_types[
+            "boolean"
+        ]
+    )
+
+    # ==================================================================
+    # RETURN RUNTIME OBJECT
+    # ==================================================================
 
     return ProcessedDataset(
-
-        X_train=X_train_processed,
-
-        X_test=X_test_processed,
-
+        X_train=X_train,
+        X_test=X_test,
         y_train=y_train,
-
         y_test=y_test,
-
+        X_full=X_full,
         feature_names=feature_names,
-
-        target_column=target_column,
-
         preprocessor=preprocessor,
-
+        target_column=target,
+        task=task,
+        numeric_features=numeric_features,
+        categorical_features=categorical_features,
+        boolean_features=boolean_features,
+        datetime_features=datetime_features,
+        original_feature_names=(
+            original_feature_names
+        ),
+        sparse_output=sparse_output,
+        n_rows=len(X),
+        n_features_before=len(
+            original_feature_names
+        ),
+        n_features_after=len(
+            feature_names
+        ),
+        prepared_feature_names=(
+            prepared_feature_names
+        ),
+        datetime_components=[
+            str(component)
+            for component in (
+                config.datetime_components
+            )
+        ],
     )
 
 
-##########################################################
-# Dataset Information
-##########################################################
+# ======================================================================
+# PREDICTION TRANSFORMATION
+# ======================================================================
+
+
+def transform_prediction_data(
+    dataframe: pd.DataFrame,
+    preprocessor: Any,
+    expected_features: list[str],
+    config: PreprocessingConfig | None = None,
+    datetime_features: list[str] | None = None,
+    datetime_components: list[str] | None = None,
+) -> Any:
+    """
+    Transform raw prediction data using an already fitted preprocessor.
+
+    IMPORTANT
+    ---------
+    This function NEVER fits the preprocessor.
+
+    Training feature schema
+        |
+        +--> expected_features
+        |
+        +--> datetime_features
+        |
+        +--> datetime_components
+        |
+        +--> fitted preprocessor
+        |
+        +--> prediction matrix
+
+    Parameters
+    ----------
+    dataframe:
+        Raw prediction dataframe.
+
+    preprocessor:
+        Already fitted sklearn transformer.
+
+    expected_features:
+        Exact raw feature columns used during training.
+
+    datetime_features:
+        Exact datetime columns detected during training.
+
+    datetime_components:
+        Exact datetime components used during training.
+
+    Backward compatibility
+    ----------------------
+    If datetime_features is not supplied, the function falls back to
+    conservative detection. New ModelArtifact-based prediction code
+    should ALWAYS supply the stored datetime schema.
+    """
+
+    if config is None:
+        config = PreprocessingConfig()
+
+    _validate_config(
+        config
+    )
+
+    _validate_dataframe(
+        dataframe,
+        "Prediction data",
+    )
+
+    if preprocessor is None:
+
+        raise PreprocessingError(
+            "A fitted preprocessor is required "
+            "for prediction."
+        )
+
+    if not expected_features:
+
+        raise PreprocessingError(
+            "Expected feature schema cannot be empty."
+        )
+
+    _validate_feature_names(
+        [
+            str(column)
+            for column in expected_features
+        ]
+    )
+
+    # ==================================================================
+    # DUPLICATE INPUT COLUMNS
+    # ==================================================================
+
+    if dataframe.columns.has_duplicates:
+
+        duplicates = (
+            dataframe.columns[
+                dataframe.columns.duplicated()
+            ]
+            .astype(str)
+            .tolist()
+        )
+
+        raise PreprocessingError(
+            "Prediction data contains duplicate "
+            f"columns: {duplicates}"
+        )
+
+    # ==================================================================
+    # MISSING FEATURES
+    # ==================================================================
+
+    missing = [
+        column
+        for column in expected_features
+        if column not in dataframe.columns
+    ]
+
+    if missing:
+
+        raise PreprocessingError(
+            "Prediction data is missing required "
+            f"columns: {missing}"
+        )
+
+    # ==================================================================
+    # EXTRA FEATURES
+    # ==================================================================
+
+    # Extra columns are deliberately ignored.
+    #
+    # Why?
+    #
+    # A prediction request commonly contains metadata such as:
+    #
+    #     prediction_id
+    #     uploaded_at
+    #     source
+    #
+    # These should not become model features accidentally.
+    #
+    # Only expected training features are passed to the fitted
+    # preprocessor.
+
+    raw = dataframe[
+        list(expected_features)
+    ].copy()
+
+    # ==================================================================
+    # DATETIME SCHEMA
+    # ==================================================================
+
+    if datetime_features is not None:
+
+        known_datetime_features = [
+            str(column)
+            for column in datetime_features
+        ]
+
+        components = (
+            tuple(
+                str(component)
+                for component in (
+                    datetime_components
+                    if datetime_components is not None
+                    else config.datetime_components
+                )
+            )
+        )
+
+        missing_datetime_columns = [
+            column
+            for column in known_datetime_features
+            if column not in raw.columns
+        ]
+
+        if missing_datetime_columns:
+
+            raise PreprocessingError(
+                "Prediction data is missing "
+                "training datetime columns: "
+                f"{missing_datetime_columns}"
+            )
+
+        try:
+
+            prepared = (
+                _expand_known_datetime_columns(
+                    dataframe=raw,
+                    datetime_features=(
+                        known_datetime_features
+                    ),
+                    components=components,
+                )
+            )
+
+        except Exception as exc:
+
+            raise PreprocessingError(
+                "Failed to reproduce training "
+                "datetime preprocessing: "
+                f"{exc}"
+            ) from exc
+
+    else:
+
+        # --------------------------------------------------------------
+        # Backward-compatible fallback.
+        #
+        # New artifact prediction should provide the stored schema.
+        # --------------------------------------------------------------
+
+        try:
+
+            prepared, detected_types = (
+                _prepare_raw_features(
+                    raw,
+                    config,
+                )
+            )
+
+            detected_datetime = (
+                detected_types[
+                    "datetime"
+                ]
+            )
+
+            # _prepare_raw_features already removes the original
+            # datetime columns.
+            #
+            # The variable is retained only for clarity.
+
+            _ = detected_datetime
+
+        except Exception as exc:
+
+            raise PreprocessingError(
+                "Failed to prepare prediction "
+                f"features: {exc}"
+            ) from exc
+
+    # ==================================================================
+    # EXACT PREPARED SCHEMA VALIDATION
+    # ==================================================================
+
+    # If the fitted ColumnTransformer exposes feature names, use them
+    # to validate that the prepared input schema is compatible.
+
+    try:
+
+        fitted_transformer_names = []
+
+        for (
+            name,
+            transformer,
+            columns,
+        ) in preprocessor.transformers_:
+
+            if transformer == "drop":
+                continue
+
+            if columns is None:
+                continue
+
+            if isinstance(
+                columns,
+                (list, tuple),
+            ):
+
+                fitted_transformer_names.extend(
+                    str(column)
+                    for column in columns
+                )
+
+        missing_prepared = [
+            column
+            for column in fitted_transformer_names
+            if column not in prepared.columns
+        ]
+
+        if missing_prepared:
+
+            raise PreprocessingError(
+                "Prediction preprocessing schema "
+                "does not match the fitted "
+                f"preprocessor. Missing prepared "
+                f"features: {missing_prepared}"
+            )
+
+    except PreprocessingError:
+        raise
+
+    except Exception:
+        # Do not fail merely because a particular sklearn version
+        # exposes transformer internals differently.
+        pass
+
+    # ==================================================================
+    # TRANSFORM ONLY
+    # ==================================================================
+
+    try:
+
+        transformed = (
+            preprocessor.transform(
+                prepared
+            )
+        )
+
+    except Exception as exc:
+
+        raise PreprocessingError(
+            "Prediction preprocessing failed: "
+            f"{exc}"
+        ) from exc
+
+    # ==================================================================
+    # OUTPUT VALIDATION
+    # ==================================================================
+
+    rows, columns = _matrix_shape(
+        transformed
+    )
+
+    if rows != len(dataframe):
+
+        raise PreprocessingError(
+            "Prediction preprocessing changed "
+            "the number of input rows."
+        )
+
+    try:
+
+        fitted_feature_count = len(
+            preprocessor.get_feature_names_out()
+        )
+
+        if columns != fitted_feature_count:
+
+            raise PreprocessingError(
+                "Prediction preprocessing produced "
+                f"{columns} features, but the fitted "
+                f"preprocessor expects "
+                f"{fitted_feature_count}."
+            )
+
+    except PreprocessingError:
+        raise
+
+    except Exception:
+        pass
+
+    return transformed
+
+
+# ======================================================================
+# DATASET SUMMARY
+# ======================================================================
+
 
 def dataset_summary(
     dataframe: pd.DataFrame,
-    target_column: str,
-    config: PreprocessingConfig | None = None,
-) -> dict:
+    target_column: str | None = None,
+) -> dict[str, Any]:
     """
-    Returns complete dataset information.
+    Lightweight dataset summary.
+
+    This function does not mutate the dataframe.
+
+    The summary is intended for API/UI metadata and diagnostics,
+    not for model fitting.
     """
 
-    if config is None:
+    if dataframe is None:
 
-        config = PreprocessingConfig()
+        return {}
 
-    return {
+    _validate_dataframe(
+        dataframe,
+        "Dataset",
+    )
 
-        "feature_summary": feature_summary(
-
-            dataframe,
-
-            target_column,
-
+    summary: dict[
+        str,
+        Any,
+    ] = {
+        "rows": int(
+            len(dataframe)
         ),
-
-        "missing_values": missing_value_summary(
-
-            dataframe,
-
+        "columns": int(
+            len(dataframe.columns)
         ),
-
-        "pipeline": pipeline_summary(
-
-            dataframe,
-
-            target_column,
-
-            config,
-
+        "memory_usage_bytes": int(
+            dataframe.memory_usage(
+                deep=True
+            ).sum()
         ),
-
-        "encoding": encoder_summary(
-
-            config,
-
+        "missing_values": int(
+            dataframe.isna()
+            .sum()
+            .sum()
         ),
-
-        "scaling": scaler_summary(
-
-            config,
-
-        ),
-
+        "target_column": target_column,
+        "columns_info": {},
     }
 
+    # ==================================================================
+    # COLUMN INFORMATION
+    # ==================================================================
 
-##########################################################
-# Public API
-##########################################################
+    for column in dataframe.columns:
+
+        series = dataframe[column]
+
+        summary[
+            "columns_info"
+        ][
+            str(column)
+        ] = {
+            "dtype": str(
+                series.dtype
+            ),
+            "missing": int(
+                series.isna().sum()
+            ),
+            "unique": int(
+                series.nunique(
+                    dropna=True
+                )
+            ),
+        }
+
+    # ==================================================================
+    # TARGET INFORMATION
+    # ==================================================================
+
+    if target_column is not None:
+
+        if target_column in dataframe.columns:
+
+            target = dataframe[
+                target_column
+            ]
+
+            summary[
+                "target"
+            ] = {
+                "dtype": str(
+                    target.dtype
+                ),
+                "unique": int(
+                    target.nunique(
+                        dropna=True
+                    )
+                ),
+                "missing": int(
+                    target.isna().sum()
+                ),
+            }
+
+    return summary
+
+
+# ======================================================================
+# PUBLIC API
+# ======================================================================
+
 
 __all__ = [
-
-    "FeatureType",
-
-    "ScalingStrategy",
-
-    "EncodingStrategy",
-
-    "MissingValueStrategy",
-
     "PreprocessingConfig",
-
-    "ProcessedDataset",
-
-    "feature_summary",
-
-    "missing_value_summary",
-
-    "dataset_summary",
-
-    "preprocess_dataset",
-
+    "detect_feature_types",
     "build_preprocessor",
-
-    "available_models",
-
+    "preprocess_dataset",
+    "transform_prediction_data",
+    "dataset_summary",
 ]
