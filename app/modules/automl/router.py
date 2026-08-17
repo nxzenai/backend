@@ -40,7 +40,9 @@ from fastapi import (
 
 )
 
+from app.modules.automl.algorithms.clustering import ClusteringConfig
 from app.modules.automl.exceptions import (
+    ClusteringConfigurationError,
     ModelArtifactError,
     ModelNotFoundError,
     PredictionNotSupportedError,
@@ -144,6 +146,32 @@ def normalize_task(
         return None
 
     return normalized
+
+
+def clustering_config_from_request(
+    cluster_count_mode: Optional[str],
+    number_of_clusters: Optional[int],
+    require_prediction_support: Optional[bool],
+) -> ClusteringConfig | None:
+
+    if (
+        cluster_count_mode is None
+        and number_of_clusters is None
+        and require_prediction_support is None
+    ):
+        return None
+
+    return ClusteringConfig(
+        cluster_count_mode=(
+            cluster_count_mode
+            if cluster_count_mode is not None
+            else "automatic"
+        ),
+        number_of_clusters=number_of_clusters,
+        require_prediction_support=bool(
+            require_prediction_support
+        ),
+    )
 
 
 # ================================================================
@@ -326,6 +354,7 @@ async def train_service(
     dataframe: pd.DataFrame,
     target_column: Optional[str],
     task: Optional[str],
+    clustering_config: ClusteringConfig | None = None,
 ):
 
     return await asyncio.to_thread(
@@ -333,6 +362,7 @@ async def train_service(
         dataframe,
         target_column,
         task=task,
+        clustering_config=clustering_config,
     )
 
 
@@ -393,6 +423,15 @@ async def train_dataset(
     task: Optional[str] = Form(
         default=None
     ),
+    cluster_count_mode: Optional[str] = Form(
+        default=None
+    ),
+    number_of_clusters: Optional[int] = Form(
+        default=None
+    ),
+    require_prediction_support: Optional[bool] = Form(
+        default=None
+    ),
     service: AutoMLService = Depends(
         get_automl_service,
     ),
@@ -418,11 +457,18 @@ async def train_dataset(
             )
         )
 
+        clustering_config = clustering_config_from_request(
+            cluster_count_mode,
+            number_of_clusters,
+            require_prediction_support,
+        )
+
         result = await train_service(
             service,
             dataframe,
             normalized_target,
             normalized_task,
+            clustering_config,
         )
 
         model_filename = await save_training_artifact(
@@ -437,6 +483,12 @@ async def train_dataset(
 
     except HTTPException:
         raise
+
+    except ClusteringConfigurationError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=exc.message,
+        ) from exc
 
     except Exception as exc:
 
@@ -461,6 +513,9 @@ async def train_from_file(
     filepath: str,
     target_column: Optional[str] = None,
     task: Optional[str] = None,
+    cluster_count_mode: Optional[str] = None,
+    number_of_clusters: Optional[int] = None,
+    require_prediction_support: Optional[bool] = None,
     service: AutoMLService = Depends(
         get_automl_service,
     ),
@@ -480,11 +535,18 @@ async def train_from_file(
             )
         )
 
+        clustering_config = clustering_config_from_request(
+            cluster_count_mode,
+            number_of_clusters,
+            require_prediction_support,
+        )
+
         result = await asyncio.to_thread(
             service.train_from_file,
             filepath,
             normalized_target,
             task=normalized_task,
+            clustering_config=clustering_config,
         )
 
         model_filename = await save_training_artifact(
@@ -499,6 +561,12 @@ async def train_from_file(
 
     except HTTPException:
         raise
+
+    except ClusteringConfigurationError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=exc.message,
+        ) from exc
 
     except Exception as exc:
 

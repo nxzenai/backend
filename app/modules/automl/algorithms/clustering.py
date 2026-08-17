@@ -6,6 +6,7 @@ AutoML Clustering Engine
 from __future__ import annotations
 
 import time
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
@@ -29,6 +30,7 @@ from app.modules.automl.constants import (
     DEFAULT_TIMEOUT_SECONDS,
     ModelStatus,
 )
+from app.modules.automl.exceptions import ClusteringConfigurationError
 from app.modules.automl.models import ClusteringResult
 
 
@@ -36,6 +38,32 @@ MIN_CLUSTERS = 2
 MAX_CLUSTERS = 10
 MAX_SPECTRAL_SAMPLES = 2_000
 MAX_DENSE_ELEMENTS = 2_000_000
+
+AUTOMATIC_CLUSTER_COUNT = "automatic"
+CUSTOM_CLUSTER_COUNT = "custom"
+
+
+@dataclass(frozen=True)
+class ClusteringConfig:
+    cluster_count_mode: str = AUTOMATIC_CLUSTER_COUNT
+    number_of_clusters: int | None = None
+    require_prediction_support: bool = False
+
+
+@dataclass(frozen=True)
+class ClusteringAlgorithmCapabilities:
+    supports_custom_cluster_count: bool
+    supports_unseen_prediction: bool
+
+
+CLUSTERING_ALGORITHM_CAPABILITIES = {
+    "kmeans": ClusteringAlgorithmCapabilities(True, True),
+    "mini_batch_kmeans": ClusteringAlgorithmCapabilities(True, True),
+    "agglomerative": ClusteringAlgorithmCapabilities(True, False),
+    "birch": ClusteringAlgorithmCapabilities(True, True),
+    "dbscan": ClusteringAlgorithmCapabilities(False, False),
+    "spectral": ClusteringAlgorithmCapabilities(True, False),
+}
 
 
 def _is_sparse(X: Any) -> bool:
@@ -57,13 +85,66 @@ def _dense_if_safe(X: Any) -> Any:
     return X.toarray()
 
 
-def _cluster_count(
+def resolve_clustering_config(
     n_samples: int,
-) -> int:
+    config: ClusteringConfig | None = None,
+) -> tuple[ClusteringConfig, int]:
 
     if n_samples < 3:
-        raise ValueError(
+        raise ClusteringConfigurationError(
             "At least 3 samples are required for clustering."
+        )
+
+    requested = config or ClusteringConfig()
+    mode = str(requested.cluster_count_mode).strip().lower()
+
+    if mode not in {
+        AUTOMATIC_CLUSTER_COUNT,
+        CUSTOM_CLUSTER_COUNT,
+    }:
+        raise ClusteringConfigurationError(
+            "cluster_count_mode must be 'automatic' or 'custom'."
+        )
+
+    normalized = ClusteringConfig(
+        cluster_count_mode=mode,
+        number_of_clusters=requested.number_of_clusters,
+        require_prediction_support=bool(
+            requested.require_prediction_support
+        ),
+    )
+
+    if mode == CUSTOM_CLUSTER_COUNT:
+        value = normalized.number_of_clusters
+
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ClusteringConfigurationError(
+                "number_of_clusters must be an integer in custom mode."
+            )
+
+        if value < MIN_CLUSTERS:
+            raise ClusteringConfigurationError(
+                f"number_of_clusters must be at least {MIN_CLUSTERS}."
+            )
+
+        if value > MAX_CLUSTERS:
+            raise ClusteringConfigurationError(
+                "number_of_clusters must not exceed the configured "
+                f"maximum of {MAX_CLUSTERS}."
+            )
+
+        if value >= n_samples:
+            raise ClusteringConfigurationError(
+                "number_of_clusters must be less than the number "
+                f"of usable training rows ({n_samples})."
+            )
+
+        return normalized, value
+
+    if normalized.number_of_clusters is not None:
+        raise ClusteringConfigurationError(
+            "number_of_clusters is only valid when "
+            "cluster_count_mode is 'custom'."
         )
 
     value = max(
@@ -78,11 +159,41 @@ def _cluster_count(
     )
 
     if value < 2:
-        raise ValueError(
+        raise ClusteringConfigurationError(
             "Unable to determine a valid cluster count."
         )
 
-    return value
+    return normalized, value
+
+
+def _prediction_supported(model: Any) -> bool:
+    return callable(getattr(model, "predict", None))
+
+
+def _skipped_result(
+    model_name: str,
+    reason: str,
+    *,
+    config: ClusteringConfig,
+    effective_number_of_clusters: int | None,
+) -> ClusteringResult:
+    capabilities = CLUSTERING_ALGORITHM_CAPABILITIES[model_name]
+    return ClusteringResult(
+        model_name=model_name,
+        success=False,
+        status=ModelStatus.SKIPPED,
+        skip_reason=reason,
+        requested_number_of_clusters=(
+            config.number_of_clusters
+            if config.cluster_count_mode == CUSTOM_CLUSTER_COUNT
+            else None
+        ),
+        effective_number_of_clusters=effective_number_of_clusters,
+        supports_custom_cluster_count=(
+            capabilities.supports_custom_cluster_count
+        ),
+        prediction_supported=False,
+    )
 
 
 def _metrics(
@@ -192,6 +303,9 @@ def safe_train_clustering(
     X: Any,
     *,
     timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
+    requested_number_of_clusters: int | None = None,
+    effective_number_of_clusters: int | None = None,
+    supports_custom_cluster_count: bool = False,
 ) -> ClusteringResult:
 
     start = time.perf_counter()
@@ -227,6 +341,10 @@ def safe_train_clustering(
                     "Training exceeded the configured "
                     "runtime threshold."
                 ),
+                requested_number_of_clusters=requested_number_of_clusters,
+                effective_number_of_clusters=effective_number_of_clusters,
+                supports_custom_cluster_count=supports_custom_cluster_count,
+                prediction_supported=False,
             )
 
         metrics = _metrics(
@@ -257,6 +375,10 @@ def safe_train_clustering(
             davies_bouldin_score=(
                 metrics["davies_bouldin_score"]
             ),
+            requested_number_of_clusters=requested_number_of_clusters,
+            effective_number_of_clusters=effective_number_of_clusters,
+            supports_custom_cluster_count=supports_custom_cluster_count,
+            prediction_supported=_prediction_supported(model),
         )
 
     except Exception as exc:
@@ -274,6 +396,10 @@ def safe_train_clustering(
             error=(
                 f"{type(exc).__name__}: {exc}"
             ),
+            requested_number_of_clusters=requested_number_of_clusters,
+            effective_number_of_clusters=effective_number_of_clusters,
+            supports_custom_cluster_count=supports_custom_cluster_count,
+            prediction_supported=False,
         )
 
 
@@ -282,6 +408,8 @@ def safe_train_spectral(
     X: Any,
     *,
     timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
+    requested_number_of_clusters: int | None = None,
+    effective_number_of_clusters: int | None = None,
 ) -> ClusteringResult:
 
     start = time.perf_counter()
@@ -308,6 +436,10 @@ def safe_train_spectral(
                     "Training exceeded the configured "
                     "runtime threshold."
                 ),
+                requested_number_of_clusters=requested_number_of_clusters,
+                effective_number_of_clusters=effective_number_of_clusters,
+                supports_custom_cluster_count=True,
+                prediction_supported=False,
             )
 
         labels = np.asarray(labels)
@@ -340,6 +472,10 @@ def safe_train_spectral(
             davies_bouldin_score=(
                 metrics["davies_bouldin_score"]
             ),
+            requested_number_of_clusters=requested_number_of_clusters,
+            effective_number_of_clusters=effective_number_of_clusters,
+            supports_custom_cluster_count=True,
+            prediction_supported=_prediction_supported(model),
         )
 
     except Exception as exc:
@@ -357,6 +493,10 @@ def safe_train_spectral(
             error=(
                 f"{type(exc).__name__}: {exc}"
             ),
+            requested_number_of_clusters=requested_number_of_clusters,
+            effective_number_of_clusters=effective_number_of_clusters,
+            supports_custom_cluster_count=True,
+            prediction_supported=False,
         )
 
 
@@ -366,6 +506,7 @@ def train_clustering_models(
     random_state: int = DEFAULT_RANDOM_STATE,
     excluded_algorithms: list[str] | None = None,
     timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
+    clustering_config: ClusteringConfig | None = None,
 ) -> list[ClusteringResult]:
 
     if X is None:
@@ -375,8 +516,9 @@ def train_clustering_models(
 
     n_samples = X.shape[0]
 
-    n_clusters = _cluster_count(
-        n_samples
+    config, n_clusters = resolve_clustering_config(
+        n_samples,
+        clustering_config,
     )
 
     excluded = {
@@ -395,41 +537,114 @@ def train_clustering_models(
 
     for model_name, model in registry.items():
 
+        capabilities = CLUSTERING_ALGORITHM_CAPABILITIES[model_name]
+
         if model_name.lower() in excluded:
 
             results.append(
-                ClusteringResult(
-                    model_name=model_name,
-                    success=False,
-                    status=ModelStatus.SKIPPED,
-                    skip_reason=(
-                        "Excluded by user configuration."
+                _skipped_result(
+                    model_name,
+                    "Excluded by user configuration.",
+                    config=config,
+                    effective_number_of_clusters=(
+                        n_clusters
+                        if capabilities.supports_custom_cluster_count
+                        else None
                     ),
                 )
             )
 
             continue
 
-        results.append(
-            safe_train_clustering(
-                model_name=model_name,
-                model=model,
-                X=X,
-                timeout_seconds=timeout_seconds,
+        if (
+            config.cluster_count_mode == CUSTOM_CLUSTER_COUNT
+            and not capabilities.supports_custom_cluster_count
+        ):
+            results.append(
+                _skipped_result(
+                    model_name,
+                    "This algorithm does not support a configured "
+                    "cluster count.",
+                    config=config,
+                    effective_number_of_clusters=None,
+                )
             )
+            continue
+
+        if (
+            config.require_prediction_support
+            and not capabilities.supports_unseen_prediction
+        ):
+            results.append(
+                _skipped_result(
+                    model_name,
+                    "This algorithm does not support prediction "
+                    "for unseen rows.",
+                    config=config,
+                    effective_number_of_clusters=n_clusters,
+                )
+            )
+            continue
+
+        trained = safe_train_clustering(
+            model_name=model_name,
+            model=model,
+            X=X,
+            timeout_seconds=timeout_seconds,
+            requested_number_of_clusters=(
+                config.number_of_clusters
+                if config.cluster_count_mode == CUSTOM_CLUSTER_COUNT
+                else None
+            ),
+            effective_number_of_clusters=(
+                n_clusters
+                if capabilities.supports_custom_cluster_count
+                else None
+            ),
+            supports_custom_cluster_count=(
+                capabilities.supports_custom_cluster_count
+            ),
         )
+
+        if (
+            config.require_prediction_support
+            and trained.success
+            and not trained.prediction_supported
+        ):
+            trained = _skipped_result(
+                model_name,
+                "The fitted estimator does not expose reliable "
+                "prediction for unseen rows.",
+                config=config,
+                effective_number_of_clusters=(
+                    n_clusters
+                    if capabilities.supports_custom_cluster_count
+                    else None
+                ),
+            )
+
+        results.append(trained)
 
     if (
         "spectral" in excluded
     ):
         results.append(
-            ClusteringResult(
-                model_name="spectral",
-                success=False,
-                status=ModelStatus.SKIPPED,
-                skip_reason=(
-                    "Excluded by user configuration."
-                ),
+            _skipped_result(
+                "spectral",
+                "Excluded by user configuration.",
+                config=config,
+                effective_number_of_clusters=n_clusters,
+            )
+        )
+
+    elif config.require_prediction_support:
+        results.append(
+            _skipped_result(
+                "spectral",
+                "This algorithm does not support prediction "
+                "for unseen rows.",
+                config=config,
+                effective_number_of_clusters=n_clusters,
             )
         )
 
@@ -464,6 +679,12 @@ def train_clustering_models(
                 model=spectral,
                 X=X,
                 timeout_seconds=timeout_seconds,
+                requested_number_of_clusters=(
+                    config.number_of_clusters
+                    if config.cluster_count_mode == CUSTOM_CLUSTER_COUNT
+                    else None
+                ),
+                effective_number_of_clusters=n_clusters,
             )
         )
 
@@ -531,6 +752,16 @@ def clustering_leaderboard(
                 ),
                 "error": result.error,
                 "skip_reason": result.skip_reason,
+                "requested_number_of_clusters": (
+                    result.requested_number_of_clusters
+                ),
+                "effective_number_of_clusters": (
+                    result.effective_number_of_clusters
+                ),
+                "supports_custom_cluster_count": (
+                    result.supports_custom_cluster_count
+                ),
+                "prediction_supported": result.prediction_supported,
             }
         )
 
@@ -551,6 +782,12 @@ leaderboard = clustering_leaderboard
 
 
 __all__ = [
+    "MIN_CLUSTERS",
+    "MAX_CLUSTERS",
+    "ClusteringConfig",
+    "ClusteringAlgorithmCapabilities",
+    "CLUSTERING_ALGORITHM_CAPABILITIES",
+    "resolve_clustering_config",
     "clustering_registry",
     "safe_train_clustering",
     "safe_train_spectral",
