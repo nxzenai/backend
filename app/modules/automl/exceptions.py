@@ -124,6 +124,33 @@ class PredictionError(AutoMLException):
         )
 
 
+class PredictionNotSupportedError(AutoMLException):
+    """
+    The saved estimator cannot predict unseen rows.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        model_name: str,
+        task: str,
+    ) -> None:
+        super().__init__(
+            message,
+            code="PREDICTION_NOT_SUPPORTED",
+        )
+        self.model_name = model_name
+        self.task = task
+
+    def to_dict(self) -> dict:
+        return {
+            **super().to_dict(),
+            "model_name": self.model_name,
+            "task": self.task,
+        }
+
+
 class AlgorithmTimeoutError(AutoMLException):
     """
     Individual algorithm exceeded its allowed runtime.
