@@ -38,6 +38,8 @@ Important contracts
 
 from __future__ import annotations
 
+import os
+import tempfile
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -1113,23 +1115,9 @@ class AutoMLTrainer:
         ):
 
             artifact = model
-
-            if len(dataframe) > (
-                artifact.max_prediction_rows
-            ):
-                raise ValueError(
-                    "Prediction request exceeds the "
-                    f"maximum allowed rows "
-                    f"({artifact.max_prediction_rows})."
-                )
-
-            transformed = transform_prediction_data(
-                dataframe=dataframe,
-                preprocessor=artifact.preprocessor,
-                expected_features=(
-                    artifact.original_feature_names
-                ),
-                config=self.preprocessing_config,
+            transformed = self._transform_artifact_input(
+                artifact,
+                dataframe,
             )
 
             # ----------------------------------------------------
@@ -1197,6 +1185,48 @@ class AutoMLTrainer:
             "Provided model is not a supported "
             "AutoML model, ModelArtifact, or transformer."
         )
+
+    def _transform_artifact_input(
+        self,
+        artifact: ModelArtifact,
+        dataframe: pd.DataFrame,
+    ) -> Any:
+
+        if len(dataframe) > artifact.max_prediction_rows:
+            raise ValueError(
+                "Prediction request exceeds the "
+                "maximum allowed rows "
+                f"({artifact.max_prediction_rows})."
+            )
+
+        return transform_prediction_data(
+            dataframe=dataframe,
+            preprocessor=artifact.preprocessor,
+            expected_features=artifact.original_feature_names,
+            config=self.preprocessing_config,
+            datetime_features=artifact.datetime_features,
+            datetime_components=artifact.datetime_components,
+        )
+
+    def predict_probabilities(
+        self,
+        artifact: ModelArtifact,
+        dataframe: pd.DataFrame,
+    ) -> Any | None:
+
+        if not isinstance(artifact, ModelArtifact):
+            raise TypeError(
+                "Prediction probabilities require a ModelArtifact."
+            )
+
+        if not hasattr(artifact.model, "predict_proba"):
+            return None
+
+        transformed = self._transform_artifact_input(
+            artifact,
+            dataframe,
+        )
+        return artifact.model.predict_proba(transformed)
 
     # ============================================================
     # BATCH PREDICTION
@@ -1275,10 +1305,26 @@ class AutoMLTrainer:
             exist_ok=True,
         )
 
-        joblib.dump(
-            model,
-            filepath,
-        )
+        temporary_path: Path | None = None
+
+        try:
+            with tempfile.NamedTemporaryFile(
+                dir=filepath.parent,
+                prefix=f".{filepath.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as temporary_file:
+                temporary_path = Path(temporary_file.name)
+
+            joblib.dump(model, temporary_path)
+            os.replace(temporary_path, filepath)
+
+        finally:
+            if (
+                temporary_path is not None
+                and temporary_path.exists()
+            ):
+                temporary_path.unlink()
 
     # ============================================================
     # LOAD MODEL

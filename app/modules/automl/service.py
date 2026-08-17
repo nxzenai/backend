@@ -18,14 +18,22 @@ Responsibilities
 
 from __future__ import annotations
 
+import math
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
-import math
 import numpy as np
 import pandas as pd
 
+from app.modules.automl.constants import MODEL_ARTIFACT_VERSION
+from app.modules.automl.exceptions import (
+    ModelArtifactError,
+    ModelNotFoundError,
+)
+from app.modules.automl.models import ModelArtifact
 from app.modules.automl.trainer import (
     AutoMLResult,
     AutoMLTask,
@@ -513,10 +521,7 @@ class AutoMLService:
                 "Model filename cannot be empty."
             )
 
-        filepath = (
-            self.model_directory
-            / filename
-        )
+        filepath = self._resolve_model_path(filename)
 
         self.trainer.save_model(
             model,
@@ -535,10 +540,7 @@ class AutoMLService:
         filename: str = "best_model.pkl",
     ) -> Path:
 
-        filepath = (
-            self.model_directory
-            / filename
-        )
+        filepath = self._resolve_model_path(filename)
 
         self.trainer.save_best_model(
             result,
@@ -546,6 +548,32 @@ class AutoMLService:
         )
 
         return filepath
+
+    def save_best_model_unique(
+        self,
+        result: AutoMLResult,
+    ) -> Path:
+
+        if (
+            result is None
+            or not result.success
+            or result.model_artifact is None
+            or result.best_model is None
+            or not getattr(result.best_model, "success", False)
+        ):
+            raise ModelArtifactError(
+                "No successful best model is available to save."
+            )
+
+        task = self._safe_filename_component(result.task)
+        model_name = self._safe_filename_component(
+            result.model_artifact.model_name
+        )
+        filename = (
+            f"{task}_{model_name}_{uuid4().hex[:12]}.pkl"
+        )
+
+        return self.save_best_model(result, filename)
 
     # ============================================================
     # LOAD MODEL
@@ -556,14 +584,119 @@ class AutoMLService:
         filename: str,
     ) -> Any:
 
-        filepath = (
-            self.model_directory
-            / filename
-        )
+        filepath = self._resolve_model_path(filename)
+
+        if not filepath.is_file():
+            raise ModelNotFoundError(
+                f"Model '{filename}' was not found."
+            )
 
         return self.trainer.load_model(
             filepath
         )
+
+    def load_artifact(
+        self,
+        filename: str,
+    ) -> ModelArtifact:
+
+        filepath = self._resolve_model_path(filename)
+        if not filepath.is_file():
+            raise ModelNotFoundError(
+                f"Model '{filename}' was not found."
+            )
+
+        try:
+            artifact = self.trainer.load_model(filepath)
+        except Exception as exc:
+            raise ModelArtifactError(
+                "The saved model artifact could not be loaded."
+            ) from exc
+
+        return self.validate_artifact(artifact)
+
+    def validate_artifact(
+        self,
+        artifact: Any,
+    ) -> ModelArtifact:
+
+        if not isinstance(artifact, ModelArtifact):
+            raise ModelArtifactError(
+                "The saved model is not a compatible ModelArtifact."
+            )
+
+        if artifact.artifact_version != MODEL_ARTIFACT_VERSION:
+            raise ModelArtifactError(
+                "The saved model artifact version is incompatible."
+            )
+
+        if artifact.model is None or artifact.preprocessor is None:
+            raise ModelArtifactError(
+                "The saved model artifact is incomplete."
+            )
+
+        if not artifact.original_feature_names:
+            raise ModelArtifactError(
+                "The saved model artifact has no input feature schema."
+            )
+
+        if artifact.max_prediction_rows < 1:
+            raise ModelArtifactError(
+                "The saved model artifact has an invalid prediction limit."
+            )
+
+        return artifact
+
+    def predict_artifact_values(
+        self,
+        artifact: ModelArtifact,
+        dataframe: pd.DataFrame,
+    ) -> dict[str, Any]:
+
+        artifact = self.validate_artifact(artifact)
+        predictions = self.predict(artifact, dataframe)
+
+        response: dict[str, Any] = {
+            "task": artifact.task,
+            "model_name": artifact.model_name,
+            "rows": len(dataframe),
+            "predictions": predictions,
+        }
+
+        if artifact.task == "classification":
+            model_classes = getattr(
+                artifact.model,
+                "classes_",
+                None,
+            )
+            classes = (
+                np.asarray(model_classes).tolist()
+                if model_classes is not None
+                else artifact.classes
+            )
+
+            if classes is not None:
+                response["classes"] = _json_safe(classes)
+
+            probabilities = self.trainer.predict_probabilities(
+                artifact,
+                dataframe,
+            )
+            if probabilities is not None:
+                probability_rows = _json_safe(probabilities)
+                if (
+                    classes is None
+                    or any(
+                        len(row) != len(classes)
+                        for row in probability_rows
+                    )
+                ):
+                    raise ModelArtifactError(
+                        "Prediction probability classes are incompatible."
+                    )
+                response["probabilities"] = probability_rows
+
+        return _json_safe(response)
 
     # ============================================================
     # MODEL EXISTS
@@ -574,10 +707,7 @@ class AutoMLService:
         filename: str,
     ) -> bool:
 
-        return (
-            self.model_directory
-            / filename
-        ).exists()
+        return self._resolve_model_path(filename).is_file()
 
     # ============================================================
     # LIST MODELS
@@ -604,10 +734,7 @@ class AutoMLService:
         filename: str,
     ) -> bool:
 
-        filepath = (
-            self.model_directory
-            / filename
-        )
+        filepath = self._resolve_model_path(filename)
 
         if not filepath.exists():
             return False
@@ -647,10 +774,46 @@ class AutoMLService:
         filename: str,
     ) -> Path:
 
-        return (
-            self.model_directory
-            / filename
-        )
+        return self._resolve_model_path(filename)
+
+    @staticmethod
+    def _safe_filename_component(value: str) -> str:
+        component = re.sub(
+            r"[^a-zA-Z0-9]+",
+            "_",
+            str(value).strip().lower(),
+        ).strip("_")
+        return component or "model"
+
+    def _resolve_model_path(
+        self,
+        filename: str,
+    ) -> Path:
+
+        if not isinstance(filename, str) or not filename.strip():
+            raise ValueError("Model filename is invalid.")
+
+        candidate = Path(filename)
+        if (
+            candidate.is_absolute()
+            or candidate.name != filename
+            or candidate.suffix.lower() != ".pkl"
+            or not re.fullmatch(
+                r"[A-Za-z0-9][A-Za-z0-9._-]*\.pkl",
+                filename,
+                flags=re.IGNORECASE,
+            )
+        ):
+            raise ValueError(
+                "Model filename must be a safe .pkl filename."
+            )
+
+        model_directory = self.model_directory.resolve()
+        filepath = (model_directory / filename).resolve()
+        if filepath.parent != model_directory:
+            raise ValueError("Model filename is invalid.")
+
+        return filepath
 
     # ============================================================
     # SAVED MODEL INFORMATION
@@ -661,10 +824,7 @@ class AutoMLService:
         filename: str,
     ) -> dict[str, Any]:
 
-        filepath = (
-            self.model_directory
-            / filename
-        )
+        filepath = self._resolve_model_path(filename)
 
         if not filepath.exists():
             raise FileNotFoundError(
@@ -922,6 +1082,7 @@ class AutoMLService:
     def complete_response(
         self,
         result: AutoMLResult,
+        model_filename: str | None = None,
     ) -> dict[str, Any]:
 
         if result is None:
@@ -931,6 +1092,8 @@ class AutoMLService:
 
         response = {
             "task": result.task,
+
+            "model_filename": model_filename,
 
             "dataset_summary":
                 result.dataset_summary,
@@ -973,6 +1136,7 @@ class AutoMLService:
                     if result.model_artifact
                     else None
                 ),
+                "model_filename": model_filename,
             },
 
             "skipped_algorithms":
