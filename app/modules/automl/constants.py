@@ -140,7 +140,7 @@ DEFAULT_MAX_DENSE_ELEMENTS = 2_000_000
 
 MODEL_ARTIFACT_VERSION = "3.0"
 
-MODEL_FILE_EXTENSION = ".joblib"
+MODEL_FILE_EXTENSION = ".pkl"
 
 
 # ======================================================================
