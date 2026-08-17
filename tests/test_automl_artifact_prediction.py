@@ -8,6 +8,12 @@ import pandas as pd
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from sklearn.cluster import (
+    DBSCAN,
+    AgglomerativeClustering,
+    KMeans,
+    SpectralClustering,
+)
 from sklearn.compose import ColumnTransformer
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LinearRegression, LogisticRegression
@@ -102,6 +108,48 @@ def _categorical_artifact() -> ModelArtifact:
     )
 
 
+def _clustering_artifact(model_name: str) -> ModelArtifact:
+    frame = pd.DataFrame(
+        {
+            "income": [15, 16, 17, 18, 70, 72, 74, 76],
+            "spending_score": [20, 22, 18, 24, 75, 80, 78, 82],
+        }
+    )
+    preprocessor = ColumnTransformer(
+        [
+            (
+                "numeric",
+                StandardScaler(),
+                ["income", "spending_score"],
+            )
+        ]
+    )
+    transformed = preprocessor.fit_transform(frame)
+    models = {
+        "kmeans": KMeans(n_clusters=2, random_state=42, n_init=10),
+        "dbscan": DBSCAN(eps=1.0, min_samples=2),
+        "agglomerative": AgglomerativeClustering(n_clusters=2),
+        "spectral": SpectralClustering(
+            n_clusters=2,
+            affinity="rbf",
+            random_state=42,
+        ),
+    }
+    model = models[model_name]
+    model.fit(transformed)
+
+    return ModelArtifact(
+        model=model,
+        preprocessor=preprocessor,
+        task="clustering",
+        target_column=None,
+        feature_names=list(preprocessor.get_feature_names_out()),
+        model_name=model_name,
+        original_feature_names=["income", "spending_score"],
+        numeric_features=["income", "spending_score"],
+    )
+
+
 def _training_result(artifact: ModelArtifact) -> AutoMLResult:
     best_model = AlgorithmResult(
         model_name=artifact.model_name,
@@ -168,6 +216,8 @@ def test_training_saves_exactly_one_loadable_best_artifact(
     model_filename = response.json()["model_filename"]
     assert model_filename.endswith(".pkl")
     assert response.json()["artifact"]["model_filename"] == model_filename
+    assert response.json()["artifact"]["prediction_supported"] is True
+    assert response.json()["artifact"]["prediction_unavailable_reason"] is None
     artifacts = list(service.model_directory.glob("*.pkl"))
     assert len(artifacts) == 1
     assert not list(service.model_directory.glob("*.tmp"))
@@ -233,6 +283,72 @@ def test_train_file_response_contains_model_filename(
 
     assert response.status_code == 200
     assert response.json()["model_filename"].endswith(".pkl")
+    assert response.json()["artifact"]["prediction_supported"] is True
+
+
+def test_classification_and_regression_capability_is_supported():
+    classification = _categorical_artifact()
+    regression = _numeric_artifact()
+
+    assert classification.prediction_supported is True
+    assert classification.prediction_unavailable_reason is None
+    assert regression.prediction_supported is True
+    assert regression.prediction_unavailable_reason is None
+
+
+def test_kmeans_capability_and_unseen_row_prediction(automl_client):
+    client, service = automl_client
+    artifact = _clustering_artifact("kmeans")
+    service.save_model(artifact, "kmeans.pkl")
+
+    assert artifact.prediction_supported is True
+
+    response = client.post(
+        "/api/v1/automl/predict/values",
+        json={
+            "model_filename": "kmeans.pkl",
+            "rows": [{"income": 71, "spending_score": 79}],
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["task"] == "clustering"
+    assert len(response.json()["predictions"]) == 1
+
+
+@pytest.mark.parametrize(
+    ("model_name", "display_name"),
+    [
+        ("dbscan", "DBSCAN"),
+        ("agglomerative", "Agglomerative Clustering"),
+        ("spectral", "Spectral Clustering"),
+    ],
+)
+def test_non_predictive_clustering_capability(model_name, display_name):
+    artifact = _clustering_artifact(model_name)
+
+    assert artifact.prediction_supported is False
+    assert artifact.prediction_unavailable_reason == (
+        f"{display_name} does not support prediction for unseen rows."
+    )
+
+
+def test_unsupported_prediction_returns_structured_conflict(automl_client):
+    client, service = automl_client
+    service.save_model(_clustering_artifact("dbscan"), "dbscan.pkl")
+
+    response = client.post(
+        "/api/v1/automl/predict/values",
+        json={"model_filename": "dbscan.pkl", "rows": [{}]},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == {
+        "code": "PREDICTION_NOT_SUPPORTED",
+        "message": "DBSCAN does not support prediction for unseen rows.",
+        "model_name": "dbscan",
+        "task": "clustering",
+    }
 
 
 def test_manual_numeric_prediction_and_column_reordering(automl_client):
@@ -407,5 +523,46 @@ def test_model_listing_information_and_deletion_still_work(automl_client):
     assert listed.json()["models"] == ["managed.pkl"]
     assert information.status_code == 200
     assert information.json()["filename"] == "managed.pkl"
+    assert information.json()["model_name"] == "linear_regression"
+    assert information.json()["task"] == "regression"
+    assert information.json()["prediction_supported"] is True
+    assert information.json()["prediction_unavailable_reason"] is None
     assert deleted.status_code == 200
     assert not service.model_exists("managed.pkl")
+
+
+def test_unsupported_model_information_matches_training_capability(automl_client):
+    client, service = automl_client
+    artifact = _clustering_artifact("dbscan")
+    service.save_model(artifact, "dbscan-info.pkl")
+
+    training_response = service.complete_response(
+        _training_result(artifact),
+        model_filename="dbscan-info.pkl",
+    )
+    information = client.get("/api/v1/automl/models/dbscan-info.pkl")
+
+    assert information.status_code == 200
+    assert information.json()["prediction_supported"] is False
+    assert information.json()["prediction_unavailable_reason"] == (
+        training_response["artifact"]["prediction_unavailable_reason"]
+    )
+
+
+def test_legacy_artifact_without_persisted_capability_fields_is_safe(
+    automl_client,
+):
+    client, service = automl_client
+    artifact = _numeric_artifact()
+
+    assert "prediction_supported" not in vars(artifact)
+    assert "prediction_unavailable_reason" not in vars(artifact)
+
+    service.save_model(artifact, "legacy.pkl")
+    loaded = joblib.load(service.model_path("legacy.pkl"))
+    information = client.get("/api/v1/automl/models/legacy.pkl")
+
+    assert loaded.artifact_version == "3.0"
+    assert loaded.prediction_supported is True
+    assert information.status_code == 200
+    assert information.json()["prediction_supported"] is True
