@@ -35,6 +35,8 @@ from .regression import (
 # ------------------------------------------------------------------
 
 from .clustering import (
+    CLUSTERING_ALGORITHM_CAPABILITIES,
+    ClusteringConfig,
     best_clustering_model,
     clustering_leaderboard,
     clustering_registry,
@@ -91,6 +93,8 @@ __all__ = [
     "safe_mape",
 
     # Clustering
+    "ClusteringConfig",
+    "CLUSTERING_ALGORITHM_CAPABILITIES",
     "clustering_registry",
     "train_clustering_models",
     "safe_train_clustering",

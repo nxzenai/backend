@@ -88,6 +88,18 @@ class AlgorithmError(AutoMLException):
         )
 
 
+class ClusteringConfigurationError(AutoMLException):
+    """
+    Clustering request configuration is invalid.
+    """
+
+    def __init__(self, message: str) -> None:
+        super().__init__(
+            message,
+            code="CLUSTERING_CONFIGURATION_ERROR",
+        )
+
+
 class ModelNotFoundError(AutoMLException):
     """
     Requested model artifact was not found.

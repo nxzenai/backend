@@ -28,6 +28,11 @@ from uuid import uuid4
 import numpy as np
 import pandas as pd
 
+from app.modules.automl.algorithms.clustering import (
+    MAX_CLUSTERS,
+    MIN_CLUSTERS,
+    ClusteringConfig,
+)
 from app.modules.automl.constants import MODEL_ARTIFACT_VERSION
 from app.modules.automl.exceptions import (
     ModelArtifactError,
@@ -383,6 +388,7 @@ class AutoMLService:
         target_column: str | None = None,
         *,
         task: AutoMLTask | str | None = None,
+        clustering_config: ClusteringConfig | None = None,
     ) -> AutoMLResult:
 
         if dataframe is None:
@@ -409,6 +415,7 @@ class AutoMLService:
             dataframe=dataframe,
             target_column=target_column,
             task=task,
+            clustering_config=clustering_config,
         )
 
         if (
@@ -432,6 +439,7 @@ class AutoMLService:
         target_column: str | None = None,
         *,
         task: AutoMLTask | str | None = None,
+        clustering_config: ClusteringConfig | None = None,
     ) -> AutoMLResult:
 
         dataframe = self.load_dataset(
@@ -442,6 +450,7 @@ class AutoMLService:
             dataframe=dataframe,
             target_column=target_column,
             task=task,
+            clustering_config=clustering_config,
         )
 
     # ============================================================
@@ -725,6 +734,17 @@ class AutoMLService:
                     )
                 response["probabilities"] = probability_rows
 
+        if artifact.task == "clustering":
+            clustering_metadata = artifact.metadata.get(
+                "clustering",
+                {},
+            )
+            response["number_of_clusters"] = (
+                clustering_metadata.get(
+                    "effective_number_of_clusters"
+                )
+            )
+
         return _json_safe(response)
 
     # ============================================================
@@ -984,6 +1004,10 @@ class AutoMLService:
             "silhouette_score",
             "calinski_harabasz_score",
             "davies_bouldin_score",
+            "requested_number_of_clusters",
+            "effective_number_of_clusters",
+            "supports_custom_cluster_count",
+            "prediction_supported",
             "outlier_count",
             "outlier_ratio",
             "decision_score_mean",
@@ -1222,6 +1246,9 @@ class AutoMLService:
                 result.excluded_algorithms,
         }
 
+        if result.task == "clustering":
+            response["clustering"] = result.clustering
+
         return _json_safe(
             response
         )
@@ -1323,6 +1350,12 @@ class AutoMLService:
                     "classification_or_regression",
                 "without_target":
                     "clustering",
+            },
+            "clustering": {
+                "minimum_number_of_clusters": MIN_CLUSTERS,
+                "maximum_number_of_clusters": MAX_CLUSTERS,
+                "default_cluster_count_mode": "automatic",
+                "default_require_prediction_support": False,
             },
         }
 
