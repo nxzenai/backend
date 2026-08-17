@@ -40,6 +40,12 @@ from fastapi import (
 
 )
 
+from app.modules.automl.exceptions import (
+    ModelArtifactError,
+    ModelNotFoundError,
+    PreprocessingError,
+)
+from app.modules.automl.schemas import PredictionValuesRequest
 from app.modules.automl.service import (
 
     AutoMLService,
@@ -329,6 +335,46 @@ async def train_service(
     )
 
 
+async def save_training_artifact(
+    service: AutoMLService,
+    result,
+) -> str:
+
+    if (
+        result is None
+        or not result.success
+        or result.model_artifact is None
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                "Training did not produce a successful "
+                "best model artifact."
+            ),
+        )
+
+    try:
+        filepath = await asyncio.to_thread(
+            service.save_best_model_unique,
+            result,
+        )
+    except ModelArtifactError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=exc.message,
+        ) from exc
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=(
+                "Training completed, but the best model "
+                "artifact could not be saved."
+            ),
+        ) from exc
+
+    return filepath.name
+
+
 # ================================================================
 # TRAIN
 # ================================================================
@@ -378,8 +424,14 @@ async def train_dataset(
             normalized_task,
         )
 
+        model_filename = await save_training_artifact(
+            service,
+            result,
+        )
+
         return service.complete_response(
-            result
+            result,
+            model_filename=model_filename,
         )
 
     except HTTPException:
@@ -434,8 +486,14 @@ async def train_from_file(
             task=normalized_task,
         )
 
+        model_filename = await save_training_artifact(
+            service,
+            result,
+        )
+
         return service.complete_response(
-            result
+            result,
+            model_filename=model_filename,
         )
 
     except HTTPException:
@@ -630,7 +688,7 @@ async def predict(
             )
         )
 
-        model = service.load_model(
+        model = service.load_artifact(
             model_filename
         )
 
@@ -644,6 +702,7 @@ async def predict(
 
         return {
             "model": model_filename,
+            "model_filename": model_filename,
             "rows": len(dataframe),
             "predictions": predictions,
         }
@@ -651,13 +710,78 @@ async def predict(
     except HTTPException:
         raise
 
+    except ModelNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=exc.message,
+        ) from exc
+
+    except ModelArtifactError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=exc.message,
+        ) from exc
+
+    except (PreprocessingError, ValueError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(exc),
+        ) from exc
+
     except Exception as exc:
 
         raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Prediction could not be completed.",
+        ) from exc
 
-            status_code=status.HTTP_400_BAD_REQUEST,
 
+@router.post(
+    "/predict/values",
+    status_code=status.HTTP_200_OK,
+)
+async def predict_values(
+    request: PredictionValuesRequest,
+    service: AutoMLService = Depends(
+        get_automl_service,
+    ),
+):
+
+    try:
+        artifact = service.load_artifact(
+            request.model_filename
+        )
+        dataframe = pd.DataFrame(request.rows)
+        result = await asyncio.to_thread(
+            service.predict_artifact_values,
+            artifact,
+            dataframe,
+        )
+        result["model_filename"] = request.model_filename
+        return result
+
+    except ModelNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=exc.message,
+        ) from exc
+
+    except ModelArtifactError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=exc.message,
+        ) from exc
+
+    except (PreprocessingError, ValueError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=str(exc),
+        ) from exc
+
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Prediction could not be completed.",
         ) from exc
 
 
@@ -713,6 +837,12 @@ async def model_information(
             detail=str(exc),
         ) from exc
 
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(exc),
+        ) from exc
+
 
 # ================================================================
 # DELETE MODEL
@@ -730,9 +860,13 @@ async def delete_model(
     ),
 ):
 
-    deleted = service.delete_model(
-        filename
-    )
+    try:
+        deleted = service.delete_model(filename)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(exc),
+        ) from exc
 
     if not deleted:
 
