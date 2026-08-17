@@ -32,6 +32,7 @@ from app.modules.automl.constants import MODEL_ARTIFACT_VERSION
 from app.modules.automl.exceptions import (
     ModelArtifactError,
     ModelNotFoundError,
+    PredictionNotSupportedError,
 )
 from app.modules.automl.models import ModelArtifact
 from app.modules.automl.trainer import (
@@ -647,6 +648,33 @@ class AutoMLService:
 
         return artifact
 
+    @staticmethod
+    def prediction_capability(
+        artifact: ModelArtifact,
+    ) -> dict[str, Any]:
+
+        return {
+            "prediction_supported": artifact.prediction_supported,
+            "prediction_unavailable_reason": (
+                artifact.prediction_unavailable_reason
+            ),
+        }
+
+    def ensure_prediction_supported(
+        self,
+        artifact: ModelArtifact,
+    ) -> None:
+
+        if artifact.prediction_supported:
+            return
+
+        raise PredictionNotSupportedError(
+            artifact.prediction_unavailable_reason
+            or "This model does not support prediction for unseen rows.",
+            model_name=artifact.model_name,
+            task=artifact.task,
+        )
+
     def predict_artifact_values(
         self,
         artifact: ModelArtifact,
@@ -654,6 +682,7 @@ class AutoMLService:
     ) -> dict[str, Any]:
 
         artifact = self.validate_artifact(artifact)
+        self.ensure_prediction_supported(artifact)
         predictions = self.predict(artifact, dataframe)
 
         response: dict[str, Any] = {
@@ -834,6 +863,40 @@ class AutoMLService:
 
         stat = filepath.stat()
 
+        artifact_metadata: dict[str, Any] = {}
+        try:
+            saved_model = self.trainer.load_model(filepath)
+            if isinstance(saved_model, ModelArtifact):
+                artifact_metadata = {
+                    "model_name": saved_model.model_name,
+                    "task": saved_model.task,
+                    "artifact_version": saved_model.artifact_version,
+                    **self.prediction_capability(saved_model),
+                }
+            else:
+                supported = callable(
+                    getattr(saved_model, "predict", None)
+                )
+                artifact_metadata = {
+                    "prediction_supported": supported,
+                    "prediction_unavailable_reason": (
+                        None
+                        if supported
+                        else (
+                            "Prediction capability is unavailable for "
+                            "this legacy saved model."
+                        )
+                    ),
+                }
+        except Exception:
+            artifact_metadata = {
+                "prediction_supported": False,
+                "prediction_unavailable_reason": (
+                    "Prediction capability could not be determined "
+                    "for this saved model."
+                ),
+            }
+
         return _json_safe(
             {
                 "filename": filepath.name,
@@ -841,6 +904,7 @@ class AutoMLService:
                 "size_bytes": stat.st_size,
                 "created_at": stat.st_ctime,
                 "modified_at": stat.st_mtime,
+                **artifact_metadata,
             }
         )
 
@@ -1090,6 +1154,17 @@ class AutoMLService:
                 "AutoML result cannot be None."
             )
 
+        artifact_capability = (
+            self.prediction_capability(result.model_artifact)
+            if result.model_artifact is not None
+            else {
+                "prediction_supported": False,
+                "prediction_unavailable_reason": (
+                    "No saved model artifact is available."
+                ),
+            }
+        )
+
         response = {
             "task": result.task,
 
@@ -1137,6 +1212,7 @@ class AutoMLService:
                     else None
                 ),
                 "model_filename": model_filename,
+                **artifact_capability,
             },
 
             "skipped_algorithms":

@@ -43,6 +43,7 @@ from fastapi import (
 from app.modules.automl.exceptions import (
     ModelArtifactError,
     ModelNotFoundError,
+    PredictionNotSupportedError,
     PreprocessingError,
 )
 from app.modules.automl.schemas import PredictionValuesRequest
@@ -751,6 +752,7 @@ async def predict_values(
         artifact = service.load_artifact(
             request.model_filename
         )
+        service.ensure_prediction_supported(artifact)
         dataframe = pd.DataFrame(request.rows)
         result = await asyncio.to_thread(
             service.predict_artifact_values,
@@ -770,6 +772,12 @@ async def predict_values(
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=exc.message,
+        ) from exc
+
+    except PredictionNotSupportedError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=exc.to_dict(),
         ) from exc
 
     except (PreprocessingError, ValueError) as exc:

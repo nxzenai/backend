@@ -436,6 +436,44 @@ class ModelArtifact:
 
     max_prediction_rows: int = 100_000
 
+    @property
+    def prediction_supported(self) -> bool:
+        """
+        Whether the fitted artifact can process unseen input rows.
+
+        This is deliberately derived from the loaded estimator instead
+        of persisted so version 3.0 artifacts remain compatible.
+        """
+
+        if callable(getattr(self.model, "predict", None)):
+            return True
+
+        return (
+            self.task == "dimensionality"
+            and callable(getattr(self.model, "transform", None))
+        )
+
+    @property
+    def prediction_unavailable_reason(self) -> str | None:
+        if self.prediction_supported:
+            return None
+
+        display_names = {
+            "dbscan": "DBSCAN",
+            "agglomerative": "Agglomerative Clustering",
+            "agglomerative_clustering": "Agglomerative Clustering",
+            "spectral": "Spectral Clustering",
+            "spectral_clustering": "Spectral Clustering",
+        }
+        display_name = display_names.get(
+            self.model_name.strip().lower(),
+            self.model_name.replace("_", " ").strip().title(),
+        )
+        return (
+            f"{display_name} does not support prediction "
+            "for unseen rows."
+        )
+
 
 # ======================================================================
 # AUTOML RESULT
