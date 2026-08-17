@@ -70,9 +70,11 @@ from app.modules.automl.algorithms.regression import (
 )
 
 from app.modules.automl.algorithms.clustering import (
+    ClusteringConfig,
     clustering_leaderboard,
     train_clustering_models,
     best_clustering_model,
+    resolve_clustering_config,
 )
 
 from app.modules.automl.algorithms.anomaly import (
@@ -623,6 +625,39 @@ class AutoMLTrainer:
                 except Exception:
                     classes = None
 
+        metadata = {
+            "trainer": self.__class__.__name__,
+            "random_state": self.config.random_state,
+            "task": task.value,
+            "n_rows": processed.n_rows,
+            "n_features_before": (
+                processed.n_features_before
+            ),
+            "n_features_after": (
+                processed.n_features_after
+            ),
+            "sparse_output": (
+                processed.sparse_output
+            ),
+        }
+
+        if task == AutoMLTask.CLUSTERING:
+            metadata["clustering"] = {
+                "requested_number_of_clusters": getattr(
+                    result,
+                    "requested_number_of_clusters",
+                    None,
+                ),
+                "effective_number_of_clusters": getattr(
+                    result,
+                    "effective_number_of_clusters",
+                    None,
+                ),
+                "prediction_supported": callable(
+                    getattr(model, "predict", None)
+                ),
+            }
+
         return ModelArtifact(
             model=model,
             preprocessor=processed.preprocessor,
@@ -633,21 +668,7 @@ class AutoMLTrainer:
             ),
             model_name=result.model_name,
             classes=classes,
-            metadata={
-                "trainer": self.__class__.__name__,
-                "random_state": self.config.random_state,
-                "task": task.value,
-                "n_rows": processed.n_rows,
-                "n_features_before": (
-                    processed.n_features_before
-                ),
-                "n_features_after": (
-                    processed.n_features_after
-                ),
-                "sparse_output": (
-                    processed.sparse_output
-                ),
-            },
+            metadata=metadata,
             original_feature_names=list(
                 processed.original_feature_names
             ),
@@ -681,6 +702,7 @@ class AutoMLTrainer:
         training_results: list[Any],
         best_model: Any,
         leaderboard: list[dict[str, Any]],
+        clustering: dict[str, Any] | None = None,
     ) -> AutoMLResult:
 
         artifact = self._build_model_artifact(
@@ -735,6 +757,7 @@ class AutoMLTrainer:
                     )
                 )
             ),
+            clustering=clustering,
         )
 
 
@@ -844,6 +867,8 @@ class AutoMLTrainer:
         self,
         dataframe: pd.DataFrame,
         target_column: str | None = None,
+        *,
+        clustering_config: ClusteringConfig | None = None,
     ) -> AutoMLResult:
 
         task, summary, processed = (
@@ -852,6 +877,11 @@ class AutoMLTrainer:
                 target_column,
                 task=AutoMLTask.CLUSTERING,
             )
+        )
+
+        effective_config, _ = resolve_clustering_config(
+            processed.X_train.shape[0],
+            clustering_config,
         )
 
         results = train_clustering_models(
@@ -863,6 +893,7 @@ class AutoMLTrainer:
             timeout_seconds=(
                 self.config.timeout_seconds
             ),
+            clustering_config=effective_config,
         )
 
         best = best_clustering_model(
@@ -873,6 +904,27 @@ class AutoMLTrainer:
             results
         )
 
+        clustering = {
+            "cluster_count_mode": effective_config.cluster_count_mode,
+            "requested_number_of_clusters": (
+                effective_config.number_of_clusters
+                if effective_config.cluster_count_mode == "custom"
+                else None
+            ),
+            "effective_number_of_clusters": getattr(
+                best,
+                "effective_number_of_clusters",
+                None,
+            ),
+            "require_prediction_support": bool(
+                effective_config.require_prediction_support
+            ),
+            "prediction_supported": bool(
+                best is not None
+                and callable(getattr(best.model, "predict", None))
+            ),
+        }
+
         return self._make_result(
             task=task,
             summary=summary,
@@ -880,6 +932,7 @@ class AutoMLTrainer:
             training_results=results,
             best_model=best,
             leaderboard=board,
+            clustering=clustering,
         )
 
     # ============================================================
@@ -984,6 +1037,7 @@ class AutoMLTrainer:
         target_column: str | None = None,
         *,
         task: AutoMLTask | str | None = None,
+        clustering_config: ClusteringConfig | None = None,
     ) -> AutoMLResult:
 
         normalized_target = _normalize_target(
@@ -1040,6 +1094,7 @@ class AutoMLTrainer:
             return self.train_clustering(
                 dataframe,
                 normalized_target,
+                clustering_config=clustering_config,
             )
 
         if (
