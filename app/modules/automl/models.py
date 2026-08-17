@@ -233,6 +233,14 @@ class ClusteringResult(
 
     noise_ratio: float | None = None
 
+    requested_number_of_clusters: int | None = None
+
+    effective_number_of_clusters: int | None = None
+
+    supports_custom_cluster_count: bool = False
+
+    prediction_supported: bool = False
+
 
 # ======================================================================
 # ANOMALY RESULT
@@ -519,6 +527,8 @@ class AutoMLResult:
     timeout_seconds: int = 30
 
     ranking_metric: str | None = None
+
+    clustering: dict[str, Any] | None = None
 
     @property
     def successful_results(
