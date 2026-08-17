@@ -8,6 +8,7 @@ from app.lifespan import lifespan
 
 from app.api.v1 import api_router
 from app.modules.system.api.router import router as system_router
+from app.modules.genai.router import router as genai_router  # <-- ADDED THIS
 
 from app.shared.responses import APIResponse
 
@@ -29,7 +30,7 @@ app = FastAPI(
 # ---------------------------------------------------------
 
 origins = [
-    #"http://localhost:3001",
+    "http://localhost:3001",  # <-- UNCOMMENTED THIS SO YOU CAN TEST LOCALLY
     #"http://127.0.0.1:8001",
     "https://www.nxzenai.com",
     #"https://coral-app-8t2db.ondigitalocean.app"
@@ -60,6 +61,7 @@ register_exception_handlers(app)
 
 app.include_router(api_router)
 app.include_router(system_router)
+app.include_router(genai_router, prefix="/api/v1")  # <-- ADDED THIS TO FIX THE 404
 
 
 logger.info("NxZenAI Studio Backend Initialised")

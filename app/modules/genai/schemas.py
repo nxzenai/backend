@@ -21,8 +21,20 @@ class ChatRequest(BaseModel):
     system_prompt: Optional[str] = None
     temperature: float = Field(default=0.7, ge=0.0, le=2.0)
 
+class MetricsData(BaseModel):
+    """Enterprise metrics for GenAI responses"""
+    model_config = {"protected_namespaces": ()}
+    
+    prompt_tokens: int
+    completion_tokens: int
+    total_tokens: int
+    ttft_ms: float  # Time to first token
+    total_time_ms: float
+    tokens_per_second: float
+    cost_usd: float
+    mode_used: str  # "local" or "cloud"
+
 class ChatResponse(BaseModel):
-    # This line fixes the warning!
     model_config = {"protected_namespaces": ()}
     
     session_id: str
@@ -30,3 +42,4 @@ class ChatResponse(BaseModel):
     provider_used: AllowedProvider
     reply: str
     tool_calls: Optional[List[Dict[str, Any]]] = None
+    metrics: Optional[MetricsData] = None  # NEW: Added metrics!
