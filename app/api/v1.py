@@ -7,9 +7,7 @@ from app.modules.notebooks.router import (
 )
 from app.modules.execution.router import router as execution_router
 from app.modules.crm.router import router as crm_router
-from app.modules.datasets.router import (
-    router as dataset_router,
-)
+from app.modules.eda.router import router as eda_router
 from app.modules.sql.router import (
     router as sql_router,
 )
@@ -33,9 +31,7 @@ api_router.include_router(
 )
 
 api_router.include_router(execution_router)
-api_router.include_router(
-    dataset_router,
-)
+api_router.include_router(eda_router)
 api_router.include_router(
     sql_router
 )

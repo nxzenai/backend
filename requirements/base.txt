@@ -13,6 +13,8 @@ python-jose[cryptography]
 passlib[bcrypt]
 
 python-multipart
+openpyxl
+xlrd
 
 email-validator
 
