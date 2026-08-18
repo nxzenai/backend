@@ -8,6 +8,9 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends, Path, status
 
+from app.modules.auth.dependencies import get_current_user
+from app.modules.auth.models import UserModel
+from app.modules.execution.dependencies import get_execution_service
 from app.modules.execution.schemas import (
     ClearCellOutputResponse,
     ExecuteCellResponse,
@@ -16,14 +19,14 @@ from app.modules.execution.schemas import (
     RestartKernelResponse,
     ShutdownKernelResponse,
 )
-
 from app.modules.execution.service import ExecutionService
-from app.modules.execution.dependencies import get_execution_service
 
 router = APIRouter(
     prefix="/notebooks",
     tags=["Execution"],
 )
+
+
 @router.post(
     "/{notebook_id}/cells/{cell_id}/execute",
     response_model=ExecuteCellResponse,
@@ -33,6 +36,7 @@ router = APIRouter(
 async def execute_cell(
     notebook_id: str = Path(...),
     cell_id: str = Path(...),
+    current_user: UserModel = Depends(get_current_user),
     service: ExecutionService = Depends(get_execution_service),
 ):
     """
@@ -42,6 +46,7 @@ async def execute_cell(
     outputs, execution_count = await service.execute_cell(
         notebook_id=notebook_id,
         cell_id=cell_id,
+        current_user=current_user,
     )
 
     return ExecuteCellResponse(
@@ -50,6 +55,8 @@ async def execute_cell(
         execution_count=execution_count,
         outputs=outputs,
     )
+
+
 @router.post(
     "/{notebook_id}/cells/{cell_id}/clear",
     response_model=ClearCellOutputResponse,
@@ -59,6 +66,7 @@ async def execute_cell(
 async def clear_cell_output(
     notebook_id: str = Path(...),
     cell_id: str = Path(...),
+    current_user: UserModel = Depends(get_current_user),
     service: ExecutionService = Depends(get_execution_service),
 ):
     """
@@ -68,9 +76,12 @@ async def clear_cell_output(
     await service.clear_cell_output(
         notebook_id,
         cell_id,
+        current_user,
     )
 
     return ClearCellOutputResponse()
+
+
 @router.post(
     "/{notebook_id}/restart",
     response_model=RestartKernelResponse,
@@ -79,6 +90,7 @@ async def clear_cell_output(
 )
 async def restart_kernel(
     notebook_id: str = Path(...),
+    current_user: UserModel = Depends(get_current_user),
     service: ExecutionService = Depends(get_execution_service),
 ):
     """
@@ -87,9 +99,12 @@ async def restart_kernel(
 
     await service.restart_kernel(
         notebook_id,
+        current_user,
     )
 
     return RestartKernelResponse()
+
+
 @router.post(
     "/{notebook_id}/interrupt",
     response_model=InterruptKernelResponse,
@@ -98,6 +113,7 @@ async def restart_kernel(
 )
 async def interrupt_kernel(
     notebook_id: str = Path(...),
+    current_user: UserModel = Depends(get_current_user),
     service: ExecutionService = Depends(get_execution_service),
 ):
     """
@@ -106,9 +122,12 @@ async def interrupt_kernel(
 
     await service.interrupt_kernel(
         notebook_id,
+        current_user,
     )
 
     return InterruptKernelResponse()
+
+
 @router.post(
     "/{notebook_id}/shutdown",
     response_model=ShutdownKernelResponse,
@@ -117,6 +136,7 @@ async def interrupt_kernel(
 )
 async def shutdown_kernel(
     notebook_id: str = Path(...),
+    current_user: UserModel = Depends(get_current_user),
     service: ExecutionService = Depends(get_execution_service),
 ):
     """
@@ -125,9 +145,12 @@ async def shutdown_kernel(
 
     await service.shutdown_kernel(
         notebook_id,
+        current_user,
     )
 
     return ShutdownKernelResponse()
+
+
 @router.get(
     "/{notebook_id}/kernel/status",
     response_model=KernelStatusResponse,
@@ -136,6 +159,7 @@ async def shutdown_kernel(
 )
 async def kernel_status(
     notebook_id: str = Path(...),
+    current_user: UserModel = Depends(get_current_user),
     service: ExecutionService = Depends(get_execution_service),
 ):
     """
@@ -144,6 +168,7 @@ async def kernel_status(
 
     status_value = await service.kernel_status(
         notebook_id,
+        current_user,
     )
 
     return KernelStatusResponse(
