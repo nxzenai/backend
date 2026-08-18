@@ -1,22 +1,21 @@
 from datetime import UTC, datetime
 
 from app.modules.auth.models import UserModel
-
+from app.modules.notebooks.constants import (
+    SUPPORTED_CELL_TYPES,
+)
 from app.modules.notebooks.exceptions import (
     CellNotFound,
+    InvalidCellOrder,
     InvalidCellType,
     NotebookNotFound,
-    NotebookPermissionDenied,
     NotebookTitleRequired,
 )
-
 from app.modules.notebooks.models import (
     CellModel,
     NotebookModel,
 )
-
 from app.modules.notebooks.repository import NotebookRepository
-
 from app.modules.notebooks.schemas import (
     CreateCellRequest,
     CreateNotebookRequest,
@@ -24,16 +23,12 @@ from app.modules.notebooks.schemas import (
     UpdateCellRequest,
     UpdateNotebookRequest,
 )
-from app.modules.notebooks.constants import (
-    SUPPORTED_CELL_TYPES,
-)
 
 
 class NotebookService:
 
     def __init__(self, repository: NotebookRepository):
         self.repository = repository
-    
 
     # ---------------------------------------------------------
     # Create Notebook
@@ -74,9 +69,7 @@ class NotebookService:
         current_user: UserModel,
     ) -> list[NotebookModel]:
 
-        return await self.repository.list_notebooks(
-            current_user.id
-        )
+        return await self.repository.list_notebooks(current_user.id)
 
     # ---------------------------------------------------------
     # Get Notebook
@@ -88,15 +81,15 @@ class NotebookService:
         current_user: UserModel,
     ) -> NotebookModel:
 
-        notebook = await self.repository.get_notebook(
-            notebook_id
-        )
+        notebook = await self.repository.get_notebook(notebook_id)
 
         if notebook is None:
             raise NotebookNotFound()
 
         if notebook.owner_id != current_user.id:
-            raise NotebookPermissionDenied()
+            # Private notebooks must not be enumerable through differing 403
+            # and 404 responses.
+            raise NotebookNotFound()
 
         return notebook
 
@@ -134,9 +127,7 @@ class NotebookService:
 
         notebook.updated_at = datetime.now(UTC)
 
-        return await self.repository.update_notebook(
-            notebook
-        )
+        return await self.repository.update_notebook(notebook)
 
     # ---------------------------------------------------------
     # Delete Notebook
@@ -153,10 +144,9 @@ class NotebookService:
             current_user,
         )
 
-        return await self.repository.delete_notebook(
-            notebook.id
-        )
-# ---------------------------------------------------------
+        return await self.repository.delete_notebook(notebook.id)
+
+    # ---------------------------------------------------------
     # Add Cell
     # ---------------------------------------------------------
 
@@ -185,6 +175,7 @@ class NotebookService:
         )
 
         return cell
+
     # ---------------------------------------------------------
     # List Cells
     # ---------------------------------------------------------
@@ -200,9 +191,8 @@ class NotebookService:
             current_user=current_user,
         )
 
-        return await self.repository.list_cells(
-            notebook
-        )
+        return await self.repository.list_cells(notebook)
+
     # ---------------------------------------------------------
     # Get Cell
     # ---------------------------------------------------------
@@ -228,6 +218,7 @@ class NotebookService:
             raise CellNotFound()
 
         return cell
+
     # ---------------------------------------------------------
     # Update Cell
     # ---------------------------------------------------------
@@ -263,6 +254,7 @@ class NotebookService:
             notebook,
             cell,
         )
+
     # ---------------------------------------------------------
     # Delete Cell
     # ---------------------------------------------------------
@@ -288,6 +280,7 @@ class NotebookService:
             raise CellNotFound()
 
         return True
+
     # ---------------------------------------------------------
     # Reorder Cells
     # ---------------------------------------------------------
@@ -304,10 +297,28 @@ class NotebookService:
             current_user=current_user,
         )
 
-        positions = {
-            item.cell_id: item.position
-            for item in request.cells
-        }
+        active_cells = await self.repository.list_cells(notebook)
+        active_ids = {cell.id for cell in active_cells}
+        requested_ids = [item.cell_id for item in request.cells]
+        requested_positions = [item.position for item in request.cells]
+
+        if len(requested_ids) != len(set(requested_ids)):
+            raise InvalidCellOrder("Cell IDs must be unique.")
+
+        if set(requested_ids) != active_ids:
+            raise InvalidCellOrder(
+                "A complete order containing every active cell is required."
+            )
+
+        if len(requested_positions) != len(set(requested_positions)):
+            raise InvalidCellOrder("Cell positions must be unique.")
+
+        if set(requested_positions) != set(range(len(active_cells))):
+            raise InvalidCellOrder(
+                "Cell positions must be contiguous and start at zero."
+            )
+
+        positions = {item.cell_id: item.position for item in request.cells}
 
         return await self.repository.reorder_cells(
             notebook,

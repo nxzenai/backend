@@ -8,7 +8,6 @@ from motor.motor_asyncio import AsyncIOMotorDatabase
 from app.core.database import get_database
 from app.core.exceptions.custom import AIStudioException
 from app.core.security.jwt import decode_access_token
-
 from app.modules.auth.models import UserModel
 from app.modules.auth.repository import AuthRepository
 from app.modules.auth.service import AuthService
@@ -17,12 +16,13 @@ from app.modules.auth.service import AuthService
 # HTTP Bearer Security
 # --------------------------------------------------
 
-security = HTTPBearer(auto_error=True)
+security = HTTPBearer(auto_error=False)
 
 
 # --------------------------------------------------
 # Auth Service Dependency
 # --------------------------------------------------
+
 
 def get_auth_service(
     db: AsyncIOMotorDatabase = Depends(get_database),
@@ -34,13 +34,21 @@ def get_auth_service(
 # Current Authenticated User
 # --------------------------------------------------
 
+
 async def get_current_user(
-    credentials: HTTPAuthorizationCredentials = Depends(security),
+    credentials: HTTPAuthorizationCredentials | None = Depends(security),
     db: AsyncIOMotorDatabase = Depends(get_database),
 ) -> UserModel:
     """
     Returns the currently authenticated user.
     """
+
+    if credentials is None:
+        raise AIStudioException(
+            message="Authentication required.",
+            status_code=401,
+            error_code="AUTHENTICATION_REQUIRED",
+        )
 
     token = credentials.credentials
 

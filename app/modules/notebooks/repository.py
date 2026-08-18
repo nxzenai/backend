@@ -69,9 +69,7 @@ class NotebookRepository:
 
         async for document in cursor:
             document["id"] = str(document.pop("_id"))
-            notebooks.append(
-                NotebookModel(**document)
-            )
+            notebooks.append(NotebookModel(**document))
 
         return notebooks
 
@@ -155,13 +153,7 @@ class NotebookRepository:
             outputs=[],
             execution_count=0 if cell_type == "code" else None,
             metadata={},
-            position=len(
-                [
-                    c
-                    for c in notebook.cells
-                    if not c.is_deleted
-                ]
-            ),
+            position=len([c for c in notebook.cells if not c.is_deleted]),
             is_deleted=False,
             created_at=now,
             updated_at=now,
@@ -181,11 +173,7 @@ class NotebookRepository:
     ) -> list[CellModel]:
 
         return sorted(
-            [
-                cell
-                for cell in notebook.cells
-                if not cell.is_deleted
-            ],
+            [cell for cell in notebook.cells if not cell.is_deleted],
             key=lambda cell: cell.position,
         )
 
@@ -226,37 +214,19 @@ class NotebookRepository:
         cell_id: str,
     ) -> bool:
 
-        print("=" * 60)
-        print("Notebook ID:", notebook.id)
-        print("Delete Cell:", cell_id)
-        print("Total Cells:", len(notebook.cells))
-        print("=" * 60)
-
         deleted = False
 
         for cell in notebook.cells:
-            print(
-                f"id={cell.id}, "
-                f"deleted={cell.is_deleted}, "
-                f"position={cell.position}"
-            )
-
             if str(cell.id) == str(cell_id) and not cell.is_deleted:
-                print("✅ MATCH FOUND")
                 cell.is_deleted = True
                 deleted = True
                 break
 
         if not deleted:
-            print("❌ NO MATCH FOUND")
             return False
 
         active_cells = sorted(
-            (
-                cell
-                for cell in notebook.cells
-                if not cell.is_deleted
-            ),
+            (cell for cell in notebook.cells if not cell.is_deleted),
             key=lambda c: c.position,
         )
 
@@ -266,8 +236,6 @@ class NotebookRepository:
         notebook.updated_at = datetime.now(UTC)
 
         await self.update_notebook(notebook)
-
-        print("✅ Cell deleted successfully")
 
         return True
 
@@ -280,26 +248,17 @@ class NotebookRepository:
         now = datetime.now(UTC)
 
         for cell in notebook.cells:
-            if (
-                not cell.is_deleted
-                and cell.id in positions
-            ):
+            if not cell.is_deleted and cell.id in positions:
                 cell.position = positions[cell.id]
                 cell.updated_at = now
 
-        notebook.cells.sort(
-            key=lambda cell: cell.position
-        )
+        notebook.cells.sort(key=lambda cell: cell.position)
 
         notebook.updated_at = now
 
         await self.update_notebook(notebook)
 
         return sorted(
-            (
-                cell
-                for cell in notebook.cells
-                if not cell.is_deleted
-            ),
+            (cell for cell in notebook.cells if not cell.is_deleted),
             key=lambda cell: cell.position,
         )

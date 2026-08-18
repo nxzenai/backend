@@ -19,22 +19,9 @@ from app.modules.execution.constants import (
     WorkerStatus,
 )
 
-
 # ============================================================================
 # Execution Output
 # ============================================================================
-
-
-class ExecutionOutput(BaseModel):
-    """
-    Represents a single execution output.
-    """
-
-    output_type: str
-
-    content: Any
-
-    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 # ============================================================================
@@ -55,13 +42,9 @@ class ExecutionResult(BaseModel):
 
     execution_time_ms: float = 0.0
 
-    started_at: datetime = Field(
-        default_factory=lambda: datetime.now(UTC)
-    )
+    started_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
-    finished_at: datetime = Field(
-        default_factory=lambda: datetime.now(UTC)
-    )
+    finished_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
 
 # ============================================================================
@@ -84,13 +67,9 @@ class Kernel(BaseModel):
 
     status: KernelStatus = KernelStatus.IDLE
 
-    created_at: datetime = Field(
-        default_factory=lambda: datetime.now(UTC)
-    )
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
-    last_activity: datetime = Field(
-        default_factory=lambda: datetime.now(UTC)
-    )
+    last_activity: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
     execution_counter: int = 0
 
@@ -120,13 +99,10 @@ class NotebookSession(BaseModel):
 
     active: bool = True
 
-    created_at: datetime = Field(
-        default_factory=lambda: datetime.now(UTC)
-    )
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
-    last_activity: datetime = Field(
-        default_factory=lambda: datetime.now(UTC)
-    )
+    last_activity: datetime = Field(default_factory=lambda: datetime.now(UTC))
+
 
 # ============================================================================
 # Execution Environment
@@ -150,9 +126,8 @@ class ExecutionEnvironment(BaseModel):
 
     timeout_seconds: int = 30
 
-    installed_packages: dict[str, str] = Field(
-        default_factory=dict
-    )
+    installed_packages: dict[str, str] = Field(default_factory=dict)
+
 
 # ============================================================================
 # Execution Worker
@@ -176,13 +151,9 @@ class ExecutionWorker(BaseModel):
 
     gpu_enabled: bool = False
 
-    created_at: datetime = Field(
-        default_factory=lambda: datetime.now(UTC)
-    )
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
-    last_heartbeat: datetime = Field(
-        default_factory=lambda: datetime.now(UTC)
-    )
+    last_heartbeat: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
 
 # ============================================================================
@@ -238,13 +209,12 @@ class ExecutionJob(BaseModel):
 
     status: JobStatus = JobStatus.QUEUED
 
-    queued_at: datetime = Field(
-        default_factory=lambda: datetime.now(UTC)
-    )
+    queued_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
     started_at: datetime | None = None
 
     completed_at: datetime | None = None
+
 
 # ============================================================================
 # Runtime Statistics
@@ -264,6 +234,7 @@ class RuntimeStatistics(BaseModel):
 
     total_executions: int = 0
 
+
 class ExecutionOutputType(str, Enum):
 
     STREAM = "stream"
@@ -279,6 +250,7 @@ class ExecutionOutputType(str, Enum):
     CLEAR_OUTPUT = "clear_output"
 
     EXECUTE_INPUT = "execute_input"
+
 
 class ExecutionOutput(BaseModel):
 
