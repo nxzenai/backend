@@ -16,35 +16,32 @@ It only manages kernel lifecycle.
 """
 
 from __future__ import annotations
+
+import asyncio
 import queue
 import time
-import asyncio
 from datetime import UTC, datetime
 from typing import Any
 
 from jupyter_client import KernelManager as JupyterKernelManager
-
+from jupyter_client.blocking.client import BlockingKernelClient
 
 from app.modules.execution.constants import (
     KERNEL_EXECUTION_TIMEOUT,
     KernelStatus,
 )
-
 from app.modules.execution.exceptions import (
     ExecutionFailed,
     ExecutionTimeout,
     KernelAlreadyRunning,
     KernelNotFound,
 )
-
 from app.modules.execution.models import (
     ExecutionOutput,
     ExecutionOutputType,
     Kernel,
 )
 
-
-from jupyter_client.blocking.client import BlockingKernelClient
 
 class KernelManager:
     """
@@ -70,6 +67,7 @@ class KernelManager:
         self._clients: dict[str, Any] = {}
 
         self._locks: dict[str, asyncio.Lock] = {}
+
     def _get_lock(
         self,
         notebook_id: str,
@@ -80,6 +78,7 @@ class KernelManager:
             self._locks[notebook_id] = asyncio.Lock()
 
         return self._locks[notebook_id]
+
     async def start_kernel(
         self,
         notebook_id: str,
@@ -93,18 +92,15 @@ class KernelManager:
 
             km = JupyterKernelManager()
 
-            km.start_kernel()
+            await asyncio.to_thread(km.start_kernel)
 
             kc = km.client()
 
-            kc.start_channels()
-
-            kc.wait_for_ready(timeout=30)
+            await asyncio.to_thread(kc.start_channels)
+            await asyncio.to_thread(kc.wait_for_ready, timeout=30)
 
             kernel = Kernel(
-
                 notebook_id=notebook_id,
-
                 status=KernelStatus.IDLE,
             )
 
@@ -117,6 +113,7 @@ class KernelManager:
             self._clients[notebook_id] = kc
 
             return kernel
+
     def get_kernel(
         self,
         notebook_id: str,
@@ -129,6 +126,7 @@ class KernelManager:
             raise KernelNotFound()
 
         return kernel
+
     def get_client(
         self,
         notebook_id: str,
@@ -141,6 +139,7 @@ class KernelManager:
             raise KernelNotFound()
 
         return client
+
     def get_manager(
         self,
         notebook_id: str,
@@ -153,6 +152,7 @@ class KernelManager:
             raise KernelNotFound()
 
         return manager
+
     async def shutdown_kernel(
         self,
         notebook_id: str,
@@ -166,13 +166,13 @@ class KernelManager:
 
             try:
 
-                client.stop_channels()
+                await asyncio.to_thread(client.stop_channels)
 
             except Exception:
 
                 pass
 
-            manager.shutdown_kernel(now=True)
+            await asyncio.to_thread(manager.shutdown_kernel, now=True)
 
             self._kernels.pop(notebook_id, None)
 
@@ -181,6 +181,7 @@ class KernelManager:
             self._managers.pop(notebook_id, None)
 
             self._locks.pop(notebook_id, None)
+
     async def restart_kernel(
         self,
         notebook_id: str,
@@ -189,12 +190,14 @@ class KernelManager:
         await self.shutdown_kernel(notebook_id)
 
         return await self.start_kernel(notebook_id)
+
     def kernel_exists(
         self,
         notebook_id: str,
     ) -> bool:
 
         return notebook_id in self._kernels
+
     def update_activity(
         self,
         notebook_id: str,
@@ -203,6 +206,7 @@ class KernelManager:
         kernel = self.get_kernel(notebook_id)
 
         kernel.last_activity = datetime.now(UTC)
+
     def get_status(
         self,
         notebook_id: str,
@@ -223,9 +227,7 @@ class KernelManager:
 
             kernel = self.get_kernel(notebook_id)
 
-            client: BlockingKernelClient = self.get_client(
-                notebook_id
-            )
+            client: BlockingKernelClient = self.get_client(notebook_id)
 
             kernel.status = KernelStatus.BUSY
 
@@ -237,21 +239,10 @@ class KernelManager:
 
             try:
 
-                msg_id = client.execute(
+                outputs = await asyncio.to_thread(
+                    self._execute_blocking,
+                    client,
                     source,
-                    allow_stdin=False,
-                    stop_on_error=True,
-                )
-
-                self._wait_for_shell_reply(
-                    client,
-                    msg_id,
-                    timeout,
-                )
-
-                outputs = self._collect_iopub_messages(
-                    client,
-                    msg_id,
                     timeout,
                 )
 
@@ -265,6 +256,21 @@ class KernelManager:
                 kernel.status = KernelStatus.IDLE
 
                 self.update_activity(notebook_id)
+
+    def _execute_blocking(
+        self,
+        client: BlockingKernelClient,
+        source: str,
+        timeout: int,
+    ) -> list[ExecutionOutput]:
+        msg_id = client.execute(
+            source,
+            allow_stdin=False,
+            stop_on_error=True,
+        )
+        self._wait_for_shell_reply(client, msg_id, timeout)
+        return self._collect_iopub_messages(client, msg_id, timeout)
+
     def _wait_for_shell_reply(
         self,
         client: BlockingKernelClient,
@@ -287,14 +293,7 @@ class KernelManager:
 
             msg_type = message["msg_type"]
 
-            
-
             if msg_type == "execute_reply":
-
-                print("=" * 80)
-                print("FULL SHELL MESSAGE")
-                print(message)
-                print("=" * 80)
 
                 # Don't raise here.
                 # Let _collect_iopub_messages() gather the actual Python traceback.
@@ -313,9 +312,7 @@ class KernelManager:
 
         while True:
 
-            remaining = timeout - (
-                time.monotonic() - start
-            )
+            remaining = timeout - (time.monotonic() - start)
 
             if remaining <= 0:
                 raise ExecutionTimeout()
@@ -335,13 +332,6 @@ class KernelManager:
             content = message["content"]
 
             if msg_type == "execute_result":
-                print("\n" + "=" * 100)
-                print("EXECUTE RESULT")
-                print(content)
-                print("=" * 100 + "\n")
-
-
-
                 outputs.append(
                     ExecutionOutput(
                         output_type=ExecutionOutputType.EXECUTE_RESULT,
@@ -353,12 +343,7 @@ class KernelManager:
                 )
                 continue
 
-
             if msg_type == "stream":
-                print("\n" + "=" * 100)
-                print("STREAM")
-                print(content)
-                print("=" * 100 + "\n")
                 outputs.append(
                     ExecutionOutput(
                         output_type=ExecutionOutputType.STREAM,
@@ -368,10 +353,6 @@ class KernelManager:
                 continue
 
             if msg_type == "display_data":
-                print("\n" + "=" * 100)
-                print("DISPLAY DATA")
-                print(content)
-                print("=" * 100 + "\n")
                 outputs.append(
                     ExecutionOutput(
                         output_type=ExecutionOutputType.DISPLAY_DATA,
@@ -399,17 +380,14 @@ class KernelManager:
         notebook_id: str,
     ) -> None:
 
-        async with self._get_lock(notebook_id):
+        # Interrupt must not wait for the execution lock: that lock is held by
+        # the active execution until the kernel becomes idle.
+        manager = self.get_manager(notebook_id)
+        await asyncio.to_thread(manager.interrupt_kernel)
 
-            manager = self.get_manager(notebook_id)
-
-            manager.interrupt_kernel()
-
-            kernel = self.get_kernel(notebook_id)
-
-            kernel.status = KernelStatus.IDLE
-
-            self.update_activity(notebook_id)
+        kernel = self.get_kernel(notebook_id)
+        kernel.status = KernelStatus.IDLE
+        self.update_activity(notebook_id)
 
     def heartbeat(
         self,
@@ -439,15 +417,11 @@ class KernelManager:
 
             kernel = self._kernels[notebook_id]
 
-            idle_time = (
-                now - kernel.last_activity
-            ).total_seconds()
+            idle_time = (now - kernel.last_activity).total_seconds()
 
             if idle_time > idle_timeout_seconds:
 
-                await self.shutdown_kernel(
-                    notebook_id
-                )
+                await self.shutdown_kernel(notebook_id)
 
     async def shutdown_all(self) -> None:
 
@@ -457,9 +431,7 @@ class KernelManager:
 
             try:
 
-                await self.shutdown_kernel(
-                    notebook_id
-                )
+                await self.shutdown_kernel(notebook_id)
 
             except Exception:
                 pass
@@ -468,9 +440,7 @@ class KernelManager:
         self,
     ) -> list[Kernel]:
 
-        return list(
-            self._kernels.values()
-        )
+        return list(self._kernels.values())
 
     def statistics(self) -> dict:
 
@@ -489,4 +459,3 @@ class KernelManager:
             "busy": busy,
             "idle": idle,
         }
-

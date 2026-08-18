@@ -1,6 +1,4 @@
 import os
-import sys
-from types import ModuleType
 
 os.environ["DEBUG"] = "false"
 
@@ -8,20 +6,8 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from app.core.exceptions.handlers import register_exception_handlers
+from app.modules.auth.dependencies import get_current_user
 from app.modules.auth.models import UserModel
-
-# Route tests do not need password hashing; isolate the auth dependency so a
-# minimal test environment does not need to import the optional bcrypt backend.
-auth_dependencies = ModuleType("app.modules.auth.dependencies")
-
-
-async def get_current_user():
-    return user()
-
-
-auth_dependencies.get_current_user = get_current_user
-sys.modules["app.modules.auth.dependencies"] = auth_dependencies
-
 from app.modules.eda.dependencies import get_eda_service
 from app.modules.eda.exceptions import (
     EDAProjectNotFound,
