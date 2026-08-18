@@ -1,10 +1,12 @@
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 
 from app.core.exceptions.custom import AIStudioException
 from app.core.logging.logger import logger
 from app.shared.responses import ErrorResponse
+
 
 def register_exception_handlers(app: FastAPI):
 
@@ -14,16 +16,20 @@ def register_exception_handlers(app: FastAPI):
         exc: AIStudioException,
     ):
 
-        logger.error(exc.message)
+        logger.warning(
+            "Handled application error code={} path={}",
+            exc.error_code,
+            request.url.path,
+        )
 
         return JSONResponse(
-    status_code=exc.status_code,
-    content=ErrorResponse(
-        message=exc.message,
-        error_code=exc.error_code,
-        details=exc.details,
-    ).model_dump(),
-)
+            status_code=exc.status_code,
+            content=ErrorResponse(
+                message=exc.message,
+                error_code=exc.error_code,
+                details=exc.details,
+            ).model_dump(),
+        )
 
     @app.exception_handler(RequestValidationError)
     async def validation_exception_handler(
@@ -31,7 +37,11 @@ def register_exception_handlers(app: FastAPI):
         exc: RequestValidationError,
     ):
 
-        logger.error(exc.errors())
+        logger.warning(
+            "Request validation failed count={} path={}",
+            len(exc.errors()),
+            request.url.path,
+        )
 
         return JSONResponse(
             status_code=422,
@@ -39,7 +49,7 @@ def register_exception_handlers(app: FastAPI):
                 "success": False,
                 "message": "Validation Error",
                 "error_code": "VALIDATION_ERROR",
-                "details": exc.errors(),
+                "details": jsonable_encoder(exc.errors()),
             },
         )
 
@@ -49,12 +59,16 @@ def register_exception_handlers(app: FastAPI):
         exc: Exception,
     ):
 
-        logger.exception(exc)
+        logger.error(
+            "Unhandled application exception type={} path={}",
+            type(exc).__name__,
+            request.url.path,
+        )
 
         return JSONResponse(
-    status_code=500,
-    content=ErrorResponse(
-        message="Internal Server Error",
-        error_code="INTERNAL_SERVER_ERROR",
-    ).model_dump(),
-)
+            status_code=500,
+            content=ErrorResponse(
+                message="Internal Server Error",
+                error_code="INTERNAL_SERVER_ERROR",
+            ).model_dump(),
+        )

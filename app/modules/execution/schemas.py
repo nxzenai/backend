@@ -11,9 +11,19 @@ class ExecuteCellResponse(BaseModel):
     outputs: list[ExecutionOutput]
 
 
+class ExecuteAllResponse(BaseModel):
+    notebook_id: str
+    results: list[ExecuteCellResponse]
+
+
 class ClearCellOutputResponse(BaseModel):
     success: bool = True
     message: str = "Cell outputs cleared successfully."
+
+
+class ClearAllOutputsResponse(BaseModel):
+    success: bool = True
+    message: str = "Notebook outputs cleared successfully."
 
 
 class RestartKernelResponse(BaseModel):

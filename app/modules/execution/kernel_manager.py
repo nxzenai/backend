@@ -348,6 +348,7 @@ class KernelManager:
                     ExecutionOutput(
                         output_type=ExecutionOutputType.STREAM,
                         content=content.get("text", ""),
+                        metadata={"name": content.get("name", "stdout")},
                     )
                 )
                 continue

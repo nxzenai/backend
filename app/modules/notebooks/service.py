@@ -116,7 +116,7 @@ class NotebookService:
 
             notebook.title = request.title.strip()
 
-        if request.description is not None:
+        if "description" in request.model_fields_set:
             notebook.description = request.description
 
         if request.visibility is not None:

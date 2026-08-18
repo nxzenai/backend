@@ -12,7 +12,9 @@ from app.modules.auth.dependencies import get_current_user
 from app.modules.auth.models import UserModel
 from app.modules.execution.dependencies import get_execution_service
 from app.modules.execution.schemas import (
+    ClearAllOutputsResponse,
     ClearCellOutputResponse,
+    ExecuteAllResponse,
     ExecuteCellResponse,
     InterruptKernelResponse,
     KernelStatusResponse,
@@ -58,6 +60,32 @@ async def execute_cell(
 
 
 @router.post(
+    "/{notebook_id}/execute-all",
+    response_model=ExecuteAllResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Execute all notebook code cells",
+)
+async def execute_all(
+    notebook_id: str = Path(...),
+    current_user: UserModel = Depends(get_current_user),
+    service: ExecutionService = Depends(get_execution_service),
+):
+    results = await service.execute_all(notebook_id, current_user)
+    return ExecuteAllResponse(
+        notebook_id=notebook_id,
+        results=[
+            ExecuteCellResponse(
+                notebook_id=notebook_id,
+                cell_id=cell_id,
+                outputs=outputs,
+                execution_count=execution_count,
+            )
+            for cell_id, outputs, execution_count in results
+        ],
+    )
+
+
+@router.post(
     "/{notebook_id}/cells/{cell_id}/clear",
     response_model=ClearCellOutputResponse,
     status_code=status.HTTP_200_OK,
@@ -80,6 +108,21 @@ async def clear_cell_output(
     )
 
     return ClearCellOutputResponse()
+
+
+@router.post(
+    "/{notebook_id}/outputs/clear",
+    response_model=ClearAllOutputsResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Clear all notebook outputs",
+)
+async def clear_all_outputs(
+    notebook_id: str = Path(...),
+    current_user: UserModel = Depends(get_current_user),
+    service: ExecutionService = Depends(get_execution_service),
+):
+    await service.clear_all_outputs(notebook_id, current_user)
+    return ClearAllOutputsResponse()
 
 
 @router.post(

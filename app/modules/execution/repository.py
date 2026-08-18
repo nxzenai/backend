@@ -117,3 +117,17 @@ class ExecutionRepository:
             raise CellNotFound()
 
         await self.notebook_repository.update_notebook(notebook)
+
+    async def clear_all_outputs(
+        self,
+        notebook_id: str,
+        current_user: UserModel,
+    ) -> None:
+        notebook = await self.get_notebook(notebook_id, current_user)
+
+        for cell in notebook.cells:
+            if not cell.is_deleted:
+                cell.outputs = []
+                cell.execution_count = None
+
+        await self.notebook_repository.update_notebook(notebook)

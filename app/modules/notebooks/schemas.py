@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.modules.notebooks.constants import (
     MAX_CELL_SOURCE_LENGTH,
@@ -13,7 +13,11 @@ Visibility = Literal["private", "public"]
 CellType = Literal["markdown", "code"]
 
 
-class CreateNotebookRequest(BaseModel):
+class RequestModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
+class CreateNotebookRequest(RequestModel):
     title: str = Field(min_length=1, max_length=MAX_NOTEBOOK_TITLE)
     description: str | None = Field(default=None, max_length=MAX_NOTEBOOK_DESCRIPTION)
     visibility: Visibility = "private"
@@ -37,7 +41,7 @@ class CreateNotebookRequest(BaseModel):
         return normalized
 
 
-class UpdateNotebookRequest(BaseModel):
+class UpdateNotebookRequest(RequestModel):
     title: str | None = Field(default=None, min_length=1, max_length=MAX_NOTEBOOK_TITLE)
     description: str | None = Field(default=None, max_length=MAX_NOTEBOOK_DESCRIPTION)
     visibility: Visibility | None = None
@@ -75,12 +79,12 @@ class NotebookResponse(BaseModel):
     updated_at: datetime
 
 
-class CreateCellRequest(BaseModel):
+class CreateCellRequest(RequestModel):
     cell_type: CellType
     source: str = Field(default="", max_length=MAX_CELL_SOURCE_LENGTH)
 
 
-class UpdateCellRequest(BaseModel):
+class UpdateCellRequest(RequestModel):
     source: str | None = Field(default=None, max_length=MAX_CELL_SOURCE_LENGTH)
     metadata: dict[str, Any] | None = None
 
@@ -97,10 +101,10 @@ class CellResponse(BaseModel):
     updated_at: datetime
 
 
-class CellPosition(BaseModel):
+class CellPosition(RequestModel):
     cell_id: str = Field(min_length=1)
     position: int = Field(ge=0)
 
 
-class ReorderCellsRequest(BaseModel):
+class ReorderCellsRequest(RequestModel):
     cells: list[CellPosition]

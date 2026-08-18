@@ -153,6 +153,36 @@ class ExecutionService:
             current_user,
         )
 
+    async def execute_all(
+        self,
+        notebook_id: str,
+        current_user: UserModel,
+    ) -> list[tuple[str, list[ExecutionOutput], int]]:
+        notebook = await self.repository.get_notebook(notebook_id, current_user)
+        results = []
+
+        for cell in sorted(
+            (cell for cell in notebook.cells if not cell.is_deleted),
+            key=lambda cell: cell.position,
+        ):
+            if cell.cell_type != "code":
+                continue
+            outputs, execution_count = await self.execute_cell(
+                notebook_id,
+                cell.id,
+                current_user,
+            )
+            results.append((cell.id, outputs, execution_count))
+
+        return results
+
+    async def clear_all_outputs(
+        self,
+        notebook_id: str,
+        current_user: UserModel,
+    ) -> None:
+        await self.repository.clear_all_outputs(notebook_id, current_user)
+
     async def restart_kernel(
         self,
         notebook_id: str,

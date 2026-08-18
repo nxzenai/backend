@@ -1,16 +1,13 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from app.api.v1 import api_router
 from app.core.config.settings import settings
 from app.core.exceptions.handlers import register_exception_handlers
 from app.core.logging.logger import logger
 from app.lifespan import lifespan
-
-from app.api.v1 import api_router
 from app.modules.system.api.router import router as system_router
-
 from app.shared.responses import APIResponse
-
 
 # ---------------------------------------------------------
 # FastAPI Application
@@ -28,19 +25,9 @@ app = FastAPI(
 # CORS Configuration
 # ---------------------------------------------------------
 
-origins = [
-    #"http://localhost:3001",
-    #"http://127.0.0.1:8001",
-    "https://www.nxzenai.com",
-    "https://coral-app-8t2db.ondigitalocean.app"
-    
-    
-
-]
-
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
+    allow_origins=settings.allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -69,6 +56,7 @@ logger.info("NxZenAI Studio Backend Initialised")
 # Root Endpoint
 # ---------------------------------------------------------
 
+
 @app.get("/", response_model=APIResponse)
 async def root():
     logger.info("Root endpoint accessed")
@@ -88,6 +76,7 @@ async def root():
 # ---------------------------------------------------------
 # Health Check
 # ---------------------------------------------------------
+
 
 @app.get("/health", response_model=APIResponse)
 async def health():
