@@ -30,6 +30,7 @@ class NotebookTitleRequired(AIStudioException):
             error_code="NOTEBOOK_TITLE_REQUIRED",
         )
 
+
 class CellNotFound(AIStudioException):
 
     def __init__(self):
@@ -50,6 +51,8 @@ class InvalidCellType(AIStudioException):
             status_code=400,
             error_code="INVALID_CELL_TYPE",
         )
+
+
 class InvalidNotebookId(AIStudioException):
 
     def __init__(self):
@@ -58,4 +61,13 @@ class InvalidNotebookId(AIStudioException):
             message="Invalid notebook id.",
             status_code=400,
             error_code="INVALID_NOTEBOOK_ID",
+        )
+
+
+class InvalidCellOrder(AIStudioException):
+    def __init__(self, message: str):
+        super().__init__(
+            message=message,
+            status_code=400,
+            error_code="INVALID_CELL_ORDER",
         )

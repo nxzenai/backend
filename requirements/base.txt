@@ -29,3 +29,9 @@ docker
 httpx
 
 loguru
+
+# Development-only host execution currently depends on a local Jupyter kernel.
+# Production must replace this with the isolated runtime provider described in
+# docs/python-lab-architecture.md.
+jupyter_client>=8.6.0
+ipykernel>=6.29.0
