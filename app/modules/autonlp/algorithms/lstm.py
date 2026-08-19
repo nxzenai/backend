@@ -11,6 +11,7 @@ import time
 import numpy as np
 import torch
 import torch.nn as nn
+
 from sklearn.metrics import (
     accuracy_score,
     classification_report,
@@ -18,7 +19,9 @@ from sklearn.metrics import (
     precision_recall_fscore_support,
 )
 
-from app.modules.autonlp.algorithms.base import NLPModelResult
+from app.modules.autonlp.algorithms.base import (
+    NLPModelResult,
+)
 
 
 ##########################################################
@@ -57,7 +60,9 @@ class LSTMTextClassifier(nn.Module):
         x: torch.Tensor,
     ) -> torch.Tensor:
 
-        embedded = self.embedding(x)
+        embedded = self.embedding(
+            x
+        )
 
         output, _ = self.lstm(
             embedded
@@ -122,6 +127,10 @@ def train_lstm_model(
 
     start_time = time.time()
 
+    # -------------------------------------------------
+    # Validate Data
+    # -------------------------------------------------
+
     if len(X_train) == 0:
         raise ValueError(
             "Training dataset is empty."
@@ -141,6 +150,7 @@ def train_lstm_model(
         raise ValueError(
             "Test labels are empty."
         )
+
 
     # -------------------------------------------------
     # Configuration
@@ -183,12 +193,26 @@ def train_lstm_model(
         )
     )
 
+    max_sequence_length = int(
+        config.get(
+            "max_sequence_length",
+            128,
+        )
+    )
+
+
     # -------------------------------------------------
     # Reproducibility
     # -------------------------------------------------
 
-    torch.manual_seed(42)
-    np.random.seed(42)
+    torch.manual_seed(
+        42
+    )
+
+    np.random.seed(
+        42
+    )
+
 
     # -------------------------------------------------
     # Device
@@ -200,6 +224,7 @@ def train_lstm_model(
         else "cpu"
     )
 
+
     # -------------------------------------------------
     # Tensors
     # -------------------------------------------------
@@ -207,22 +232,31 @@ def train_lstm_model(
     X_train_tensor = torch.tensor(
         X_train,
         dtype=torch.long,
-    ).to(device)
+    ).to(
+        device
+    )
 
     y_train_tensor = torch.tensor(
         y_train,
         dtype=torch.long,
-    ).to(device)
+    ).to(
+        device
+    )
 
     X_test_tensor = torch.tensor(
         X_test,
         dtype=torch.long,
-    ).to(device)
+    ).to(
+        device
+    )
 
     y_test_tensor = torch.tensor(
         y_test,
         dtype=torch.long,
-    ).to(device)
+    ).to(
+        device
+    )
+
 
     # -------------------------------------------------
     # Dimensions
@@ -237,7 +271,9 @@ def train_lstm_model(
         ),
     )
 
-    vocab_size = max_token + 1
+    vocab_size = (
+        max_token + 1
+    )
 
     max_class = max(
         int(
@@ -248,7 +284,10 @@ def train_lstm_model(
         ),
     )
 
-    num_classes = max_class + 1
+    num_classes = (
+        max_class + 1
+    )
+
 
     # -------------------------------------------------
     # Model
@@ -259,41 +298,57 @@ def train_lstm_model(
         num_classes=num_classes,
         embedding_dim=embedding_dim,
         hidden_dim=hidden_dim,
-    ).to(device)
+    ).to(
+        device
+    )
 
-    criterion = nn.CrossEntropyLoss()
+    criterion = (
+        nn.CrossEntropyLoss()
+    )
 
     optimizer = torch.optim.Adam(
         model.parameters(),
         lr=learning_rate,
     )
 
+
     # -------------------------------------------------
     # History
     # -------------------------------------------------
 
     train_loss_history: list[float] = []
+
     validation_loss_history: list[float] = []
 
     train_accuracy_history: list[float] = []
+
     validation_accuracy_history: list[float] = []
+
 
     # -------------------------------------------------
     # Early Stopping State
     # -------------------------------------------------
 
-    best_validation_loss = float("inf")
+    best_validation_loss = float(
+        "inf"
+    )
+
     best_model_state = None
+
     best_epoch = 0
 
     epochs_without_improvement = 0
+
     early_stopped = False
+
 
     # -------------------------------------------------
     # Training Loop
     # -------------------------------------------------
 
-    for epoch in range(epochs):
+    for epoch in range(
+        epochs
+    ):
 
         model.train()
 
@@ -319,6 +374,7 @@ def train_lstm_model(
             )
         )
 
+
         # ---------------------------------------------
         # Validation
         # ---------------------------------------------
@@ -343,9 +399,15 @@ def train_lstm_model(
                 )
             )
 
+
         current_validation_loss = float(
             validation_loss.item()
         )
+
+
+        # ---------------------------------------------
+        # History
+        # ---------------------------------------------
 
         train_loss_history.append(
             round(
@@ -381,6 +443,7 @@ def train_lstm_model(
             )
         )
 
+
         # ---------------------------------------------
         # Best Model + Early Stopping
         # ---------------------------------------------
@@ -394,10 +457,14 @@ def train_lstm_model(
                 current_validation_loss
             )
 
-            best_epoch = epoch + 1
+            best_epoch = (
+                epoch + 1
+            )
 
             best_model_state = {
-                key: value.detach().cpu().clone()
+                key:
+                    value.detach().cpu().clone()
+
                 for key, value
                 in model.state_dict().items()
             }
@@ -415,6 +482,7 @@ def train_lstm_model(
                 early_stopped = True
                 break
 
+
     # -------------------------------------------------
     # Restore Best Model
     # -------------------------------------------------
@@ -425,11 +493,15 @@ def train_lstm_model(
             best_model_state
         )
 
-        model.to(device)
+        model.to(
+            device
+        )
+
 
     epochs_trained = len(
         train_loss_history
     )
+
 
     # -------------------------------------------------
     # Final Evaluation
@@ -458,6 +530,7 @@ def train_lstm_model(
             dim=1,
         )
 
+
     predictions = (
         prediction_tensor
         .cpu()
@@ -478,6 +551,7 @@ def train_lstm_model(
         .numpy()
     )
 
+
     # -------------------------------------------------
     # Overall Metrics
     # -------------------------------------------------
@@ -496,12 +570,15 @@ def train_lstm_model(
         )
     )
 
+
     # -------------------------------------------------
     # Confusion Matrix
     # -------------------------------------------------
 
     class_ids = list(
-        range(num_classes)
+        range(
+            num_classes
+        )
     )
 
     confusion = confusion_matrix(
@@ -509,6 +586,7 @@ def train_lstm_model(
         predictions,
         labels=class_ids,
     ).tolist()
+
 
     # -------------------------------------------------
     # Per-Class Metrics
@@ -527,55 +605,70 @@ def train_lstm_model(
     for class_id in class_ids:
 
         class_data = report.get(
-            str(class_id),
+            str(
+                class_id
+            ),
             {},
         )
 
         class_metrics.append(
             {
-                "class_id": class_id,
-                "precision": round(
-                    float(
+                "class_id":
+                    class_id,
+
+                "precision":
+                    round(
+                        float(
+                            class_data.get(
+                                "precision",
+                                0.0,
+                            )
+                        ),
+                        4,
+                    ),
+
+                "recall":
+                    round(
+                        float(
+                            class_data.get(
+                                "recall",
+                                0.0,
+                            )
+                        ),
+                        4,
+                    ),
+
+                "f1_score":
+                    round(
+                        float(
+                            class_data.get(
+                                "f1-score",
+                                0.0,
+                            )
+                        ),
+                        4,
+                    ),
+
+                "support":
+                    int(
                         class_data.get(
-                            "precision",
-                            0.0,
+                            "support",
+                            0,
                         )
                     ),
-                    4,
-                ),
-                "recall": round(
-                    float(
-                        class_data.get(
-                            "recall",
-                            0.0,
-                        )
-                    ),
-                    4,
-                ),
-                "f1_score": round(
-                    float(
-                        class_data.get(
-                            "f1-score",
-                            0.0,
-                        )
-                    ),
-                    4,
-                ),
-                "support": int(
-                    class_data.get(
-                        "support",
-                        0,
-                    )
-                ),
             }
         )
+
 
     # -------------------------------------------------
     # Human-Friendly Assessment
     # -------------------------------------------------
 
     if f1_score >= 0.90:
-        confidence_level = "Excellent"
+
+        confidence_level = (
+            "Excellent"
+        )
 
         summary = (
             "The LSTM model performs very strongly "
@@ -583,7 +676,10 @@ def train_lstm_model(
         )
 
     elif f1_score >= 0.80:
-        confidence_level = "Good"
+
+        confidence_level = (
+            "Good"
+        )
 
         summary = (
             "The LSTM model performs well overall "
@@ -591,7 +687,10 @@ def train_lstm_model(
         )
 
     elif f1_score >= 0.65:
-        confidence_level = "Moderate"
+
+        confidence_level = (
+            "Moderate"
+        )
 
         summary = (
             "The LSTM model learned useful patterns, "
@@ -600,7 +699,10 @@ def train_lstm_model(
         )
 
     else:
-        confidence_level = "Needs Improvement"
+
+        confidence_level = (
+            "Needs Improvement"
+        )
 
         summary = (
             "The LSTM model has limited performance "
@@ -608,55 +710,147 @@ def train_lstm_model(
             "or tuning."
         )
 
+
+    # -------------------------------------------------
+    # Artifact State
+    # -------------------------------------------------
+
+    artifact_state = {
+        key:
+            value.detach().cpu().clone()
+
+        for key, value
+        in model.state_dict().items()
+    }
+
+
     # -------------------------------------------------
     # Return
     # -------------------------------------------------
 
     return NLPModelResult(
-        model_name="LSTM",
-        success=True,
-        training_time=round(
-            time.time() - start_time,
-            4,
-        ),
-        accuracy=round(
-            float(accuracy),
-            4,
-        ),
-        precision=round(
-            float(precision),
-            4,
-        ),
-        recall=round(
-            float(recall),
-            4,
-        ),
-        f1_score=round(
-            float(f1_score),
-            4,
-        ),
-        final_loss=round(
-            float(final_loss),
-            4,
-        ),
-        confidence_level=confidence_level,
-        summary=summary,
 
-        epochs_requested=epochs,
-        epochs_trained=epochs_trained,
-        best_epoch=best_epoch,
-        early_stopped=early_stopped,
+        model_name=
+            "LSTM",
 
-        train_loss_history=train_loss_history,
-        validation_loss_history=validation_loss_history,
-        train_accuracy_history=train_accuracy_history,
-        validation_accuracy_history=validation_accuracy_history,
+        success=
+            True,
 
-        predictions=predictions,
-        probabilities=probabilities,
+        training_time=
+            round(
+                time.time()
+                - start_time,
+                4,
+            ),
 
-        confusion_matrix=confusion,
-        class_metrics=class_metrics,
+        accuracy=
+            round(
+                float(
+                    accuracy
+                ),
+                4,
+            ),
+
+        precision=
+            round(
+                float(
+                    precision
+                ),
+                4,
+            ),
+
+        recall=
+            round(
+                float(
+                    recall
+                ),
+                4,
+            ),
+
+        f1_score=
+            round(
+                float(
+                    f1_score
+                ),
+                4,
+            ),
+
+        final_loss=
+            round(
+                float(
+                    final_loss
+                ),
+                4,
+            ),
+
+        confidence_level=
+            confidence_level,
+
+        summary=
+            summary,
+
+        epochs_requested=
+            epochs,
+
+        epochs_trained=
+            epochs_trained,
+
+        best_epoch=
+            best_epoch,
+
+        early_stopped=
+            early_stopped,
+
+        train_loss_history=
+            train_loss_history,
+
+        validation_loss_history=
+            validation_loss_history,
+
+        train_accuracy_history=
+            train_accuracy_history,
+
+        validation_accuracy_history=
+            validation_accuracy_history,
+
+        predictions=
+            predictions,
+
+        probabilities=
+            probabilities,
+
+        confusion_matrix=
+            confusion,
+
+        class_metrics=
+            class_metrics,
+
+        # ---------------------------------------------
+        # Artifact Support
+        # ---------------------------------------------
+
+        model_state_dict=
+            artifact_state,
+
+        model_config={
+            "vocab_size":
+                vocab_size,
+
+            "num_classes":
+                num_classes,
+
+            "embedding_dim":
+                embedding_dim,
+
+            "hidden_dim":
+                hidden_dim,
+
+            "max_sequence_length":
+                max_sequence_length,
+
+            "padding_idx":
+                0,
+        },
     )
 
 

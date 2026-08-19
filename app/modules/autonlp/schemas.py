@@ -9,7 +9,11 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+)
 
 from app.modules.autonlp.constants import (
     JobStatus,
@@ -23,11 +27,22 @@ from app.modules.autonlp.constants import (
 ##########################################################
 
 class AutoNLPJobCreateRequest(BaseModel):
+    """
+    AutoNLP job configuration.
+
+    Architecture is intentionally not exposed to the user.
+    NxZen AutoNLP currently trains LSTM only.
+    """
+
     dataset_id: str = Field(...)
+
     text_column: str = Field(...)
-    target_column: str | None = Field(default=None)
+
+    target_column: str | None = Field(
+        default=None
+    )
+
     task: NLPTask = Field(...)
-    architecture: NLPArchitecture = Field(...)
 
     max_epochs: int = Field(
         default=30,
@@ -41,8 +56,11 @@ class AutoNLPJobCreateRequest(BaseModel):
 ##########################################################
 
 class AutoNLPDatasetSummary(BaseModel):
+
     total_samples: int | None = None
+
     training_samples: int | None = None
+
     test_samples: int | None = None
 
     vocab_size: int | None = None
@@ -61,6 +79,7 @@ class AutoNLPDatasetSummary(BaseModel):
 ##########################################################
 
 class AutoNLPTrainingHistory(BaseModel):
+
     train_loss: list[float] = Field(
         default_factory=list
     )
@@ -83,8 +102,11 @@ class AutoNLPTrainingHistory(BaseModel):
 ##########################################################
 
 class AutoNLPTrainingInfo(BaseModel):
+
     epochs_requested: int | None = None
+
     epochs_trained: int | None = None
+
     best_epoch: int | None = None
 
     early_stopped: bool = False
@@ -97,18 +119,23 @@ class AutoNLPTrainingInfo(BaseModel):
 ##########################################################
 
 class AutoNLPMetrics(BaseModel):
+
     architecture: str | None = None
 
     input_tokens: int | None = None
 
     accuracy: float | None = None
+
     precision: float | None = None
+
     recall: float | None = None
+
     f1_score: float | None = None
 
     final_loss: float | None = None
 
     confidence_level: str | None = None
+
     summary: str | None = None
 
 
@@ -117,14 +144,15 @@ class AutoNLPMetrics(BaseModel):
 ##########################################################
 
 class AutoNLPClassMetric(BaseModel):
+
     class_id: int
 
-    # Human-readable class name:
-    # negative / neutral / positive etc.
     label: str | None = None
 
     precision: float
+
     recall: float
+
     f1_score: float
 
     support: int
@@ -135,7 +163,7 @@ class AutoNLPClassMetric(BaseModel):
 ##########################################################
 
 class AutoNLPEvaluation(BaseModel):
-    # Order used by confusion matrix rows/columns.
+
     labels: list[str] = Field(
         default_factory=list
     )
@@ -144,7 +172,77 @@ class AutoNLPEvaluation(BaseModel):
         default_factory=list
     )
 
-    class_metrics: list[AutoNLPClassMetric] = Field(
+    class_metrics: list[
+        AutoNLPClassMetric
+    ] = Field(
+        default_factory=list
+    )
+
+
+##########################################################
+# Model Artifact
+##########################################################
+
+class AutoNLPArtifactInfo(BaseModel):
+
+    model_config = ConfigDict(
+        protected_namespaces=()
+    )
+
+    artifact_id: str | None = None
+
+    model_name: str = "LSTM"
+
+    status: str = "ready"
+
+    artifact_path: str | None = None
+
+
+##########################################################
+# Prediction Request
+##########################################################
+
+class AutoNLPPredictRequest(BaseModel):
+
+    text: str = Field(
+        ...,
+        min_length=1,
+        max_length=10000,
+    )
+
+
+##########################################################
+# Prediction Probability
+##########################################################
+
+class AutoNLPClassProbability(BaseModel):
+
+    label: str
+
+    probability: float
+
+
+##########################################################
+# Prediction Response
+##########################################################
+
+class AutoNLPPredictResponse(BaseModel):
+
+    model_config = ConfigDict(
+        protected_namespaces=()
+    )
+
+    job_id: str
+
+    model_name: str = "LSTM"
+
+    predicted_label: str
+
+    confidence: float
+
+    probabilities: list[
+        AutoNLPClassProbability
+    ] = Field(
         default_factory=list
     )
 
@@ -154,23 +252,40 @@ class AutoNLPEvaluation(BaseModel):
 ##########################################################
 
 class AutoNLPJobResponse(BaseModel):
+
     job_id: str
 
     status: JobStatus
+
     task: NLPTask
-    architecture: NLPArchitecture
+
+    architecture: NLPArchitecture = (
+        NLPArchitecture.LSTM
+    )
 
     best_model_id: str | None = None
 
     metrics: AutoNLPMetrics | None = None
 
-    dataset_summary: AutoNLPDatasetSummary | None = None
+    dataset_summary: (
+        AutoNLPDatasetSummary | None
+    ) = None
 
-    training_info: AutoNLPTrainingInfo | None = None
+    training_info: (
+        AutoNLPTrainingInfo | None
+    ) = None
 
-    training_history: AutoNLPTrainingHistory | None = None
+    training_history: (
+        AutoNLPTrainingHistory | None
+    ) = None
 
-    evaluation: AutoNLPEvaluation | None = None
+    evaluation: (
+        AutoNLPEvaluation | None
+    ) = None
+
+    artifact: (
+        AutoNLPArtifactInfo | None
+    ) = None
 
     created_at: datetime | None = None
 
@@ -180,8 +295,11 @@ class AutoNLPJobResponse(BaseModel):
 ##########################################################
 
 class AutoNLPResponse(BaseModel):
+
     success: bool = True
+
     message: str
+
     data: Any | None = None
 
 
@@ -197,6 +315,10 @@ __all__ = [
     "AutoNLPMetrics",
     "AutoNLPClassMetric",
     "AutoNLPEvaluation",
+    "AutoNLPArtifactInfo",
+    "AutoNLPPredictRequest",
+    "AutoNLPClassProbability",
+    "AutoNLPPredictResponse",
     "AutoNLPJobResponse",
     "AutoNLPResponse",
 ]

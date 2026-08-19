@@ -9,7 +9,7 @@ from sklearn.preprocessing import LabelEncoder
 
 @dataclass
 class NLPProcessingConfig:
-    max_sequence_length: int = 128
+    max_sequence_length: int = 32
     oov_token: str = "<OOV>"
     test_size: float = 0.20
     random_state: int = 42
