@@ -28,19 +28,9 @@ app = FastAPI(
 # CORS Configuration
 # ---------------------------------------------------------
 
-origins = [
-    #"http://localhost:3001",
-    #"http://127.0.0.1:8001",
-    "https://www.nxzenai.com",
-    "https://coral-app-8t2db.ondigitalocean.app"
-    
-    
-
-]
-
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
+    allow_origins=settings.cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
