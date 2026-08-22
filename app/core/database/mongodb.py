@@ -1,3 +1,5 @@
+import certifi
+
 from motor.motor_asyncio import (
     AsyncIOMotorClient,
     AsyncIOMotorDatabase,
@@ -22,6 +24,7 @@ class MongoDB:
 
         cls.client = AsyncIOMotorClient(
             settings.mongodb_uri,
+            tlsCAFile=certifi.where(),
             maxPoolSize=100,
             minPoolSize=5,
             serverSelectionTimeoutMS=5000,
