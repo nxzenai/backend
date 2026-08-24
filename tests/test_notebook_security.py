@@ -64,6 +64,12 @@ class RouteExecutionService:
     async def clear_cell_output(self, notebook_id, cell_id, current_user):
         return None
 
+    async def execute_all(self, notebook_id, current_user):
+        return []
+
+    async def clear_all_outputs(self, notebook_id, current_user):
+        return None
+
     async def restart_kernel(self, notebook_id, current_user):
         return None
 
@@ -75,6 +81,16 @@ class RouteExecutionService:
 
     async def kernel_status(self, notebook_id, current_user):
         return KernelStatus.STOPPED
+
+    async def runtime_info(self, notebook_id, current_user):
+        return {
+            "notebook_id": notebook_id,
+            "status": KernelStatus.STOPPED,
+            "python_version": "3.12",
+            "packages": [],
+            "gpu_available": False,
+            "gpu_details": None,
+        }
 
 
 def execution_app(authenticated: bool) -> FastAPI:
@@ -93,10 +109,13 @@ def execution_app(authenticated: bool) -> FastAPI:
     [
         ("post", "/api/v1/notebooks/notebook-a/cells/cell-a/execute"),
         ("post", "/api/v1/notebooks/notebook-a/cells/cell-a/clear"),
+        ("post", "/api/v1/notebooks/notebook-a/execute-all"),
+        ("post", "/api/v1/notebooks/notebook-a/outputs/clear"),
         ("post", "/api/v1/notebooks/notebook-a/restart"),
         ("post", "/api/v1/notebooks/notebook-a/interrupt"),
         ("post", "/api/v1/notebooks/notebook-a/shutdown"),
         ("get", "/api/v1/notebooks/notebook-a/kernel/status"),
+        ("get", "/api/v1/notebooks/notebook-a/runtime/info"),
     ],
 )
 def test_every_execution_endpoint_requires_authentication(method, path):

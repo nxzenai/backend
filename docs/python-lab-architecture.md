@@ -87,3 +87,19 @@ off the FastAPI event loop, protects the editor route, and renders sanitized HTM
 inside a script-disabled iframe. Runtime isolation, shared coordination, full
 `nbformat` import, revision-safe autosave, output limits, and project files remain
 future work and are not represented as production-ready.
+
+## Colab-style private-staging extension
+
+The notebook API now also supports notebook-scoped dataset files, validated
+Jupyter import/export, bounded persisted output, execution duration, live
+runtime package/hardware information, and small built-in examples. Each local
+kernel starts in its own generated notebook workspace. Uploaded files use
+server-generated storage names and are exposed to that kernel through an exact
+runtime-relative path such as `notebook-files/<generated-name>.csv`. Client
+filesystem paths are never resolved by the API.
+
+This does not change the trust boundary. Workspace directories are host
+directories and kernels remain host processes. Local development and private
+staging with trusted users are the only approved scopes. Public production
+remains blocked on the isolated runtime provider, quotas, network policy, and
+shared coordination described above.
