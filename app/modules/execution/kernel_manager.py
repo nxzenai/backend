@@ -18,9 +18,11 @@ It only manages kernel lifecycle.
 from __future__ import annotations
 
 import asyncio
+import json
 import queue
 import time
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 from jupyter_client import KernelManager as JupyterKernelManager
@@ -34,6 +36,7 @@ from app.modules.execution.exceptions import (
     ExecutionFailed,
     ExecutionTimeout,
     KernelAlreadyRunning,
+    HostExecutionDisabled,
     KernelNotFound,
 )
 from app.modules.execution.models import (
@@ -41,6 +44,7 @@ from app.modules.execution.models import (
     ExecutionOutputType,
     Kernel,
 )
+from app.core.config.settings import settings
 
 
 class KernelManager:
@@ -58,7 +62,16 @@ class KernelManager:
       Jupyter Kernel
     """
 
-    def __init__(self):
+    def __init__(
+        self,
+        workspace_root: str | None = None,
+        output_max_bytes: int | None = None,
+    ):
+
+        self.workspace_root = Path(
+            workspace_root or settings.notebook_workspace_root
+        ).resolve()
+        self.output_max_bytes = output_max_bytes or settings.notebook_output_max_bytes
 
         self._kernels: dict[str, Kernel] = {}
 
@@ -84,6 +97,9 @@ class KernelManager:
         notebook_id: str,
     ) -> Kernel:
 
+        if settings.environment.lower() == "production":
+            raise HostExecutionDisabled()
+
         async with self._get_lock(notebook_id):
 
             if notebook_id in self._kernels:
@@ -92,7 +108,11 @@ class KernelManager:
 
             km = JupyterKernelManager()
 
-            await asyncio.to_thread(km.start_kernel)
+            workspace = (self.workspace_root / notebook_id).resolve()
+            if workspace.parent != self.workspace_root:
+                raise ValueError("Invalid notebook workspace identifier.")
+            await asyncio.to_thread(workspace.mkdir, parents=True, exist_ok=True)
+            await asyncio.to_thread(km.start_kernel, cwd=str(workspace))
 
             kc = km.client()
 
@@ -307,6 +327,27 @@ class KernelManager:
     ) -> list[ExecutionOutput]:
 
         outputs: list[ExecutionOutput] = []
+        output_bytes = 0
+        truncated = False
+
+        def record(output: ExecutionOutput) -> None:
+            nonlocal output_bytes, truncated
+            size = len(
+                json.dumps(output.model_dump(mode="json"), default=str).encode("utf-8")
+            )
+            if not truncated and output_bytes + size <= self.output_max_bytes:
+                outputs.append(output)
+                output_bytes += size
+                return
+            if not truncated:
+                outputs.append(
+                    ExecutionOutput(
+                        output_type=ExecutionOutputType.STREAM,
+                        content="\n[Output truncated: configured notebook output limit reached.]",
+                        metadata={"name": "stderr", "truncated": True},
+                    )
+                )
+                truncated = True
 
         start = time.monotonic()
 
@@ -332,28 +373,27 @@ class KernelManager:
             content = message["content"]
 
             if msg_type == "execute_result":
-                outputs.append(
+                record(
                     ExecutionOutput(
                         output_type=ExecutionOutputType.EXECUTE_RESULT,
                         content=content,
-                        metadata={
-                            "name": content.get("name"),
-                        },
+                        metadata=content.get("metadata", {}),
                     )
                 )
                 continue
 
             if msg_type == "stream":
-                outputs.append(
+                record(
                     ExecutionOutput(
                         output_type=ExecutionOutputType.STREAM,
                         content=content.get("text", ""),
+                        metadata={"name": content.get("name", "stdout")},
                     )
                 )
                 continue
 
             if msg_type == "display_data":
-                outputs.append(
+                record(
                     ExecutionOutput(
                         output_type=ExecutionOutputType.DISPLAY_DATA,
                         content=content,
@@ -362,7 +402,7 @@ class KernelManager:
                 continue
 
             if msg_type == "error":
-                outputs.append(
+                record(
                     ExecutionOutput(
                         output_type=ExecutionOutputType.ERROR,
                         content=content,

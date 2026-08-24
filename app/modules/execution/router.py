@@ -12,11 +12,14 @@ from app.modules.auth.dependencies import get_current_user
 from app.modules.auth.models import UserModel
 from app.modules.execution.dependencies import get_execution_service
 from app.modules.execution.schemas import (
+    ClearAllOutputsResponse,
     ClearCellOutputResponse,
+    ExecuteAllResponse,
     ExecuteCellResponse,
     InterruptKernelResponse,
     KernelStatusResponse,
     RestartKernelResponse,
+    RuntimeInfoResponse,
     ShutdownKernelResponse,
 )
 from app.modules.execution.service import ExecutionService
@@ -54,7 +57,32 @@ async def execute_cell(
         cell_id=cell_id,
         execution_count=execution_count,
         outputs=outputs,
+        execution_duration_ms=(
+            await service.repository.get_cell(notebook_id, cell_id, current_user)
+        ).execution_duration_ms,
     )
+
+
+@router.post("/{notebook_id}/execute-all", response_model=ExecuteAllResponse)
+async def execute_all(
+    notebook_id: str,
+    current_user: UserModel = Depends(get_current_user),
+    service: ExecutionService = Depends(get_execution_service),
+):
+    results = await service.execute_all(notebook_id, current_user)
+    responses = []
+    for cell_id, outputs, count in results:
+        cell = await service.repository.get_cell(notebook_id, cell_id, current_user)
+        responses.append(
+            ExecuteCellResponse(
+                notebook_id=notebook_id,
+                cell_id=cell_id,
+                execution_count=count,
+                outputs=outputs,
+                execution_duration_ms=cell.execution_duration_ms,
+            )
+        )
+    return ExecuteAllResponse(notebook_id=notebook_id, results=responses)
 
 
 @router.post(
@@ -80,6 +108,16 @@ async def clear_cell_output(
     )
 
     return ClearCellOutputResponse()
+
+
+@router.post("/{notebook_id}/outputs/clear", response_model=ClearAllOutputsResponse)
+async def clear_all_outputs(
+    notebook_id: str,
+    current_user: UserModel = Depends(get_current_user),
+    service: ExecutionService = Depends(get_execution_service),
+):
+    await service.clear_all_outputs(notebook_id, current_user)
+    return ClearAllOutputsResponse()
 
 
 @router.post(
@@ -175,3 +213,16 @@ async def kernel_status(
         notebook_id=notebook_id,
         status=status_value,
     )
+
+
+@router.get("/{notebook_id}/runtime/info", response_model=RuntimeInfoResponse)
+async def runtime_info(
+    notebook_id: str,
+    current_user: UserModel = Depends(get_current_user),
+    service: ExecutionService = Depends(get_execution_service),
+):
+    return RuntimeInfoResponse(
+        **(await service.runtime_info(notebook_id, current_user))
+    )
+    ExecuteAllResponse,
+    RuntimeInfoResponse,

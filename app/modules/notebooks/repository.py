@@ -142,9 +142,20 @@ class NotebookRepository:
         notebook: NotebookModel,
         cell_type: str,
         source: str,
+        position: int | None = None,
     ) -> CellModel:
 
         now = datetime.now(UTC)
+
+        active_cells = sorted(
+            (existing for existing in notebook.cells if not existing.is_deleted),
+            key=lambda existing: existing.position,
+        )
+        insert_at = (
+            len(active_cells) if position is None else min(position, len(active_cells))
+        )
+        for existing in active_cells[insert_at:]:
+            existing.position += 1
 
         cell = CellModel(
             id=str(uuid4()),
@@ -153,13 +164,14 @@ class NotebookRepository:
             outputs=[],
             execution_count=0 if cell_type == "code" else None,
             metadata={},
-            position=len([c for c in notebook.cells if not c.is_deleted]),
+            position=insert_at,
             is_deleted=False,
             created_at=now,
             updated_at=now,
         )
 
         notebook.cells.append(cell)
+        notebook.cells.sort(key=lambda existing: existing.position)
 
         notebook.updated_at = now
 
