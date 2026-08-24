@@ -23,12 +23,40 @@ from app.modules.notebooks.schemas import (
     UpdateCellRequest,
     UpdateNotebookRequest,
 )
+from app.modules.notebooks.examples import EXAMPLE_NOTEBOOKS
+from app.modules.notebooks.exceptions import NotebookExampleNotFound
 
 
 class NotebookService:
 
     def __init__(self, repository: NotebookRepository):
         self.repository = repository
+
+    def list_examples(self) -> list[dict]:
+        return [
+            {
+                "slug": slug,
+                **{key: value for key, value in example.items() if key != "cells"},
+            }
+            for slug, example in EXAMPLE_NOTEBOOKS.items()
+        ]
+
+    async def create_example(self, slug: str, current_user: UserModel) -> NotebookModel:
+        example = EXAMPLE_NOTEBOOKS.get(slug)
+        if example is None:
+            raise NotebookExampleNotFound()
+        notebook = await self.create_notebook(
+            CreateNotebookRequest(
+                title=example["title"],
+                description=example["description"],
+                visibility="private",
+                tags=[example["category"].lower().replace(" ", "-")],
+            ),
+            current_user,
+        )
+        for cell_type, source in example["cells"]:
+            await self.repository.add_cell(notebook, cell_type, source)
+        return notebook
 
     # ---------------------------------------------------------
     # Create Notebook
@@ -116,7 +144,7 @@ class NotebookService:
 
             notebook.title = request.title.strip()
 
-        if request.description is not None:
+        if "description" in request.model_fields_set:
             notebook.description = request.description
 
         if request.visibility is not None:
@@ -172,6 +200,7 @@ class NotebookService:
             notebook=notebook,
             cell_type=request.cell_type,
             source=request.source,
+            position=request.position,
         )
 
         return cell

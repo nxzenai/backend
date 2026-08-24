@@ -268,3 +268,12 @@ class ExecutionPermissionDenied(ExecutionException):
             status_code=403,
             error_code="EXECUTION_PERMISSION_DENIED",
         )
+
+
+class HostExecutionDisabled(ExecutionException):
+    def __init__(self):
+        super().__init__(
+            message="Host notebook execution is disabled in production.",
+            status_code=503,
+            error_code="HOST_EXECUTION_DISABLED",
+        )

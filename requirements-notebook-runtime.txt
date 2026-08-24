@@ -1,0 +1,20 @@
+# Optional host/private-staging notebook runtime profile.
+# Install this in the notebook runtime environment, not every API process.
+# Python 3.14 currently has no supported TensorFlow or spaCy runtime in this profile.
+numpy>=1.26,<3
+pandas>=2.2,<3
+scipy>=1.12,<2
+matplotlib>=3.8,<4
+seaborn>=0.13,<1
+scikit-learn>=1.4,<2
+jupyter-client>=8.6,<9
+ipykernel>=6.29,<8
+ipython>=8.22,<10
+openpyxl>=3.1,<4
+torch>=2.2,<3
+tensorflow>=2.16,<3; python_version < "3.14"
+keras>=3,<4; python_version < "3.14"
+transformers>=4.40,<6
+datasets>=2.19,<5
+spacy>=3.7,<4; python_version < "3.14"
+nltk>=3.8,<4
