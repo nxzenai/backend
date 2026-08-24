@@ -65,6 +65,7 @@ class ExecutionRepository:
         outputs: list[ExecutionOutput],
         execution_count: int,
         current_user: UserModel,
+        execution_duration_ms: float | None = None,
     ) -> CellModel:
 
         notebook = await self.get_notebook(
@@ -79,6 +80,12 @@ class ExecutionRepository:
                 cell.outputs = outputs
 
                 cell.execution_count = execution_count
+                cell.execution_duration_ms = execution_duration_ms
+                cell.execution_state = (
+                    "failed"
+                    if any(output.output_type == "error" for output in outputs)
+                    else "succeeded"
+                )
 
                 break
 
@@ -117,3 +124,34 @@ class ExecutionRepository:
             raise CellNotFound()
 
         await self.notebook_repository.update_notebook(notebook)
+
+    async def clear_all_outputs(
+        self, notebook_id: str, current_user: UserModel
+    ) -> None:
+        notebook = await self.get_notebook(notebook_id, current_user)
+        for cell in notebook.cells:
+            if not cell.is_deleted:
+                cell.outputs = []
+                cell.execution_count = (
+                    None if cell.cell_type == "code" else cell.execution_count
+                )
+                cell.execution_duration_ms = None
+                cell.execution_state = "idle"
+        await self.notebook_repository.update_notebook(notebook)
+
+    async def mark_execution_state(
+        self,
+        notebook_id: str,
+        cell_id: str,
+        current_user: UserModel,
+        state: str,
+        duration_ms: float | None = None,
+    ) -> None:
+        notebook = await self.get_notebook(notebook_id, current_user)
+        for cell in notebook.cells:
+            if cell.id == cell_id and not cell.is_deleted:
+                cell.execution_state = state
+                cell.execution_duration_ms = duration_ms
+                await self.notebook_repository.update_notebook(notebook)
+                return
+        raise CellNotFound()

@@ -71,3 +71,43 @@ class InvalidCellOrder(AIStudioException):
             status_code=400,
             error_code="INVALID_CELL_ORDER",
         )
+
+
+class NotebookFileNotFound(AIStudioException):
+    def __init__(self):
+        super().__init__("Notebook file not found.", 404, "NOTEBOOK_FILE_NOT_FOUND")
+
+
+class InvalidNotebookFile(AIStudioException):
+    def __init__(self, message: str = "Invalid notebook file."):
+        super().__init__(message, 422, "INVALID_NOTEBOOK_FILE")
+
+
+class NotebookFileTooLarge(AIStudioException):
+    def __init__(self):
+        super().__init__(
+            "Notebook file exceeds the configured size limit.",
+            413,
+            "NOTEBOOK_FILE_TOO_LARGE",
+        )
+
+
+class InvalidNotebookImport(AIStudioException):
+    def __init__(self, message: str = "Invalid Jupyter notebook."):
+        super().__init__(message, 422, "INVALID_NOTEBOOK_IMPORT")
+
+
+class NotebookImportTooLarge(AIStudioException):
+    def __init__(self):
+        super().__init__(
+            "Jupyter notebook exceeds the configured size limit.",
+            413,
+            "NOTEBOOK_IMPORT_TOO_LARGE",
+        )
+
+
+class NotebookExampleNotFound(AIStudioException):
+    def __init__(self):
+        super().__init__(
+            "Notebook example not found.", 404, "NOTEBOOK_EXAMPLE_NOT_FOUND"
+        )

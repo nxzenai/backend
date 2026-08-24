@@ -13,11 +13,15 @@ Responsibilities:
 
 from __future__ import annotations
 
+import time
+import asyncio
+
 from app.modules.auth.models import UserModel
 from app.modules.execution.constants import KernelStatus
 from app.modules.execution.kernel_manager import KernelManager
 from app.modules.execution.models import ExecutionOutput
 from app.modules.execution.repository import ExecutionRepository
+from app.modules.execution.environment import detect_runtime_environment
 
 
 class ExecutionService:
@@ -103,10 +107,22 @@ class ExecutionService:
         # Execute code
         # -------------------------------
 
-        outputs, execution_count = await self.kernel_manager.execute(
-            notebook_id,
-            cell.source,
+        await self.repository.mark_execution_state(
+            notebook_id, cell_id, current_user, "running"
         )
+        started = time.perf_counter()
+        try:
+            outputs, execution_count = await self.kernel_manager.execute(
+                notebook_id,
+                cell.source,
+            )
+        except Exception:
+            duration_ms = (time.perf_counter() - started) * 1000
+            await self.repository.mark_execution_state(
+                notebook_id, cell_id, current_user, "failed", duration_ms
+            )
+            raise
+        duration_ms = (time.perf_counter() - started) * 1000
 
         # -------------------------------
         # Save outputs
@@ -118,12 +134,28 @@ class ExecutionService:
             outputs=outputs,
             execution_count=execution_count,
             current_user=current_user,
+            execution_duration_ms=duration_ms,
         )
 
         return (
             outputs,
             execution_count,
         )
+
+    async def execute_all(
+        self, notebook_id: str, current_user: UserModel
+    ) -> list[tuple[str, list[ExecutionOutput], int]]:
+        notebook = await self.repository.get_notebook(notebook_id, current_user)
+        results = []
+        for cell in sorted(
+            (item for item in notebook.cells if not item.is_deleted),
+            key=lambda item: item.position,
+        ):
+            if cell.cell_type != "code":
+                continue
+            outputs, count = await self.execute_cell(notebook_id, cell.id, current_user)
+            results.append((cell.id, outputs, count))
+        return results
 
     async def clear_cell_output(
         self,
@@ -152,6 +184,11 @@ class ExecutionService:
             cell_id,
             current_user,
         )
+
+    async def clear_all_outputs(
+        self, notebook_id: str, current_user: UserModel
+    ) -> None:
+        await self.repository.clear_all_outputs(notebook_id, current_user)
 
     async def restart_kernel(
         self,
@@ -228,3 +265,8 @@ class ExecutionService:
             return KernelStatus.STOPPED
 
         return self.kernel_manager.get_status(notebook_id)
+
+    async def runtime_info(self, notebook_id: str, current_user: UserModel) -> dict:
+        status = await self.kernel_status(notebook_id, current_user)
+        details = await asyncio.to_thread(detect_runtime_environment)
+        return {"notebook_id": notebook_id, "status": status, **details}

@@ -32,8 +32,8 @@ class Settings(BaseSettings):
     )
 
     debug: bool = Field(
-        default=True,
-        alias="DEBUG",
+        default=False,
+        alias="APP_DEBUG",
     )
 
     host: str = Field(
@@ -169,6 +169,24 @@ class Settings(BaseSettings):
     log_level: str = Field(
         default="INFO",
         alias="LOG_LEVEL",
+    )
+
+    # Notebook workspaces are development/private-staging host directories.
+    notebook_workspace_root: str = Field(
+        default="data/notebook-workspaces",
+        alias="NOTEBOOK_WORKSPACE_ROOT",
+    )
+    notebook_file_max_bytes: int = Field(
+        default=25 * 1024 * 1024,
+        alias="NOTEBOOK_FILE_MAX_BYTES",
+    )
+    notebook_import_max_bytes: int = Field(
+        default=10 * 1024 * 1024,
+        alias="NOTEBOOK_IMPORT_MAX_BYTES",
+    )
+    notebook_output_max_bytes: int = Field(
+        default=2 * 1024 * 1024,
+        alias="NOTEBOOK_OUTPUT_MAX_BYTES",
     )
 
 
