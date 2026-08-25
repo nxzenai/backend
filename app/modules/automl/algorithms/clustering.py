@@ -48,6 +48,7 @@ class ClusteringConfig:
     cluster_count_mode: str = AUTOMATIC_CLUSTER_COUNT
     number_of_clusters: int | None = None
     require_prediction_support: bool = False
+    include_identifier_features: bool = False
 
 
 @dataclass(frozen=True)
@@ -111,6 +112,9 @@ def resolve_clustering_config(
         number_of_clusters=requested.number_of_clusters,
         require_prediction_support=bool(
             requested.require_prediction_support
+        ),
+        include_identifier_features=bool(
+            requested.include_identifier_features
         ),
     )
 
