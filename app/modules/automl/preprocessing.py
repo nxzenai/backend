@@ -57,6 +57,7 @@ No fitting is performed during prediction.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -586,6 +587,40 @@ def detect_feature_types(
         "boolean": boolean_features,
         "datetime": datetime_features,
     }
+
+
+def detect_identifier_columns(
+    dataframe: pd.DataFrame,
+) -> list[str]:
+    """Detect columns that are likely row identifiers, not model signals."""
+
+    identifiers: list[str] = []
+    row_count = max(len(dataframe), 1)
+    for column in dataframe.columns:
+        name = str(column)
+        normalized = re.sub(r"[^a-z0-9]", "", name.lower())
+        exact_identifier = normalized in {
+            "id", "uuid", "guid", "index", "rowid", "rowindex",
+            "rownumber", "recordid",
+        }
+        explicit_suffix = (
+            name.endswith(("ID", "Id", "UUID", "Uuid", "GUID", "Guid"))
+            or bool(re.search(r"(?:^|[_\-\s])(id|uuid|guid)$", name.lower()))
+        )
+        high_cardinality_name = (
+            normalized.endswith("id")
+            or normalized.endswith("uuid")
+            or normalized.endswith("guid")
+            or normalized.startswith("unnamed")
+        )
+        if not (exact_identifier or explicit_suffix or high_cardinality_name):
+            continue
+
+        unique_ratio = dataframe[column].nunique(dropna=True) / row_count
+        if exact_identifier or explicit_suffix or unique_ratio >= 0.8:
+            identifiers.append(name)
+
+    return identifiers
 
 
 # ======================================================================
@@ -2095,6 +2130,7 @@ def transform_prediction_data(
 def dataset_summary(
     dataframe: pd.DataFrame,
     target_column: str | None = None,
+    ignored_columns: list[str] | None = None,
 ) -> dict[str, Any]:
     """
     Lightweight dataset summary.
@@ -2113,6 +2149,9 @@ def dataset_summary(
         dataframe,
         "Dataset",
     )
+
+    ignored = {str(column) for column in (ignored_columns or [])}
+    identifiers = set(detect_identifier_columns(dataframe))
 
     summary: dict[
         str,
@@ -2145,23 +2184,60 @@ def dataset_summary(
     for column in dataframe.columns:
 
         series = dataframe[column]
+        column_name = str(column)
+        missing = int(series.isna().sum())
+        role = (
+            "target"
+            if column_name == target_column
+            else "ignored"
+            if column_name in ignored and column_name not in identifiers
+            else "identifier"
+            if column_name in identifiers
+            else "feature"
+        )
+        description = (
+            "Selected prediction target."
+            if role == "target"
+            else "Identifier-like column detected from its name and uniqueness."
+            if role == "identifier"
+            else "Excluded from model training."
+            if role == "ignored"
+            else "Description unavailable"
+        )
+
+        categories: list[Any] = []
+        if (
+            pd.api.types.is_object_dtype(series)
+            or pd.api.types.is_string_dtype(series)
+            or pd.api.types.is_categorical_dtype(series)
+            or pd.api.types.is_bool_dtype(series)
+        ):
+            unique_values = series.dropna().unique()
+            if len(unique_values) <= 50:
+                categories = unique_values.tolist()
 
         summary[
             "columns_info"
         ][
-            str(column)
+            column_name
         ] = {
             "dtype": str(
                 series.dtype
             ),
-            "missing": int(
-                series.isna().sum()
+            "missing": missing,
+            "missing_percentage": float(
+                (missing / len(dataframe)) * 100.0
             ),
             "unique": int(
                 series.nunique(
                     dropna=True
                 )
             ),
+            "role": role,
+            "description": description,
+            "required": role == "feature",
+            "nullable": missing > 0,
+            "categories": categories,
         }
 
     # ==================================================================
@@ -2203,6 +2279,7 @@ def dataset_summary(
 __all__ = [
     "PreprocessingConfig",
     "detect_feature_types",
+    "detect_identifier_columns",
     "build_preprocessor",
     "preprocess_dataset",
     "transform_prediction_data",
