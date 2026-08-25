@@ -297,35 +297,19 @@ class AutoMLService:
                 "Dataset is empty."
             )
 
+        summary = self.trainer.summarize_dataset(dataframe)
         return _json_safe(
             {
-                "rows": int(
-                    len(dataframe)
-                ),
-                "columns": int(
-                    len(dataframe.columns)
-                ),
+                **summary,
                 "column_names": [
                     str(column)
                     for column in dataframe.columns
                 ],
                 "dtypes": {
-                    str(column): str(
-                        dtype
-                    )
-                    for column, dtype
-                    in dataframe.dtypes.items()
+                    str(column): str(dtype)
+                    for column, dtype in dataframe.dtypes.items()
                 },
-                "missing_values": int(
-                    dataframe.isnull()
-                    .sum()
-                    .sum()
-                ),
-                "memory_usage_bytes": int(
-                    dataframe.memory_usage(
-                        deep=True
-                    ).sum()
-                ),
+                "dataset_summary": summary,
             }
         )
 
@@ -699,6 +683,9 @@ class AutoMLService:
             "model_name": artifact.model_name,
             "rows": len(dataframe),
             "predictions": predictions,
+            "target_metadata": artifact.metadata.get(
+                "prediction_schema", {}
+            ).get("target"),
         }
 
         if artifact.task == "classification":
@@ -715,6 +702,26 @@ class AutoMLService:
 
             if classes is not None:
                 response["classes"] = _json_safe(classes)
+                response["encoded_predictions"] = [
+                    next(
+                        (
+                            index
+                            for index, class_value in enumerate(classes)
+                            if class_value == prediction
+                        ),
+                        None,
+                    )
+                    for prediction in predictions
+                ]
+
+            response["prediction_meanings"] = [
+                (
+                    f"{artifact.target_column} = {prediction}"
+                    if artifact.target_column
+                    else f"Training class = {prediction}"
+                )
+                for prediction in predictions
+            ]
 
             probabilities = self.trainer.predict_probabilities(
                 artifact,
@@ -733,6 +740,18 @@ class AutoMLService:
                         "Prediction probability classes are incompatible."
                     )
                 response["probabilities"] = probability_rows
+                if classes is not None:
+                    response["prediction_confidences"] = [
+                        (
+                            row[classes.index(prediction)]
+                            if prediction in classes
+                            else None
+                        )
+                        for prediction, row in zip(
+                            predictions,
+                            probability_rows,
+                        )
+                    ]
 
         if artifact.task == "clustering":
             clustering_metadata = artifact.metadata.get(
@@ -744,8 +763,156 @@ class AutoMLService:
                     "effective_number_of_clusters"
                 )
             )
+            cluster_profiles = clustering_metadata.get(
+                "cluster_profiles",
+                {},
+            )
+            response["cluster_profiles"] = cluster_profiles
+            response["segment_labels"] = []
+            response["prediction_profiles"] = []
+            response["technical_clusters"] = []
+            for prediction in predictions:
+                profile = cluster_profiles.get(str(prediction), {})
+                segment_label = profile.get(
+                    "segment_label",
+                    f"Customer Segment {prediction}",
+                )
+                profile_text = profile.get(
+                    "profile",
+                    "No reliable multi-feature profile is available.",
+                )
+                response["segment_labels"].append(segment_label)
+                response["prediction_profiles"].append(profile_text)
+                response["technical_clusters"].append(
+                    f"Cluster {prediction}"
+                )
+
+            # Retain the generic batch-display field with segment names,
+            # without exposing legacy raw-feature descriptions.
+            response["prediction_labels"] = list(
+                response["segment_labels"]
+            )
 
         return _json_safe(response)
+
+    def visual_results(
+        self,
+        result: AutoMLResult,
+    ) -> dict[str, Any]:
+        """Build bounded chart data from the evaluated best model."""
+
+        best = result.best_model
+        processed = result.processed_dataset
+        if best is None or getattr(best, "model", None) is None:
+            return {}
+
+        model = best.model
+
+        def evaluate(method_name: str, values: Any) -> Any:
+            method = getattr(model, method_name)
+            try:
+                return method(values)
+            except Exception:
+                if hasattr(values, "toarray"):
+                    return method(values.toarray())
+                raise
+
+        try:
+            if result.task == "classification":
+                from sklearn.metrics import auc, roc_curve
+
+                X_test = processed.X_test
+                y_test = np.asarray(processed.y_test)
+                classes = np.asarray(
+                    getattr(model, "classes_", np.unique(y_test))
+                )
+                if len(classes) < 2:
+                    return {}
+                if callable(getattr(model, "predict_proba", None)):
+                    scores = np.asarray(evaluate("predict_proba", X_test))
+                elif callable(getattr(model, "decision_function", None)):
+                    scores = np.asarray(evaluate("decision_function", X_test))
+                else:
+                    return {}
+
+                curves = []
+                for index, class_value in enumerate(classes):
+                    if scores.ndim == 1:
+                        if len(classes) != 2 or index == 0:
+                            continue
+                        class_scores = scores
+                    else:
+                        if index >= scores.shape[1]:
+                            continue
+                        class_scores = scores[:, index]
+                    binary_target = (y_test == class_value).astype(int)
+                    if len(np.unique(binary_target)) < 2:
+                        continue
+                    fpr, tpr, _ = roc_curve(binary_target, class_scores)
+                    sample = np.linspace(0, len(fpr) - 1, min(200, len(fpr)), dtype=int)
+                    curves.append({
+                        "class_name": class_value,
+                        "auc": float(auc(fpr, tpr)),
+                        "points": [
+                            {"fpr": float(fpr[i]), "tpr": float(tpr[i])}
+                            for i in sample
+                        ],
+                    })
+                return {"roc_curves": curves} if curves else {}
+
+            if result.task == "regression":
+                actual = np.asarray(processed.y_test, dtype=float)
+                predicted = np.asarray(evaluate("predict", processed.X_test), dtype=float)
+                count = min(500, len(actual))
+                indexes = np.linspace(0, len(actual) - 1, count, dtype=int)
+                return {
+                    "regression_points": [
+                        {
+                            "actual": float(actual[i]),
+                            "predicted": float(predicted[i]),
+                            "residual": float(actual[i] - predicted[i]),
+                        }
+                        for i in indexes
+                    ]
+                }
+
+            if result.task == "clustering":
+                from sklearn.decomposition import PCA
+
+                matrix = processed.X_full
+                if hasattr(matrix, "toarray"):
+                    matrix = matrix.toarray()
+                matrix = np.asarray(matrix, dtype=float)
+                labels = np.asarray(getattr(best, "labels", []))
+                if matrix.ndim != 2 or len(matrix) != len(labels):
+                    return {}
+                reduced_with_pca = matrix.shape[1] > 2
+                if reduced_with_pca:
+                    coordinates = PCA(
+                        n_components=2,
+                        random_state=result.random_state,
+                    ).fit_transform(matrix)
+                elif matrix.shape[1] == 1:
+                    coordinates = np.column_stack([matrix[:, 0], np.zeros(len(matrix))])
+                else:
+                    coordinates = matrix[:, :2]
+                count = min(1000, len(coordinates))
+                indexes = np.linspace(0, len(coordinates) - 1, count, dtype=int)
+                return {
+                    "cluster_points": [
+                        {
+                            "x": float(coordinates[i, 0]),
+                            "y": float(coordinates[i, 1]),
+                            "cluster": labels[i],
+                        }
+                        for i in indexes
+                    ],
+                    "reduced_with_pca": reduced_with_pca,
+                }
+        except Exception:
+            return {}
+
+        return {}
 
     # ============================================================
     # MODEL EXISTS
@@ -1236,8 +1403,38 @@ class AutoMLService:
                     else None
                 ),
                 "model_filename": model_filename,
+                "required_features": (
+                    result.model_artifact.metadata.get(
+                        "required_features", []
+                    )
+                    if result.model_artifact
+                    else []
+                ),
+                "feature_importance": (
+                    result.model_artifact.metadata.get(
+                        "feature_importance", []
+                    )
+                    if result.model_artifact
+                    else []
+                ),
+                "prediction_schema": (
+                    result.model_artifact.metadata.get(
+                        "prediction_schema", {}
+                    )
+                    if result.model_artifact
+                    else {}
+                ),
+                "ignored_identifiers": (
+                    result.model_artifact.metadata.get(
+                        "ignored_identifiers", []
+                    )
+                    if result.model_artifact
+                    else []
+                ),
                 **artifact_capability,
             },
+
+            "visual_results": self.visual_results(result),
 
             "skipped_algorithms":
                 result.skipped_algorithms,

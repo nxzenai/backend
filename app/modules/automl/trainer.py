@@ -39,6 +39,7 @@ Important contracts
 from __future__ import annotations
 
 import os
+import re
 import tempfile
 from dataclasses import dataclass, field
 from enum import Enum
@@ -53,6 +54,7 @@ from app.modules.automl.preprocessing import (
     PreprocessingConfig,
     ProcessedDataset,
     dataset_summary,
+    detect_identifier_columns,
     preprocess_dataset,
     transform_prediction_data,
 )
@@ -150,6 +152,8 @@ class TrainerConfig:
     )
 
     verbose: bool = True
+
+    include_identifier_features: bool = False
 
 
 # ================================================================
@@ -481,12 +485,13 @@ class AutoMLTrainer:
         self,
         dataframe: pd.DataFrame,
         target_column: str | None = None,
+        ignored_columns: list[str] | None = None,
     ) -> dict[str, Any]:
 
         return dataset_summary(
             dataframe=dataframe,
             target_column=target_column,
-            
+            ignored_columns=ignored_columns,
         )
 
     # ============================================================
@@ -518,6 +523,7 @@ class AutoMLTrainer:
         target_column: str | None,
         *,
         task: AutoMLTask | str | None = None,
+        include_identifier_features: bool | None = None,
     ) -> tuple[
         AutoMLTask,
         dict[str, Any],
@@ -555,15 +561,44 @@ class AutoMLTrainer:
             else None
         )
 
+        include_identifiers = (
+            self.config.include_identifier_features
+            if include_identifier_features is None
+            else include_identifier_features
+        )
+        ignored_identifiers: list[str] = []
+        if (
+            effective_task in {
+                AutoMLTask.CLASSIFICATION,
+                AutoMLTask.REGRESSION,
+                AutoMLTask.CLUSTERING,
+            }
+            and not include_identifiers
+        ):
+            ignored_identifiers = [
+                column
+                for column in detect_identifier_columns(dataframe)
+                if column != preprocessing_target
+            ]
+
+        training_dataframe = dataframe.drop(
+            columns=ignored_identifiers,
+            errors="ignore",
+        )
+
         summary = self.summarize_dataset(
             dataframe,
             preprocessing_target,
+            ignored_identifiers,
         )
 
         processed = self.preprocess(
-            dataframe,
+            training_dataframe,
             preprocessing_target,
             task=effective_task,
+        )
+        processed.ignored_features = list(
+            ignored_identifiers
         )
 
         return (
@@ -582,6 +617,7 @@ class AutoMLTrainer:
         task: AutoMLTask,
         result: Any,
         processed: ProcessedDataset,
+        summary: dict[str, Any],
     ) -> ModelArtifact | None:
 
         if result is None:
@@ -639,9 +675,68 @@ class AutoMLTrainer:
             "sparse_output": (
                 processed.sparse_output
             ),
+            "required_features": list(
+                processed.original_feature_names
+            ),
+            "ignored_identifiers": list(
+                processed.ignored_features
+            ),
         }
 
+        columns_info = summary.get("columns_info", {})
+        metadata["prediction_schema"] = {
+            "expected_features": list(processed.original_feature_names),
+            "required_fields": list(processed.original_feature_names),
+            "datatypes": {
+                name: columns_info.get(name, {}).get("dtype")
+                for name in processed.original_feature_names
+            },
+            "columns": {
+                name: {
+                    "dtype": columns_info.get(name, {}).get("dtype"),
+                    "required": True,
+                    "nullable": bool(
+                        columns_info.get(name, {}).get("nullable", False)
+                    ),
+                    "categories": columns_info.get(name, {}).get(
+                        "categories", []
+                    ),
+                }
+                for name in processed.original_feature_names
+            },
+            "ignored_identifiers": list(processed.ignored_features),
+            "target": (
+                {
+                    "name": processed.target_column,
+                    **columns_info.get(processed.target_column, {}),
+                    "unit": columns_info.get(
+                        processed.target_column, {}
+                    ).get("unit"),
+                }
+                if processed.target_column
+                else None
+            ),
+        }
+
+        feature_importance = (
+            self._feature_importance(
+                model,
+                processed.feature_names,
+            )
+            if task in {
+                AutoMLTask.CLASSIFICATION,
+                AutoMLTask.REGRESSION,
+            }
+            else []
+        )
+        if feature_importance:
+            metadata["feature_importance"] = feature_importance
+
         if task == AutoMLTask.CLUSTERING:
+            cluster_profiles = self._cluster_profiles(
+                result,
+                processed,
+            )
             metadata["clustering"] = {
                 "requested_number_of_clusters": getattr(
                     result,
@@ -655,6 +750,10 @@ class AutoMLTrainer:
                 ),
                 "prediction_supported": callable(
                     getattr(model, "predict", None)
+                ),
+                "cluster_profiles": cluster_profiles,
+                "excluded_identifier_features": list(
+                    processed.ignored_features
                 ),
             }
 
@@ -709,6 +808,7 @@ class AutoMLTrainer:
             task=task,
             result=best_model,
             processed=processed,
+            summary=summary,
         )
 
         skipped = []
@@ -760,6 +860,294 @@ class AutoMLTrainer:
             clustering=clustering,
         )
 
+    @staticmethod
+    def _feature_importance(
+        model: Any,
+        feature_names: list[str],
+    ) -> list[dict[str, Any]]:
+        """Return estimator-backed importance only when it is available."""
+
+        values = getattr(model, "feature_importances_", None)
+        source = "feature_importances_"
+        if values is None:
+            values = getattr(model, "coef_", None)
+            source = "coef_"
+        if values is None:
+            return []
+
+        try:
+            importance = np.asarray(values, dtype=float)
+            if importance.ndim > 1:
+                importance = np.mean(np.abs(importance), axis=0)
+            else:
+                importance = np.abs(importance)
+            if importance.size != len(feature_names):
+                return []
+            order = np.argsort(importance)[::-1][:15]
+            return [
+                {
+                    "feature": str(feature_names[index]),
+                    "importance": float(importance[index]),
+                    "source": source,
+                }
+                for index in order
+                if np.isfinite(importance[index])
+                and importance[index] > 0
+            ]
+        except Exception:
+            return []
+
+    @staticmethod
+    def _cluster_profiles(
+        result: Any,
+        processed: ProcessedDataset,
+    ) -> dict[str, dict[str, Any]]:
+        """Build stable multi-feature profiles from measured centroids."""
+
+        labels = getattr(result, "labels", None)
+        if labels is None or processed.X_full is None:
+            return {}
+
+        try:
+            matrix = processed.X_full
+            if hasattr(matrix, "toarray"):
+                matrix = matrix.toarray()
+            matrix = np.asarray(matrix, dtype=float)
+            label_values = np.asarray(labels)
+            if matrix.ndim != 2 or len(matrix) != len(label_values):
+                return {}
+
+            overall = np.nanmean(matrix, axis=0)
+            spread = np.nanstd(matrix, axis=0)
+            spread[spread < 1e-12] = 1.0
+            profiles: dict[str, dict[str, Any]] = {}
+            cluster_centroids = {
+                value: np.nanmean(matrix[label_values == value], axis=0)
+                for value in np.unique(label_values)
+                if value != -1
+            }
+
+            for label in np.unique(label_values):
+                label_key = str(label.item() if hasattr(label, "item") else label)
+                if label == -1:
+                    profiles[label_key] = {
+                        "segment_label": "Unassigned Segment",
+                        "profile": "Noise or unassigned observations.",
+                        "characteristics": [],
+                    }
+                    continue
+                centroid = cluster_centroids[label]
+                other_centroids = [
+                    value
+                    for cluster_label, value in cluster_centroids.items()
+                    if cluster_label != label
+                ]
+                other_reference = (
+                    np.nanmean(other_centroids, axis=0)
+                    if other_centroids
+                    else overall
+                )
+                overall_deviations = (centroid - overall) / spread
+                relative_deviations = (centroid - other_reference) / spread
+                distinction_scores = (
+                    0.65
+                    * np.maximum(
+                        np.abs(overall_deviations),
+                        np.abs(relative_deviations),
+                    )
+                    + 0.35
+                    * np.minimum(
+                        np.abs(overall_deviations),
+                        np.abs(relative_deviations),
+                    )
+                )
+                ranked = np.argsort(distinction_scores)[::-1]
+                traits: list[str] = []
+                label_terms: list[tuple[str, float, str]] = []
+                used_features: set[str] = set()
+                for index in ranked:
+                    score = float(distinction_scores[index])
+                    if (
+                        not np.isfinite(score)
+                        or score < 0.4
+                        or max(
+                            abs(overall_deviations[index]),
+                            abs(relative_deviations[index]),
+                        ) < 0.5
+                    ):
+                        continue
+                    characteristic = AutoMLTrainer._cluster_characteristic(
+                        str(processed.feature_names[index]),
+                        float(overall_deviations[index]),
+                        float(relative_deviations[index]),
+                        score,
+                        processed.original_feature_names,
+                    )
+                    if characteristic is None:
+                        continue
+                    feature, text, label_term, strength = characteristic
+                    if (
+                        feature in used_features
+                        or feature in processed.ignored_features
+                    ):
+                        continue
+                    used_features.add(feature)
+                    traits.append(text)
+                    if (
+                        label_term
+                        and strength >= 0.45
+                        and len(label_term) <= 32
+                        and any(character.isalpha() for character in label_term)
+                    ):
+                        label_terms.append((label_term, strength, text))
+                    if len(traits) == 3:
+                        break
+
+                numeric_label = label.item() if hasattr(label, "item") else label
+                segment_label = f"Customer Segment {numeric_label}"
+                label_evidence = label_terms[:3]
+                if (
+                    len(label_evidence) >= 2
+                    and label_evidence[1][1] >= 0.45
+                    and np.mean(
+                        [strength for _, strength, _ in label_evidence]
+                    ) >= 0.5
+                ):
+                    segment_label = (
+                        " ".join(term for term, _, _ in label_evidence)
+                        + " Customers"
+                    )
+
+                profile_traits = (
+                    [text for _, _, text in label_evidence]
+                    if len(label_evidence) >= 2
+                    else traits
+                )
+
+                profiles[label_key] = {
+                    "segment_label": segment_label,
+                    "profile": (
+                        "; ".join(profile_traits)
+                        if len(profile_traits) >= 2
+                        else "No meaningful multi-feature distinction was detected."
+                    ),
+                    "characteristics": (
+                        profile_traits if len(profile_traits) >= 2 else []
+                    ),
+                }
+            return profiles
+        except Exception:
+            return {}
+
+    @staticmethod
+    def _cluster_label_feature_name(
+        feature: str,
+    ) -> str:
+        """Convert a source column name into concise label-safe wording."""
+
+        text = re.sub(r"[\(\[\{].*?[\)\]\}]", " ", feature)
+        text = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", text)
+        text = re.sub(r"[^A-Za-z]+", " ", text)
+        ignored_tokens = {
+            "annual", "yearly", "avg", "average", "mean", "level",
+            "score", "value", "index", "metric", "measure",
+            "measurement", "column", "feature", "total", "min", "max",
+            "std", "k", "usd", "dollar", "dollars", "percent",
+            "percentage", "pct", "kg", "lb", "lbs", "cm", "mm",
+        }
+        tokens = [
+            token
+            for token in text.split()
+            if token.lower() not in ignored_tokens
+        ]
+        if not tokens:
+            tokens = text.split()[:1]
+
+        return " ".join(token.title() for token in tokens[-2:])
+
+    @staticmethod
+    def _cluster_characteristic(
+        transformed_name: str,
+        overall_deviation: float,
+        relative_deviation: float,
+        distinction_score: float,
+        original_features: list[str],
+    ) -> tuple[str, str, str | None, float] | None:
+        raw_name = transformed_name.split("__", 1)[-1]
+        feature = next(
+            (
+                name
+                for name in sorted(original_features, key=len, reverse=True)
+                if raw_name == name or raw_name.startswith(f"{name}_")
+            ),
+            None,
+        )
+        if feature is None:
+            return None
+
+        display_name = re.sub(
+            r"(?<=[a-z0-9])(?=[A-Z])",
+            " ",
+            re.sub(r"[_-]+", " ", feature),
+        ).strip()
+        category = raw_name[len(feature):].lstrip("_")
+        direction_value = (
+            relative_deviation
+            if abs(relative_deviation) >= 0.25
+            else overall_deviation
+        )
+        if category:
+            if direction_value > 0 and distinction_score >= 0.55:
+                display_category = re.sub(r"[_-]+", " ", category).strip()
+                return (
+                    feature,
+                    (
+                        f"{display_name} is typically {display_category} "
+                        f"({overall_deviation:+.2f} SD versus overall; "
+                        f"{relative_deviation:+.2f} SD versus other clusters)"
+                    ),
+                    display_category,
+                    distinction_score,
+                )
+            return None
+
+        overall_direction = "above" if overall_deviation >= 0 else "below"
+        relative_direction = "above" if relative_deviation >= 0 else "below"
+        label_name = AutoMLTrainer._cluster_label_feature_name(feature)
+        normalized_name = label_name.lower().strip()
+        if normalized_name == "age" or normalized_name.endswith(" age"):
+            label_term = "Older" if direction_value > 0 else "Younger"
+        elif abs(overall_deviation) < 0.35 and abs(relative_deviation) >= 0.5:
+            label_term = (
+                f"Moderate-{label_name}"
+                if " " not in label_name
+                else f"Moderate {label_name}"
+            )
+        else:
+            if direction_value > 0:
+                label_direction = (
+                    "High"
+                    if abs(overall_deviation) >= 0.75
+                    else "Moderate-High"
+                )
+            else:
+                label_direction = "Low"
+            label_term = (
+                f"{label_direction}-{label_name}"
+                if " " not in label_name
+                else f"{label_direction} {label_name}"
+            )
+        return (
+            feature,
+            (
+                f"{display_name} is {abs(overall_deviation):.2f} SD "
+                f"{overall_direction} the overall mean and "
+                f"{abs(relative_deviation):.2f} SD "
+                f"{relative_direction} other clusters"
+            ),
+            label_term,
+            distinction_score,
+        )
 
     # ============================================================
     # CLASSIFICATION
@@ -871,11 +1259,15 @@ class AutoMLTrainer:
         clustering_config: ClusteringConfig | None = None,
     ) -> AutoMLResult:
 
+        requested_config = clustering_config or ClusteringConfig()
         task, summary, processed = (
             self.prepare_dataset(
                 dataframe,
                 target_column,
                 task=AutoMLTask.CLUSTERING,
+                include_identifier_features=(
+                    requested_config.include_identifier_features
+                ),
             )
         )
 
@@ -922,6 +1314,9 @@ class AutoMLTrainer:
             "prediction_supported": bool(
                 best is not None
                 and callable(getattr(best.model, "predict", None))
+            ),
+            "excluded_identifier_features": list(
+                processed.ignored_features
             ),
         }
 
