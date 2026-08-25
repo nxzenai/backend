@@ -757,24 +757,18 @@ async def predict(
             )
         )
 
-        model = service.load_artifact(
+        artifact = service.load_artifact(
             model_filename
         )
 
-        predictions = await asyncio.to_thread(
-            service.predict,
-            model,
-
+        result = await asyncio.to_thread(
+            service.predict_artifact_values,
+            artifact,
             dataframe,
-
         )
-
-        return {
-            "model": model_filename,
-            "model_filename": model_filename,
-            "rows": len(dataframe),
-            "predictions": predictions,
-        }
+        result["model"] = model_filename
+        result["model_filename"] = model_filename
+        return result
 
     except HTTPException:
         raise
@@ -789,6 +783,12 @@ async def predict(
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=exc.message,
+        ) from exc
+
+    except PredictionNotSupportedError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=exc.to_dict(),
         ) from exc
 
     except (PreprocessingError, ValueError) as exc:

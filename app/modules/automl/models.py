@@ -362,6 +362,10 @@ class ProcessedDataset:
         default_factory=list
     )
 
+    ignored_features: list[str] = field(
+        default_factory=list
+    )
+
     sparse_output: bool = False
 
     n_rows: int = 0
