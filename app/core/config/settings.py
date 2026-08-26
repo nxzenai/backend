@@ -171,6 +171,34 @@ class Settings(BaseSettings):
         alias="LOG_LEVEL",
     )
 
+    # -------------------------------------------------
+    # Email
+    # -------------------------------------------------
+
+    smtp_host: str | None = Field(default=None, alias="SMTP_HOST")
+    smtp_port: int = Field(default=587, alias="SMTP_PORT")
+    smtp_username: str | None = Field(default=None, alias="SMTP_USERNAME")
+    smtp_password: str | None = Field(default=None, alias="SMTP_PASSWORD")
+    smtp_from_email: str | None = Field(default=None, alias="SMTP_FROM_EMAIL")
+    smtp_from_name: str = Field(default="NxZenAI", alias="SMTP_FROM_NAME")
+    smtp_use_tls: bool = Field(default=True, alias="SMTP_USE_TLS")
+    smtp_use_ssl: bool = Field(default=False, alias="SMTP_USE_SSL")
+    smtp_admin_recipients_raw: str = Field(
+        default=(
+            "bhargav@nxzenai.com,fayaz@nxzenai.com,"
+            "roushan@nxzenai.com,shruthi.n@nxzenai.com"
+        ),
+        alias="SMTP_ADMIN_RECIPIENTS",
+    )
+
+    @property
+    def smtp_admin_recipients(self) -> list[str]:
+        return [
+            recipient.strip()
+            for recipient in self.smtp_admin_recipients_raw.split(",")
+            if recipient.strip()
+        ]
+
     # Notebook workspaces are development/private-staging host directories.
     notebook_workspace_root: str = Field(
         default="data/notebook-workspaces",
