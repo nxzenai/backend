@@ -8,7 +8,7 @@ from app.lifespan import lifespan
 from routers.leads import router as lead_router
 
 app = FastAPI(
-    title="NEXTGENAI API",
+    title="NXZENAI API",
     version="1.0.0",
     lifespan=lifespan,
 )
@@ -18,10 +18,10 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        #"https://www.nxzenai.com",
+        "https://www.nxzenai.com",
         #"http://localhost:3000",
         #"http://127.0.0.1:3000",
-        "http://localhost:3001"
+        #"http://localhost:3001"
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -45,7 +45,7 @@ app.include_router(api_router)
 @app.get("/")
 async def root():
     return {
-        "message": "NEXTGENAI Backend Running"
+        "message": "NXZENAI Backend Running"
     }
 
 
