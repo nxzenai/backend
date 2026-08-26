@@ -1,0 +1,89 @@
+{
+  "artifact_id": "904364c7-c8c5-472c-b09a-6583fe4c4b4d",
+  "architecture": "rnn",
+  "modality": "time_series",
+  "model_filename": "model.pt",
+  "classes_filename": "classes.json",
+  "model_config": {
+    "architecture": "rnn",
+    "input_size": 3,
+    "hidden_size": 64,
+    "num_layers": 1,
+    "num_classes": 3,
+    "dropout": 0.2,
+    "learning_rate": 0.001,
+    "sequence_length": 10,
+    "feature_names": [
+      "sensor_1",
+      "sensor_2",
+      "sensor_3"
+    ],
+    "target_column": "status",
+    "feature_mean": [
+      1.0971802473068237,
+      0.9643001556396484,
+      0.9327693581581116
+    ],
+    "feature_std": [
+      1.134580373764038,
+      1.1644434928894043,
+      0.6662203073501587
+    ]
+  },
+  "class_names": [
+    "fault",
+    "normal",
+    "warning"
+  ],
+  "metrics": {
+    "architecture": "RNN",
+    "modality": "time_series",
+    "accuracy": 0.8235,
+    "final_loss": 0.709,
+    "confidence_level": "Medium",
+    "summary": "The RNN learned useful sequential patterns, but additional data or tuning may improve results."
+  },
+  "dataset_summary": {
+    "modality": "time_series",
+    "total_samples": 171,
+    "training_samples": 137,
+    "validation_samples": 34,
+    "class_count": 3,
+    "classes": [
+      "fault",
+      "normal",
+      "warning"
+    ],
+    "batch_size": 32,
+    "file_size_kb": 6.1553
+  },
+  "training_info": {
+    "epochs_requested": 3,
+    "epochs_trained": 3,
+    "best_epoch": 3,
+    "early_stopped": false,
+    "training_time": 1.0042
+  },
+  "training_history": {
+    "train_loss": [
+      1.086493,
+      0.962183,
+      0.839736
+    ],
+    "validation_loss": [
+      0.996671,
+      0.872763,
+      0.709029
+    ],
+    "train_accuracy": [
+      0.489051,
+      0.737226,
+      0.875912
+    ],
+    "validation_accuracy": [
+      0.264706,
+      0.617647,
+      0.823529
+    ]
+  }
+}
