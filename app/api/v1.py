@@ -17,8 +17,9 @@ from app.modules.automl.router import (
 
 # --- NEW: Import our AI Module Routers ---
 from app.modules.autonlp.router import router as autonlp_router
-from app.modules.autodl.router import router as autodl_router
+from app.modules.autodl_v2.router import router as autodl_v2_router
 from app.modules.genai.router import router as genai_router
+from app.modules.ai_registry.router import router as ai_registry_router
 
 api_router = APIRouter(
     prefix="/api/v1"
@@ -42,5 +43,9 @@ api_router.include_router(crm_router)
 
 # --- NEW: Register our AI Module Routers ---
 api_router.include_router(autonlp_router)
-api_router.include_router(autodl_router)
+api_router.include_router(autodl_v2_router, prefix="/autodl")
+api_router.include_router(
+    autodl_v2_router, prefix="/autodl-v2", include_in_schema=False,
+)
+api_router.include_router(ai_registry_router)
 api_router.include_router(genai_router)

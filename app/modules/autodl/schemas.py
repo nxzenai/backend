@@ -30,11 +30,12 @@ class AutoDLJobCreateRequest(BaseModel):
     dataset_id: str = Field(...)
     modality: Modality = Field(...)
     architecture: DLArchitecture = Field(...)
+    target_column: str | None = None
 
     max_epochs: int = Field(
         default=50,
         ge=1,
-        le=1000,
+        le=100,
     )
 
 
@@ -114,6 +115,43 @@ class AutoDLTrainingHistory(BaseModel):
     )
 
 
+class AutoDLTrainingProgress(BaseModel):
+    stage: str = "queued"
+    current_epoch: int = 0
+    total_epochs: int = 0
+    percentage: float = 0.0
+    latest_train_loss: float | None = None
+    latest_validation_loss: float | None = None
+    latest_train_accuracy: float | None = None
+    latest_validation_accuracy: float | None = None
+
+
+class AutoDLExecutionInfo(BaseModel):
+    queued_at: datetime | None = None
+    started_at: datetime | None = None
+    ended_at: datetime | None = None
+    worker_id: str | None = None
+    device: str | None = None
+    retry_count: int = 0
+    failure_code: str | None = None
+    execution_duration: float | None = None
+    cancellation_requested: bool = False
+
+
+class AutoDLDatasetInspection(BaseModel):
+    modality: Modality
+    filename: str
+    file_count: int | None = None
+    class_counts: dict[str, int] = Field(default_factory=dict)
+    dimensions: list[dict[str, int]] = Field(default_factory=list)
+    columns: list[str] = Field(default_factory=list)
+    row_count: int | None = None
+    missing_values: dict[str, int] = Field(default_factory=dict)
+    target_column: str | None = None
+    target_valid: bool | None = None
+    target_error: str | None = None
+
+
 # ============================================================
 # Artifact Information
 # ============================================================
@@ -128,6 +166,24 @@ class AutoDLArtifactInfo(BaseModel):
     model_name: str = "CNN"
     status: str = "ready"
     artifact_path: str | None = None
+    model_version_id: str | None = None
+    artifact_integrity_sha256: str | None = None
+
+
+class AutoDLEvaluation(BaseModel):
+    labels: list[str] = Field(default_factory=list)
+    confusion_matrix: list[list[int]] = Field(default_factory=list)
+
+
+class AutoDLLeaderboardEntry(BaseModel):
+    rank: int | None = None
+    model_name: str
+    score: float | None = None
+    accuracy: float | None = None
+    final_loss: float | None = None
+    training_time: float | None = None
+    success: bool = True
+    error: str | None = None
 
 
 # ============================================================
@@ -155,6 +211,8 @@ class AutoDLPredictionResponse(BaseModel):
     ] = Field(
         default_factory=list
     )
+    explanation_status: str = "unavailable for this model"
+    gradcam_image: str | None = None
 
 
 # ============================================================
@@ -184,11 +242,19 @@ class AutoDLJobResponse(BaseModel):
         AutoDLTrainingHistory | None
     ) = None
 
+    progress: AutoDLTrainingProgress | None = None
+    execution: AutoDLExecutionInfo | None = None
+
+    leaderboard: list[AutoDLLeaderboardEntry] = Field(default_factory=list)
+    evaluation: AutoDLEvaluation | None = None
+
     artifact: (
         AutoDLArtifactInfo | None
     ) = None
 
     created_at: datetime | None = None
+    archived_at: datetime | None = None
+    error: str | None = None
 
 
 # ============================================================
@@ -202,7 +268,12 @@ __all__ = [
     "AutoDLDatasetSummary",
     "AutoDLTrainingInfo",
     "AutoDLTrainingHistory",
+    "AutoDLTrainingProgress",
+    "AutoDLExecutionInfo",
+    "AutoDLDatasetInspection",
     "AutoDLArtifactInfo",
+    "AutoDLEvaluation",
+    "AutoDLLeaderboardEntry",
     "AutoDLPredictionProbability",
     "AutoDLPredictionResponse",
     "AutoDLJobResponse",

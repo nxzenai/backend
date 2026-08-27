@@ -24,7 +24,6 @@ class NLPTask(str, Enum):
     Supported NLP tasks.
     """
     TEXT_CLASSIFICATION = "text_classification"
-    NAMED_ENTITY_RECOGNITION = "ner"
     SENTIMENT_ANALYSIS = "sentiment_analysis"
 
 ##########################################################
@@ -35,6 +34,7 @@ class JobStatus(str, Enum):
     """
     AutoNLP job lifecycle.
     """
+    QUEUED = "queued"
     PENDING = "pending"
     RUNNING = "running"
     COMPLETED = "completed"
@@ -50,9 +50,7 @@ class NLPArchitecture(str, Enum):
     Classical ML algorithms are intentionally excluded.
     """
     LSTM = "lstm"
-    RNN = "rnn"
-    DAE = "dae"
-    DBN = "dbn"
+    DISTILBERT = "distilbert"
 
 ##########################################################
 # Default Architectures
@@ -60,12 +58,7 @@ class NLPArchitecture(str, Enum):
 
 DEFAULT_CLASSIFICATION_ARCHITECTURES = [
     NLPArchitecture.LSTM,
-    NLPArchitecture.RNN,
-]
-
-DEFAULT_NER_ARCHITECTURES = [
-    NLPArchitecture.LSTM,
-    NLPArchitecture.RNN,
+    NLPArchitecture.DISTILBERT,
 ]
 
 ##########################################################

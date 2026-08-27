@@ -19,6 +19,8 @@ Responsibilities
 from __future__ import annotations
 
 import logging
+import base64
+from typing import Any
 
 from io import BytesIO
 
@@ -27,6 +29,9 @@ import pandas as pd
 import torch
 
 from fastapi import UploadFile
+
+from app.core.config.settings import settings
+from app.core.experiment_manifest import sha256_bytes
 
 from PIL import Image
 
@@ -40,6 +45,7 @@ from app.modules.autodl.algorithms.cnn import (
 from app.modules.autodl.algorithms.rnn import (
     RNNTimeSeriesClassifier,
 )
+from app.modules.autodl.algorithms.transfer import build_resnet18_classifier
 
 from app.modules.autodl.artifacts import (
     get_autodl_artifact_info,
@@ -58,16 +64,16 @@ from app.modules.autodl.dataset_loader import (
 )
 
 from app.modules.autodl.exceptions import (
+    AutoDLJobCancelledError,
     AutoDLException,
-)
-
-from app.modules.autodl.repository import (
-    AutoDLRepository,
 )
 
 from app.modules.autodl.schemas import (
     AutoDLArtifactInfo,
+    AutoDLEvaluation,
+    AutoDLExecutionInfo,
     AutoDLJobResponse,
+    AutoDLTrainingProgress,
     AutoDLPredictionProbability,
     AutoDLPredictionResponse,
 )
@@ -91,29 +97,137 @@ class AutoDLService:
 
     def __init__(
         self,
-        repo: AutoDLRepository,
+        repo: Any,
     ):
         self.repo = repo
         self.trainer = AutoDLTrainer()
 
+    @staticmethod
+    def _execution_info(job) -> AutoDLExecutionInfo:
+        return AutoDLExecutionInfo(
+            queued_at=job.queued_at or job.created_at,
+            started_at=job.started_at,
+            ended_at=job.ended_at,
+            worker_id=job.worker_id,
+            device=job.execution_device,
+            retry_count=job.retry_count or 0,
+            failure_code=job.failure_code,
+            execution_duration=job.execution_duration,
+            cancellation_requested=bool(job.cancellation_requested),
+        )
+
 
     # ========================================================
-    # Start AutoDL Job
+    # Create AutoDL Job
     # ========================================================
 
-    def start_autodl_job(
+    def create_autodl_job(
         self,
-        file: UploadFile,
+        filename: str,
         modality: str,
         architecture: str,
         max_epochs: int,
+        owner_id: str,
+        target_column: str | None = None,
+        candidate_architectures: list[str] | None = None,
+    ) -> AutoDLJobResponse:
+
+        normalized_modality = Modality(str(modality).strip().lower())
+        normalized_architecture = DLArchitecture(
+            str(architecture).strip().lower()
+        )
+        candidates = [DLArchitecture(str(item).strip().lower()) for item in (candidate_architectures or [architecture])]
+        allowed_candidates = (
+            {DLArchitecture.CNN, DLArchitecture.RESNET18}
+            if normalized_modality == Modality.IMAGE
+            else {DLArchitecture.RNN}
+        )
+        if not candidates or not set(candidates).issubset(allowed_candidates):
+            raise AutoDLException("One or more selected architectures are unsupported for this modality.")
+
+        if (
+            normalized_modality == Modality.IMAGE
+            and normalized_architecture not in (DLArchitecture.CNN, DLArchitecture.RESNET18)
+        ) or (
+            normalized_modality == Modality.TIME_SERIES
+            and normalized_architecture != DLArchitecture.RNN
+        ):
+            raise AutoDLException(
+                "The selected modality and architecture are not supported."
+            )
+
+        normalized_max_epochs = int(max_epochs)
+        if not 1 <= normalized_max_epochs <= settings.ai_training_max_epochs:
+            raise AutoDLException(
+                "max_epochs must be between 1 and "
+                f"{settings.ai_training_max_epochs}."
+            )
+
+        if (
+            normalized_modality == Modality.TIME_SERIES
+            and not str(target_column or "").strip()
+        ):
+            raise AutoDLException(
+                "target_column is required for time-series training."
+            )
+
+        job = self.repo.create_job({
+            "dataset_id": filename or "dataset",
+            "owner_id": owner_id,
+            "modality": normalized_modality,
+            "architecture": normalized_architecture,
+            "status": JobStatus.QUEUED,
+            "max_epochs": normalized_max_epochs,
+        })
+        if hasattr(self.repo, "update_configuration"):
+            self.repo.update_configuration(job.id, {
+                "modality": normalized_modality.value,
+                "architecture": normalized_architecture.value,
+                "candidate_architectures": [item.value for item in candidates],
+                "max_epochs": normalized_max_epochs,
+                "target_column": str(target_column).strip() if target_column else None,
+                "dataset_filename": filename or "dataset",
+            })
+
+        queued_progress = AutoDLTrainingProgress(
+            stage="queued",
+            total_epochs=normalized_max_epochs,
+        )
+        self.repo.update_progress(
+            job.id,
+            queued_progress.model_dump(mode="json"),
+        )
+
+        return AutoDLJobResponse(
+            job_id=job.id,
+            status=JobStatus.QUEUED,
+            architecture=job.architecture,
+            modality=job.modality,
+            progress=queued_progress,
+            execution=self._execution_info(job),
+            created_at=job.created_at,
+        )
+
+
+    # ========================================================
+    # Run AutoDL Job
+    # ========================================================
+
+    def run_autodl_training(
+        self,
+        job_id: str,
+        contents: bytes,
+        filename: str,
+        modality: str,
+        architecture: str,
+        max_epochs: int,
+        target_column: str | None = None,
+        candidate_architectures: list[str] | None = None,
     ) -> AutoDLJobResponse:
 
         # ----------------------------------------------------
         # Read upload
         # ----------------------------------------------------
-
-        contents = file.file.read()
 
         if not contents:
             raise AutoDLException(
@@ -173,12 +287,11 @@ class AutoDLService:
             normalized_modality
             == Modality.IMAGE
             and normalized_architecture
-            != DLArchitecture.CNN
+            not in (DLArchitecture.CNN, DLArchitecture.RESNET18)
         ):
 
             raise AutoDLException(
-                "IMAGE AutoDL currently supports "
-                "CNN only."
+                "IMAGE AutoDL supports cnn and resnet18 only."
             )
 
 
@@ -192,16 +305,6 @@ class AutoDLService:
             raise AutoDLException(
                 "TIME_SERIES AutoDL currently "
                 "supports RNN only."
-            )
-
-
-        if (
-            normalized_modality
-            == Modality.AUDIO
-        ):
-
-            raise AutoDLException(
-                "AUDIO AutoDL is not enabled yet."
             )
 
 
@@ -232,10 +335,11 @@ class AutoDLService:
             )
 
 
-        if normalized_max_epochs > 1000:
+        if normalized_max_epochs > settings.ai_training_max_epochs:
 
             raise AutoDLException(
-                "max_epochs cannot exceed 1000."
+                "max_epochs cannot exceed "
+                f"{settings.ai_training_max_epochs}."
             )
 
 
@@ -246,29 +350,17 @@ class AutoDLService:
         # Create DB job
         # ----------------------------------------------------
 
-        job_data = {
-
-            "dataset_id":
-                file.filename
-                or "dataset",
-
-            "modality":
-                normalized_modality,
-
-            "architecture":
-                normalized_architecture,
-
-            "status":
-                JobStatus.RUNNING,
-
-            "max_epochs":
-                normalized_max_epochs,
-        }
-
-
-        job = self.repo.create_job(
-            job_data
+        job = self.repo.update_status(
+            job_id,
+            JobStatus.RUNNING,
         )
+
+        self.repo.update_progress(job.id, {
+            "stage": "preparing_dataset",
+            "current_epoch": 0,
+            "total_epochs": normalized_max_epochs,
+            "percentage": 2.0,
+        })
 
 
         try:
@@ -286,8 +378,7 @@ class AutoDLService:
                     contents,
 
                 filename=
-                    file.filename
-                    or "dataset",
+                    filename or "dataset",
             )
 
 
@@ -308,6 +399,29 @@ class AutoDLService:
 
                 max_epochs=
                     normalized_max_epochs,
+
+                target_column=
+                    target_column,
+
+                candidate_architectures=candidate_architectures,
+
+                progress_callback=lambda values: self.repo.update_progress(
+                    job.id,
+                    {
+                        "stage": "training",
+                        "current_epoch": int(values["current_epoch"]),
+                        "total_epochs": int(values["total_epochs"]),
+                        "percentage": round(
+                            5.0 + 85.0 * int(values["current_epoch"])
+                            / max(int(values["total_epochs"]), 1),
+                            2,
+                        ),
+                        "latest_train_loss": values["train_loss"],
+                        "latest_validation_loss": values["validation_loss"],
+                        "latest_train_accuracy": values["train_accuracy"],
+                        "latest_validation_accuracy": values["validation_accuracy"],
+                    },
+                ),
             )
 
 
@@ -322,6 +436,15 @@ class AutoDLService:
                     "AutoDL training did not "
                     "return a trained model."
                 )
+
+            best_architecture = DLArchitecture(
+                str(
+                    (getattr(best_model, "model_config", {}) or {}).get(
+                        "architecture",
+                        normalized_architecture.value,
+                    )
+                ).lower()
+            )
 
 
             # ------------------------------------------------
@@ -414,6 +537,13 @@ class AutoDLService:
 
             if trained_model is not None:
 
+                self.repo.update_progress(job.id, {
+                    "stage": "saving_artifact",
+                    "current_epoch": len(training_history["train_loss"]),
+                    "total_epochs": normalized_max_epochs,
+                    "percentage": 95.0,
+                })
+
                 model_config = (
                     getattr(
                         best_model,
@@ -444,7 +574,7 @@ class AutoDLService:
                             trained_model,
 
                         architecture=
-                            normalized_architecture.value,
+                            best_architecture.value,
 
                         modality=
                             normalized_modality.value,
@@ -466,6 +596,11 @@ class AutoDLService:
 
                         training_history=
                             training_history,
+
+                        dataset_hash=sha256_bytes(contents),
+                        random_seed=self.trainer.config.random_seed,
+                        task=result.task,
+                        leaderboard=result.leaderboard,
                     )
                 )
 
@@ -488,8 +623,36 @@ class AutoDLService:
                         artifact_path=
                             artifact_result
                             .artifact_path,
+
+                        model_version_id=artifact_result.model_version_id,
+                        artifact_integrity_sha256=artifact_result.artifact_integrity_sha256,
                     )
                 )
+
+                if hasattr(self.repo, "update_training_metadata"):
+                    self.repo.update_training_metadata(job.id, {
+                        "dataset_hash": sha256_bytes(contents),
+                        "dataset_summary": (
+                            result.dataset_summary.model_dump(mode="json")
+                            if hasattr(result.dataset_summary, "model_dump")
+                            else result.dataset_summary
+                        ),
+                        "target_column": target_column,
+                        "feature_names": list(model_config.get("feature_names", []) or []),
+                        "task": str(getattr(result.task, "value", result.task)),
+                        "selected_model": best_architecture.value,
+                        "artifact_reference": artifact.artifact_path,
+                        "training_metadata": {
+                            "dataset_hash": sha256_bytes(contents),
+                            "task": str(getattr(result.task, "value", result.task)),
+                            "selected_model": best_architecture.value,
+                            "artifact_reference": artifact.artifact_path,
+                            "manifest": {
+                                "model_version_id": artifact.model_version_id,
+                                "artifact_integrity_sha256": artifact.artifact_integrity_sha256,
+                            },
+                        },
+                    })
 
 
             # ------------------------------------------------
@@ -502,18 +665,22 @@ class AutoDLService:
             )
 
 
-            completed_job = (
-                self.repo.mark_completed(
-                    job.id
-                )
-            )
-
-
             # ------------------------------------------------
             # Response
             # ------------------------------------------------
 
-            return AutoDLJobResponse(
+            completed_progress = AutoDLTrainingProgress(
+                stage="completed",
+                current_epoch=len(training_history["train_loss"]),
+                total_epochs=normalized_max_epochs,
+                percentage=100.0,
+                latest_train_loss=(training_history["train_loss"][-1] if training_history["train_loss"] else None),
+                latest_validation_loss=(training_history["validation_loss"][-1] if training_history["validation_loss"] else None),
+                latest_train_accuracy=(training_history["train_accuracy"][-1] if training_history["train_accuracy"] else None),
+                latest_validation_accuracy=(training_history["validation_accuracy"][-1] if training_history["validation_accuracy"] else None),
+            )
+
+            response = AutoDLJobResponse(
 
                 job_id=
                     job.id,
@@ -522,7 +689,7 @@ class AutoDLService:
                     JobStatus.COMPLETED,
 
                 architecture=
-                    job.architecture,
+                    best_architecture,
 
                 modality=
                     job.modality,
@@ -545,13 +712,40 @@ class AutoDLService:
                 training_history=
                     training_history,
 
+                progress=completed_progress,
+
+                leaderboard=result.leaderboard,
+
+                evaluation=AutoDLEvaluation(
+                    labels=list(getattr(best_model, "class_names", []) or []),
+                    confusion_matrix=list(getattr(best_model, "confusion_matrix", []) or []),
+                ),
+
                 artifact=
                     artifact,
 
                 created_at=
-                    completed_job.created_at,
+                    job.created_at,
             )
 
+            self.repo.update_result(
+                job.id,
+                response.model_dump(mode="json"),
+            )
+
+            self.repo.update_progress(
+                job.id,
+                completed_progress.model_dump(mode="json"),
+            )
+
+            self.repo.mark_completed(job.id)
+
+            return response
+
+
+        except AutoDLJobCancelledError:
+            self.repo.mark_cancelled(job.id)
+            raise
 
         except Exception as exc:
 
@@ -565,7 +759,9 @@ class AutoDLService:
             try:
 
                 self.repo.mark_failed(
-                    job.id
+                    job.id,
+                    "Training failed. Review worker logs using the job ID.",
+                    "TRAINING_FAILED",
                 )
 
             except Exception:
@@ -586,7 +782,7 @@ class AutoDLService:
 
 
             raise AutoDLException(
-                f"Training failed: {exc}"
+                "Training failed. Review worker logs using the job ID."
             ) from exc
 
 
@@ -614,11 +810,19 @@ class AutoDLService:
     def get_job_status(
         self,
         job_id: str,
+        owner_id: str,
     ) -> AutoDLJobResponse:
 
         job = self.repo.get_job(
-            job_id
+            job_id,
+            owner_id,
         )
+
+        if job.status == JobStatus.COMPLETED and job.result:
+            response = AutoDLJobResponse(**job.result)
+            response.archived_at = job.archived_at
+            response.execution = self._execution_info(job)
+            return response
 
 
         artifact = None
@@ -667,6 +871,9 @@ class AutoDLService:
                         artifact_data.get(
                             "artifact_path"
                         ),
+
+                    model_version_id=artifact_data.get("model_version_id"),
+                    artifact_integrity_sha256=artifact_data.get("artifact_integrity_sha256"),
                 )
             )
 
@@ -699,12 +906,39 @@ class AutoDLService:
             metrics=
                 job.metrics,
 
+            progress=
+                job.progress,
+
+            execution=self._execution_info(job),
+
             artifact=
                 artifact,
 
             created_at=
                 job.created_at,
+
+            archived_at=
+                job.archived_at,
+
+            error=
+                job.error_message,
         )
+
+
+    def list_jobs(
+        self,
+        owner_id: str,
+        include_archived: bool = False,
+    ) -> list[AutoDLJobResponse]:
+        return [
+            self.get_job_status(job.id, owner_id)
+            for job in self.repo.list_jobs(owner_id, include_archived)
+        ]
+
+
+    def archive_job(self, job_id: str, owner_id: str) -> dict[str, str]:
+        self.repo.archive_job(job_id, owner_id)
+        return {"job_id": job_id, "status": "archived"}
 
 
     # ========================================================
@@ -715,15 +949,32 @@ class AutoDLService:
         self,
         job_id: str,
         file: UploadFile,
+        owner_id: str,
     ) -> AutoDLPredictionResponse:
 
         # ----------------------------------------------------
         # Confirm DB job exists
         # ----------------------------------------------------
 
-        self.repo.get_job(
-            job_id
+        job = self.repo.get_job(
+            job_id,
+            owner_id,
         )
+
+        if job.archived_at is not None:
+            raise AutoDLException("Archived AutoDL jobs cannot run predictions.")
+        if job.status != JobStatus.COMPLETED:
+            raise AutoDLException("The AutoDL job must be completed before prediction.")
+
+        prediction_name = (file.filename or "").lower()
+        if job.modality == Modality.IMAGE and not prediction_name.endswith(
+            (".png", ".jpg", ".jpeg", ".webp", ".bmp")
+        ):
+            raise AutoDLException(
+                "Image prediction requires a PNG, JPG, WEBP, or BMP image."
+            )
+        if job.architecture == DLArchitecture.RNN and not prediction_name.endswith(".csv"):
+            raise AutoDLException("RNN prediction requires a CSV file.")
 
 
         # ----------------------------------------------------
@@ -772,7 +1023,7 @@ class AutoDLService:
         # ----------------------------------------------------
 
         if (
-            architecture == "cnn"
+            architecture in {"cnn", "resnet18"}
             and modality == "image"
         ):
 
@@ -906,19 +1157,18 @@ class AutoDLService:
 
 
         # ----------------------------------------------------
-        # Reconstruct CNN
+        # Reconstruct the winning image classifier.
         # ----------------------------------------------------
 
-        model = CNNImageClassifier(
-
-            num_classes=
-                num_classes,
-
-            input_channels=
-                input_channels,
-
-            dropout=
-                dropout,
+        architecture = str(metadata.get("architecture", "cnn")).lower()
+        model = (
+            build_resnet18_classifier(num_classes, pretrained=False)
+            if architecture == "resnet18"
+            else CNNImageClassifier(
+                num_classes=num_classes,
+                input_channels=input_channels,
+                dropout=dropout,
+            )
         )
 
 
@@ -932,7 +1182,7 @@ class AutoDLService:
 
             raise AutoDLException(
                 "Unable to load the saved "
-                "CNN model weights."
+                "image model weights."
             ) from exc
 
 
@@ -1021,18 +1271,39 @@ class AutoDLService:
         # Inference
         # ----------------------------------------------------
 
-        with torch.no_grad():
-
-            logits = model(
-                tensor
+        gradcam_image = None
+        explanation_status = "unavailable for this model"
+        if architecture == "resnet18":
+            activations: list[torch.Tensor] = []
+            gradients: list[torch.Tensor] = []
+            layer = model.layer4[-1].conv2
+            forward_handle = layer.register_forward_hook(
+                lambda _module, _inputs, output: activations.append(output)
             )
-
-            probability_tensor = (
-                torch.softmax(
-                    logits,
-                    dim=1,
-                )[0]
+            backward_handle = layer.register_full_backward_hook(
+                lambda _module, _grad_input, grad_output: gradients.append(grad_output[0])
             )
+            logits = model(tensor)
+            prediction_index = int(torch.argmax(logits, dim=1).item())
+            model.zero_grad(set_to_none=True)
+            logits[0, prediction_index].backward()
+            forward_handle.remove()
+            backward_handle.remove()
+            if activations and gradients:
+                weights = gradients[0].mean(dim=(2, 3), keepdim=True)
+                cam = torch.relu((weights * activations[0]).sum(dim=1))[0]
+                if float(cam.max()) > 0:
+                    cam = cam / cam.max()
+                    heatmap = (cam.detach().cpu().numpy() * 255).astype(np.uint8)
+                    heatmap_image = Image.fromarray(heatmap).resize(image.size).convert("RGB")
+                    buffer = BytesIO()
+                    heatmap_image.save(buffer, format="PNG")
+                    gradcam_image = "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")
+                    explanation_status = "available"
+            probability_tensor = torch.softmax(logits.detach(), dim=1)[0]
+        else:
+            with torch.no_grad():
+                probability_tensor = torch.softmax(model(tensor), dim=1)[0]
 
 
         return self._build_prediction_response(
@@ -1041,13 +1312,16 @@ class AutoDLService:
                 job_id,
 
             model_name=
-                "CNN",
+                "ResNet18 Transfer" if architecture == "resnet18" else "CNN",
 
             class_names=
                 class_names,
 
             probability_tensor=
                 probability_tensor,
+
+            explanation_status=explanation_status,
+            gradcam_image=gradcam_image,
         )
 
 
@@ -1504,6 +1778,8 @@ class AutoDLService:
         model_name: str,
         class_names: list[str],
         probability_tensor: torch.Tensor,
+        explanation_status: str = "unavailable for this model",
+        gradcam_image: str | None = None,
     ) -> AutoDLPredictionResponse:
 
         probabilities = [
@@ -1571,6 +1847,9 @@ class AutoDLService:
 
             probabilities=
                 probabilities,
+
+            explanation_status=explanation_status,
+            gradcam_image=gradcam_image,
         )
 
 
