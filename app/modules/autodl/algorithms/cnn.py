@@ -22,10 +22,11 @@ import random
 import time
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 
 import torch
 import torch.nn as nn
+from app.core.ai_device import resolve_execution_device
 
 from torch.utils.data import DataLoader
 
@@ -100,6 +101,8 @@ class DLModelResult:
     validation_accuracy: list[float] = field(
         default_factory=list
     )
+
+    confusion_matrix: list[list[int]] = field(default_factory=list)
 
 
 # ============================================================
@@ -250,10 +253,7 @@ def _resolve_device() -> torch.device:
     Prefer CUDA when available, otherwise CPU.
     """
 
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-
-    return torch.device("cpu")
+    return resolve_execution_device()
 
 
 def _confidence_level(
@@ -422,6 +422,17 @@ def _evaluate(
     )
 
 
+def _confusion_matrix(model: nn.Module, loader: DataLoader, num_classes: int) -> list[list[int]]:
+    matrix = [[0 for _ in range(num_classes)] for _ in range(num_classes)]
+    model.eval()
+    with torch.no_grad():
+        for inputs, labels in loader:
+            predictions = torch.argmax(model(inputs.to(next(model.parameters()).device)), dim=1)
+            for actual, predicted in zip(labels.tolist(), predictions.cpu().tolist()):
+                matrix[int(actual)][int(predicted)] += 1
+    return matrix
+
+
 # ============================================================
 # Training
 # ============================================================
@@ -441,6 +452,7 @@ def train_cnn_model(
     patience: int = 4,
     random_seed: int = 42,
     verbose: bool = True,
+    progress_callback: Callable[[dict[str, float | int]], None] | None = None,
 ) -> DLModelResult:
     """
     Train a real CNN image-classification model.
@@ -794,6 +806,16 @@ def train_cnn_model(
             epoch + 1
         )
 
+        if progress_callback is not None:
+            progress_callback({
+                "current_epoch": epochs_trained,
+                "total_epochs": max_epochs,
+                "train_loss": train_loss_history[-1],
+                "validation_loss": validation_loss_history[-1],
+                "train_accuracy": train_accuracy_history[-1],
+                "validation_accuracy": validation_accuracy_history[-1],
+            })
+
         # ----------------------------------------------------
         # Best Model Selection
         # ----------------------------------------------------
@@ -1039,6 +1061,12 @@ def train_cnn_model(
 
         validation_accuracy=
             validation_accuracy_history,
+
+        confusion_matrix=_confusion_matrix(
+            model,
+            validation_loader,
+            num_classes,
+        ),
     )
 
 

@@ -1,13 +1,19 @@
 from __future__ import annotations
 
 import logging
+from io import BytesIO
 
 import pandas as pd
 import torch
 
+from app.core.config.settings import settings
+from app.core.experiment_manifest import sha256_bytes
+from app.core.ai_background_jobs import JobCancelledError
+
 from app.modules.autonlp.artifacts import (
     load_autonlp_artifact,
     save_autonlp_artifact,
+    save_transformer_artifact,
 )
 
 from app.modules.autonlp.constants import (
@@ -32,11 +38,15 @@ from app.modules.autonlp.repository import (
 
 from app.modules.autonlp.schemas import (
     AutoNLPArtifactInfo,
+    AutoNLPBatchPredictionResponse,
+    AutoNLPBatchPredictionRow,
     AutoNLPClassMetric,
     AutoNLPClassProbability,
     AutoNLPDatasetSummary,
     AutoNLPEvaluation,
+    AutoNLPExecutionInfo,
     AutoNLPJobResponse,
+    AutoNLPTrainingProgress,
     AutoNLPMetrics,
     AutoNLPPredictResponse,
     AutoNLPTrainingHistory,
@@ -84,19 +94,117 @@ class AutoNLPService:
             TrainerConfig()
         )
 
+    @staticmethod
+    def _execution_info(job) -> AutoNLPExecutionInfo:
+        return AutoNLPExecutionInfo(
+            queued_at=job.queued_at or job.created_at,
+            started_at=job.started_at,
+            ended_at=job.ended_at,
+            worker_id=job.worker_id,
+            device=job.execution_device,
+            retry_count=job.retry_count or 0,
+            failure_code=job.failure_code,
+            execution_duration=job.execution_duration,
+            cancellation_requested=bool(job.cancellation_requested),
+        )
+
 
     ##########################################################
-    # Start AutoNLP Job
+    # Create AutoNLP Job
     ##########################################################
 
-    def start_autonlp_job_from_dataframe(
+    def create_autonlp_job(
         self,
         dataframe: pd.DataFrame,
         filename: str,
         text_column: str,
         target_column: str,
         task: NLPTask,
+        max_epochs: int,
+        owner_id: str,
+        candidate_architectures: list[str] | None = None,
+    ) -> AutoNLPJobResponse:
+        if dataframe.empty:
+            raise TextDatasetValidationError(
+                "The uploaded dataset is empty."
+            )
+        if text_column not in dataframe.columns:
+            raise TextDatasetValidationError(
+                f"Text column '{text_column}' was not found."
+            )
+        if target_column not in dataframe.columns:
+            raise TextDatasetValidationError(
+                f"Target column '{target_column}' was not found."
+            )
+        if text_column == target_column:
+            raise TextDatasetValidationError(
+                "Text column and target column must be different."
+            )
+        if task not in (
+            NLPTask.TEXT_CLASSIFICATION,
+            NLPTask.SENTIMENT_ANALYSIS,
+        ):
+            raise TextDatasetValidationError(
+                f"Task '{task.value}' is not supported."
+            )
+        if not 1 <= max_epochs <= settings.ai_training_max_epochs:
+            raise TextDatasetValidationError(
+                "max_epochs must be between 1 and "
+                f"{settings.ai_training_max_epochs}."
+            )
+        requested_candidates = {
+            str(item).strip().lower()
+            for item in (candidate_architectures or ["lstm"])
+        }
+        if not requested_candidates or not requested_candidates.issubset({"lstm", "distilbert"}):
+            raise TextDatasetValidationError("Supported AutoNLP architectures are lstm and distilbert.")
+
+        job = self.repo.create_job({
+            "dataset_id": filename,
+            "owner_id": owner_id,
+            "text_column": text_column,
+            "target_column": target_column,
+            "task": task,
+            "architecture": NLPArchitecture.LSTM,
+            "status": JobStatus.QUEUED,
+            "max_epochs": max_epochs,
+        })
+
+        queued_progress = AutoNLPTrainingProgress(
+            stage="queued",
+            total_epochs=max_epochs,
+        )
+        self.repo.update_progress(
+            job.id,
+            queued_progress.model_dump(mode="json"),
+        )
+
+        return AutoNLPJobResponse(
+            job_id=job.id,
+            status=JobStatus.QUEUED,
+            task=job.task,
+            architecture=job.architecture,
+            progress=queued_progress,
+            execution=self._execution_info(job),
+            created_at=job.created_at,
+        )
+
+
+    ##########################################################
+    # Run AutoNLP Job
+    ##########################################################
+
+    def run_autonlp_training(
+        self,
+        job_id: str,
+        dataframe: pd.DataFrame,
+        filename: str,
+        text_column: str,
+        target_column: str,
+        task: NLPTask,
         max_epochs: int = 30,
+        candidate_architectures: list[str] | None = None,
+        dataset_hash: str = "unknown",
     ) -> AutoNLPJobResponse:
         """
         Starts an AutoNLP training job using LSTM.
@@ -153,10 +261,11 @@ class AutoNLPService:
 
         if (
             max_epochs < 1
-            or max_epochs > 500
+            or max_epochs > settings.ai_training_max_epochs
         ):
             raise TextDatasetValidationError(
-                "max_epochs must be between 1 and 500."
+                "max_epochs must be between 1 and "
+                f"{settings.ai_training_max_epochs}."
             )
 
 
@@ -164,6 +273,12 @@ class AutoNLPService:
         # 4. Force LSTM Architecture
         # -------------------------------------------------
 
+        candidates = list(dict.fromkeys(
+            str(item).strip().lower()
+            for item in (candidate_architectures or [NLPArchitecture.LSTM.value])
+        ))
+        if not candidates or not set(candidates).issubset({"lstm", "distilbert"}):
+            raise TextDatasetValidationError("Supported AutoNLP architectures are lstm and distilbert.")
         architecture = NLPArchitecture.LSTM
 
 
@@ -250,19 +365,17 @@ class AutoNLPService:
         # 10. Create Job
         # -------------------------------------------------
 
-        job_data = {
-            "dataset_id": filename,
-            "text_column": text_column,
-            "target_column": target_column,
-            "task": task,
-            "architecture": architecture,
-            "status": JobStatus.RUNNING,
-            "max_epochs": max_epochs,
-        }
-
-        job = self.repo.create_job(
-            job_data
+        job = self.repo.update_status(
+            job_id,
+            JobStatus.RUNNING,
         )
+
+        self.repo.update_progress(job.id, {
+            "stage": "preparing_dataset",
+            "current_epoch": 0,
+            "total_epochs": max_epochs,
+            "percentage": 2.0,
+        })
 
 
         try:
@@ -284,7 +397,27 @@ class AutoNLPService:
 
                 architecture="lstm",
 
+                candidate_architectures=candidates,
+
                 max_epochs=max_epochs,
+
+                progress_callback=lambda values: self.repo.update_progress(
+                    job.id,
+                    {
+                        "stage": "training",
+                        "current_epoch": int(values["current_epoch"]),
+                        "total_epochs": int(values["total_epochs"]),
+                        "percentage": round(
+                            5.0 + 85.0 * int(values["current_epoch"])
+                            / max(int(values["total_epochs"]), 1),
+                            2,
+                        ),
+                        "latest_train_loss": values["train_loss"],
+                        "latest_validation_loss": values["validation_loss"],
+                        "latest_train_accuracy": values["train_accuracy"],
+                        "latest_validation_accuracy": values["validation_accuracy"],
+                    },
+                ),
             )
 
             best_model = (
@@ -296,7 +429,12 @@ class AutoNLPService:
             # 12. Validate Artifact State
             # -------------------------------------------------
 
-            if best_model.model_state_dict is None:
+            best_architecture = (
+                NLPArchitecture.DISTILBERT
+                if str(best_model.model_config.get("architecture", "lstm")) == "distilbert"
+                else NLPArchitecture.LSTM
+            )
+            if best_architecture == NLPArchitecture.LSTM and best_model.model_state_dict is None:
                 raise AutoNLPException(
                     "The trained LSTM model did not "
                     "return model artifact state."
@@ -304,8 +442,7 @@ class AutoNLPService:
 
             if not best_model.model_config:
                 raise AutoNLPException(
-                    "The trained LSTM model did not "
-                    "return model configuration."
+                    "The trained model did not return model configuration."
                 )
 
 
@@ -323,44 +460,62 @@ class AutoNLPService:
                 .preprocessing
             )
 
-            artifact_data = save_autonlp_artifact(
-                job_id=job.id,
+            self.repo.update_progress(job.id, {
+                "stage": "saving_artifact",
+                "current_epoch": len(best_model.train_loss_history),
+                "total_epochs": max_epochs,
+                "percentage": 95.0,
+            })
 
-                model_state_dict=(
-                    best_model.model_state_dict
-                ),
-
-                model_config=(
-                    best_model.model_config
-                ),
-
-                tokenizer=(
-                    processed.tokenizer
-                ),
-
-                label_classes=(
-                    processed.label_classes
-                ),
-
-                oov_token=(
-                    preprocessing_config.oov_token
-                ),
-
-                max_sequence_length=(
-                    preprocessing_config
-                    .max_sequence_length
-                ),
-            )
+            manifest_metrics = {
+                "accuracy": best_model.accuracy,
+                "precision": best_model.precision,
+                "recall": best_model.recall,
+                "f1_score": best_model.f1_score,
+                "final_loss": best_model.final_loss,
+            }
+            if best_architecture == NLPArchitecture.DISTILBERT:
+                if best_model.model is None or best_model.tokenizer_object is None:
+                    raise AutoNLPException("The trained transformer did not return a complete artifact.")
+                artifact_data = save_transformer_artifact(
+                    job_id=job.id,
+                    model=best_model.model,
+                    tokenizer=best_model.tokenizer_object,
+                    model_config=best_model.model_config,
+                    label_classes=processed.label_classes,
+                    dataset_hash=dataset_hash,
+                    task=task.value,
+                    random_seed=preprocessing_config.random_state,
+                    metrics=manifest_metrics,
+                    leaderboard=result.leaderboard,
+                )
+            else:
+                artifact_data = save_autonlp_artifact(
+                    job_id=job.id,
+                    model_state_dict=best_model.model_state_dict,
+                    model_config=best_model.model_config,
+                    tokenizer=processed.tokenizer,
+                    label_classes=processed.label_classes,
+                    oov_token=preprocessing_config.oov_token,
+                    max_sequence_length=preprocessing_config.max_sequence_length,
+                    dataset_hash=dataset_hash,
+                    task=task.value,
+                    random_seed=preprocessing_config.random_state,
+                    metrics=manifest_metrics,
+                    leaderboard=result.leaderboard,
+                )
 
             artifact = AutoNLPArtifactInfo(
                 artifact_id=job.id,
-                model_name="LSTM",
+                model_name=best_model.model_name,
                 status="ready",
                 artifact_path=(
                     artifact_data[
                         "artifact_path"
                     ]
                 ),
+                model_version_id=artifact_data.get("model_version_id"),
+                artifact_integrity_sha256=artifact_data.get("artifact_integrity_sha256"),
             )
 
 
@@ -590,6 +745,8 @@ class AutoNLPService:
                 class_metrics=(
                     class_metric_objects
                 ),
+                roc_auc=best_model.roc_auc,
+                roc_curve=best_model.roc_curve,
             )
 
 
@@ -621,7 +778,7 @@ class AutoNLPService:
                 ),
 
                 "recommended_model": (
-                    "LSTM"
+                    best_model.model_name
                 ),
 
                 "recommendation_reason": (
@@ -634,16 +791,22 @@ class AutoNLPService:
                 metrics_for_db,
             )
 
-            self.repo.mark_completed(
-                job.id
-            )
-
-
             # -------------------------------------------------
             # 20. Response
             # -------------------------------------------------
 
-            return AutoNLPJobResponse(
+            completed_progress = AutoNLPTrainingProgress(
+                stage="completed",
+                current_epoch=len(training_history.train_loss),
+                total_epochs=max_epochs,
+                percentage=100.0,
+                latest_train_loss=(training_history.train_loss[-1] if training_history.train_loss else None),
+                latest_validation_loss=(training_history.validation_loss[-1] if training_history.validation_loss else None),
+                latest_train_accuracy=(training_history.train_accuracy[-1] if training_history.train_accuracy else None),
+                latest_validation_accuracy=(training_history.validation_accuracy[-1] if training_history.validation_accuracy else None),
+            )
+
+            response = AutoNLPJobResponse(
                 job_id=job.id,
 
                 status=(
@@ -653,7 +816,7 @@ class AutoNLPService:
                 task=job.task,
 
                 architecture=(
-                    NLPArchitecture.LSTM
+                    best_architecture
                 ),
 
                 metrics=metrics,
@@ -670,6 +833,10 @@ class AutoNLPService:
                     training_history
                 ),
 
+                progress=completed_progress,
+
+                leaderboard=result.leaderboard,
+
                 evaluation=evaluation,
 
                 artifact=artifact,
@@ -677,21 +844,34 @@ class AutoNLPService:
                 created_at=job.created_at,
             )
 
+            self.repo.update_result(
+                job.id,
+                response.model_dump(mode="json"),
+            )
+
+            self.repo.update_progress(
+                job.id,
+                completed_progress.model_dump(mode="json"),
+            )
+
+            self.repo.mark_completed(job.id)
+
+            return response
+
+
+        except JobCancelledError:
+            self.repo.mark_cancelled(job.id)
+            raise
 
         except Exception as exc:
-
-            logger.exception(
-                "AutoNLP LSTM training failed "
-                "for job %s",
-                job.id,
-            )
-
+            logger.exception("AutoNLP training failed for job %s", job.id)
             self.repo.mark_failed(
-                job.id
+                job.id,
+                "Training failed. Review worker logs using the job ID.",
+                "TRAINING_FAILED",
             )
-
             raise AutoNLPException(
-                f"Training failed: {exc}"
+                "Training failed. Review worker logs using the job ID."
             ) from exc
 
 
@@ -702,16 +882,37 @@ class AutoNLPService:
     def get_job_status(
         self,
         job_id: str,
+        owner_id: str,
     ) -> AutoNLPJobResponse:
 
         job = self.repo.get_job(
-            job_id
+            job_id,
+            owner_id,
         )
+
+        if job.status == JobStatus.COMPLETED and job.result:
+            response = AutoNLPJobResponse(**job.result)
+            response.archived_at = job.archived_at
+            response.execution = self._execution_info(job)
+            return response
 
         stored = (
             job.metrics
             or {}
         )
+
+        if not stored:
+            return AutoNLPJobResponse(
+                job_id=job.id,
+                status=job.status,
+                task=job.task,
+                architecture=job.architecture,
+                progress=job.progress,
+                execution=self._execution_info(job),
+                created_at=job.created_at,
+                archived_at=job.archived_at,
+                error=job.error_message,
+            )
 
 
         # -------------------------------------------------
@@ -908,12 +1109,34 @@ class AutoNLPService:
                 training_history
             ),
 
+            progress=job.progress,
+
+            execution=self._execution_info(job),
+
             evaluation=evaluation,
 
             artifact=artifact,
 
             created_at=job.created_at,
+            archived_at=job.archived_at,
+            error=job.error_message,
         )
+
+
+    def list_jobs(
+        self,
+        owner_id: str,
+        include_archived: bool = False,
+    ) -> list[AutoNLPJobResponse]:
+        return [
+            self.get_job_status(job.id, owner_id)
+            for job in self.repo.list_jobs(owner_id, include_archived)
+        ]
+
+
+    def archive_job(self, job_id: str, owner_id: str) -> dict[str, str]:
+        self.repo.archive_job(job_id, owner_id)
+        return {"job_id": job_id, "status": "archived"}
 
 
     ##########################################################
@@ -924,6 +1147,8 @@ class AutoNLPService:
         self,
         job_id: str,
         text: str,
+        owner_id: str,
+        loaded_artifact: dict | None = None,
     ) -> AutoNLPPredictResponse:
         """
         Uses the saved LSTM artifact generated by a
@@ -949,7 +1174,8 @@ class AutoNLPService:
         # -------------------------------------------------
 
         job = self.repo.get_job(
-            job_id
+            job_id,
+            owner_id,
         )
 
         if job.status != JobStatus.COMPLETED:
@@ -958,16 +1184,15 @@ class AutoNLPService:
                 "before predictions can be made."
             )
 
+        if job.archived_at is not None:
+            raise AutoNLPException("Archived AutoNLP jobs cannot run predictions.")
+
 
         # -------------------------------------------------
         # 3. Load Saved Artifact
         # -------------------------------------------------
 
-        loaded_artifact = (
-            load_autonlp_artifact(
-                job_id
-            )
-        )
+        loaded_artifact = loaded_artifact or load_autonlp_artifact(job_id)
 
         model = (
             loaded_artifact[
@@ -1176,6 +1401,144 @@ class AutoNLPService:
             probabilities=(
                 probability_items
             ),
+        )
+
+        if str(metadata.get("architecture", "lstm")).lower() == "distilbert":
+            max_sequence_length = int(metadata.get("max_sequence_length", 128))
+            encoded = tokenizer(
+                cleaned_text,
+                truncation=True,
+                max_length=max_sequence_length,
+                return_tensors="pt",
+            )
+            model.eval()
+            with torch.no_grad():
+                output = model(**encoded)
+                probability_tensor = torch.softmax(output.logits, dim=1)
+                prediction_id = int(torch.argmax(probability_tensor, dim=1).item())
+            probabilities = probability_tensor[0].cpu().tolist()
+            if prediction_id >= len(label_classes):
+                raise AutoNLPException("The transformer returned an invalid prediction class.")
+
+            token_attributions = []
+            explanation_status = "unavailable for this model"
+            try:
+                embeddings = model.get_input_embeddings()(encoded["input_ids"]).detach()
+                embeddings.requires_grad_(True)
+                attribution_inputs = {
+                    key: value for key, value in encoded.items() if key != "input_ids"
+                }
+                attribution_output = model(inputs_embeds=embeddings, **attribution_inputs)
+                model.zero_grad(set_to_none=True)
+                attribution_output.logits[0, prediction_id].backward()
+                scores = (embeddings.grad * embeddings).sum(dim=-1)[0].detach().cpu()
+                tokens = tokenizer.convert_ids_to_tokens(encoded["input_ids"][0])
+                usable = [
+                    (token, float(score))
+                    for token, score, mask in zip(tokens, scores.tolist(), encoded["attention_mask"][0].tolist())
+                    if mask and token not in tokenizer.all_special_tokens
+                ]
+                scale = max((abs(score) for _, score in usable), default=0.0)
+                if scale > 0:
+                    token_attributions = [
+                        {"token": token, "attribution": round(score / scale, 6)}
+                        for token, score in usable
+                    ]
+                    explanation_status = "available"
+            except Exception:
+                logger.info("Token attribution unavailable for AutoNLP job %s", job_id, exc_info=True)
+
+            probability_items = [
+                AutoNLPClassProbability(label=label_classes[index], probability=round(float(value), 6))
+                for index, value in enumerate(probabilities)
+                if index < len(label_classes)
+            ]
+            probability_items.sort(key=lambda item: item.probability, reverse=True)
+            return AutoNLPPredictResponse(
+                job_id=job_id,
+                model_name="DistilBERT",
+                predicted_label=label_classes[prediction_id],
+                confidence=round(float(probabilities[prediction_id]), 6),
+                probabilities=probability_items,
+                explanation_status=explanation_status,
+                token_attributions=token_attributions,
+            )
+
+
+    def predict_batch(
+        self,
+        job_id: str,
+        owner_id: str,
+        contents: bytes,
+        filename: str,
+        text_column: str,
+    ) -> AutoNLPBatchPredictionResponse:
+        if not filename.lower().endswith(".csv"):
+            raise TextDatasetValidationError(
+                "Batch prediction requires a CSV file."
+            )
+        try:
+            dataframe = pd.read_csv(BytesIO(contents))
+        except Exception as exc:
+            raise TextDatasetValidationError(
+                "Unable to read the prediction CSV."
+            ) from exc
+        if dataframe.empty:
+            raise TextDatasetValidationError("Prediction CSV is empty.")
+        if len(dataframe) > settings.ai_training_max_rows:
+            raise TextDatasetValidationError(
+                "Prediction CSV exceeds the configured row limit."
+            )
+        cleaned_column = text_column.strip()
+        if not cleaned_column or cleaned_column not in dataframe.columns:
+            raise TextDatasetValidationError(
+                f"Prediction CSV is missing text column '{cleaned_column}'."
+            )
+
+        job = self.repo.get_job(job_id, owner_id)
+        if job.status != JobStatus.COMPLETED:
+            raise AutoNLPException(
+                "The AutoNLP job must be completed before prediction."
+            )
+
+        if job.archived_at is not None:
+            raise AutoNLPException("Archived AutoNLP jobs cannot run predictions.")
+        artifact = load_autonlp_artifact(job_id)
+        rows = []
+
+        for row_index, value in dataframe[cleaned_column].items():
+            if pd.isna(value) or not str(value).strip():
+                rows.append(AutoNLPBatchPredictionRow(
+                    row_index=int(row_index),
+                    error="Text value is empty.",
+                ))
+                continue
+            try:
+                prediction = self.predict(
+                    job_id=job_id,
+                    text=str(value),
+                    owner_id=owner_id,
+                    loaded_artifact=artifact,
+                )
+                rows.append(AutoNLPBatchPredictionRow(
+                    row_index=int(row_index),
+                    predicted_label=prediction.predicted_label,
+                    confidence=prediction.confidence,
+                ))
+            except Exception as exc:
+                rows.append(AutoNLPBatchPredictionRow(
+                    row_index=int(row_index),
+                    error=str(exc),
+                ))
+
+        failed_rows = sum(1 for row in rows if row.error)
+        return AutoNLPBatchPredictionResponse(
+            job_id=job_id,
+            text_column=cleaned_column,
+            total_rows=len(rows),
+            valid_rows=len(rows) - failed_rows,
+            failed_rows=failed_rows,
+            rows=rows,
         )
 
 

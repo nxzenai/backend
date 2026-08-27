@@ -32,6 +32,7 @@ from app.modules.autonlp.preprocessing import (
 from app.modules.autonlp.algorithms.lstm import (
     train_lstm_model,
 )
+from app.modules.autonlp.algorithms.transformer import train_transformer_model
 
 
 ##########################################################
@@ -118,7 +119,9 @@ class AutoNLPTrainer:
         labels: list[str],
         target_column: str,
         architecture: str = "lstm",
+        candidate_architectures: list[str] | None = None,
         max_epochs: int = 30,
+        progress_callback=None,
     ) -> AutoNLPResult:
         """
         Executes the complete AutoNLP pipeline.
@@ -137,10 +140,13 @@ class AutoNLPTrainer:
         # 1. Validate Architecture
         # -------------------------------------------------
 
-        if architecture_name != "lstm":
+        candidates = list(dict.fromkeys(
+            item.strip().lower()
+            for item in (candidate_architectures or [architecture_name])
+        ))
+        if not candidates or not set(candidates).issubset({"lstm", "distilbert"}):
             raise ValueError(
-                "NxZen AutoNLP currently supports "
-                "the LSTM architecture only."
+                "NxZen AutoNLP supports lstm and distilbert for text classification."
             )
 
 
@@ -247,7 +253,8 @@ class AutoNLPTrainer:
             "hidden_dim": 64,
             "max_sequence_length": (
                 self.config.preprocessing.max_sequence_length
-            ),    
+            ),
+            "progress_callback": progress_callback,
         }
 
 
@@ -255,13 +262,38 @@ class AutoNLPTrainer:
         # 6. Train LSTM
         # -------------------------------------------------
 
-        result = train_lstm_model(
-            X_train=processed.X_train,
-            y_train=processed.y_train,
-            X_test=processed.X_test,
-            y_test=processed.y_test,
-            config=model_config,
+        training_results: list[Any] = []
+        failures: list[dict[str, Any]] = []
+        if "lstm" in candidates:
+            training_results.append(train_lstm_model(
+                X_train=processed.X_train,
+                y_train=processed.y_train,
+                X_test=processed.X_test,
+                y_test=processed.y_test,
+                config=model_config,
+            ))
+        if "distilbert" in candidates:
+            try:
+                training_results.append(train_transformer_model(
+                    train_text=processed.train_text,
+                    test_text=processed.test_text,
+                    y_train=processed.y_train,
+                    y_test=processed.y_test,
+                    num_classes=len(processed.label_classes),
+                    max_sequence_length=self.config.preprocessing.max_sequence_length,
+                    max_epochs=max_epochs,
+                    random_seed=self.config.preprocessing.random_state,
+                    progress_callback=progress_callback,
+                ))
+            except Exception as exc:
+                failures.append({"model_name": "DistilBERT", "success": False, "error": str(exc)[:300]})
+        if not training_results:
+            raise RuntimeError("All selected AutoNLP architectures failed to train.")
+        training_results.sort(
+            key=lambda item: (item.f1_score, item.accuracy, -item.final_loss),
+            reverse=True,
         )
+        result = training_results[0]
 
 
         # -------------------------------------------------
@@ -286,7 +318,7 @@ class AutoNLPTrainer:
 
         leaderboard = [
             {
-                "rank": 1,
+                "rank": rank,
 
                 "model_name":
                     result.model_name,
@@ -327,7 +359,9 @@ class AutoNLPTrainer:
                 "success":
                     result.success,
             }
-        ]
+            for rank, candidate_result in enumerate(training_results, 1)
+            for result in [candidate_result]
+        ] + failures
 
 
         # -------------------------------------------------
@@ -369,10 +403,8 @@ class AutoNLPTrainer:
         # -------------------------------------------------
 
         recommendation_reason = (
-            "NxZen AutoNLP trained an LSTM model "
-            "for this dataset. The model was evaluated "
-            "using held-out validation data and can be "
-            "saved as an artifact for testing new text."
+            f"{result.model_name} ranked first by held-out weighted F1 "
+            "among the successfully trained candidates."
         )
 
 
@@ -397,7 +429,7 @@ class AutoNLPTrainer:
             )
 
             print(
-                "[AutoNLP] Model: LSTM"
+                f"[AutoNLP] Model: {result.model_name}"
             )
 
             print(
@@ -456,11 +488,9 @@ class AutoNLPTrainer:
 
             processed_dataset=processed,
 
-            training_results=[
-                result
-            ],
+            training_results=training_results,
 
-            recommended_model="LSTM",
+            recommended_model=result.model_name,
 
             recommendation_reason=(
                 recommendation_reason

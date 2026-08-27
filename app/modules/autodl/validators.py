@@ -13,8 +13,8 @@ def validate_dl_request(request: AutoDLJobCreateRequest) -> None:
     arch = request.architecture
     mod = request.modality
     
-    if mod == Modality.IMAGE and arch not in [DLArchitecture.CNN, DLArchitecture.DAE, DLArchitecture.DBN]:
+    if mod == Modality.IMAGE and arch != DLArchitecture.CNN:
         raise InvalidArchitectureError(f"Architecture {arch.value} is not suitable for IMAGE modality.")
         
-    if mod == Modality.TIME_SERIES and arch not in [DLArchitecture.RNN, DLArchitecture.LSTM, DLArchitecture.DAE]:
+    if mod == Modality.TIME_SERIES and arch != DLArchitecture.RNN:
         raise InvalidArchitectureError(f"Architecture {arch.value} is not suitable for TIME_SERIES modality.")

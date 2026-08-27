@@ -1,0 +1,84 @@
+{
+  "schema_version": 1,
+  "model_version_id": "time_series_classification-f15a5f9fdea7-443d885e1fc4",
+  "dataset_hash": "f15a5f9fdea7525a4e1505914f69da47dc8bcfda1c5bc1d53c8d6002488b97ed",
+  "task": "time_series_classification",
+  "model_configuration": {
+    "architecture": "rnn",
+    "input_size": 5,
+    "hidden_size": 64,
+    "num_layers": 1,
+    "num_classes": 1255,
+    "dropout": 0.2,
+    "learning_rate": 0.001,
+    "sequence_length": 10,
+    "feature_names": [
+      "Open",
+      "High",
+      "Low",
+      "Adj Close**",
+      "Volume"
+    ],
+    "target_column": "Close*",
+    "feature_mean": [
+      30681.82421875,
+      30875.708984375,
+      30475.208984375,
+      30684.546875,
+      352154432.0
+    ],
+    "feature_std": [
+      3728.694580078125,
+      3716.305419921875,
+      3743.476318359375,
+      3731.255859375,
+      110534272.0
+    ]
+  },
+  "random_seed": 42,
+  "preprocessing_configuration": {
+    "sequence_length": 10,
+    "feature_names": [
+      "Open",
+      "High",
+      "Low",
+      "Adj Close**",
+      "Volume"
+    ],
+    "feature_mean": [
+      30681.82421875,
+      30875.708984375,
+      30475.208984375,
+      30684.546875,
+      352154432.0
+    ],
+    "feature_std": [
+      3728.694580078125,
+      3716.305419921875,
+      3743.476318359375,
+      3731.255859375,
+      110534272.0
+    ]
+  },
+  "training_metrics": {
+    "architecture": "RNN",
+    "modality": "time_series",
+    "accuracy": 0.0,
+    "final_loss": 7.1667,
+    "confidence_level": "Low",
+    "summary": "The RNN completed training, but validation performance is currently limited. Consider adding more representative sequences or adjusting the sequence configuration. Training stopped early after validation performance stopped improving."
+  },
+  "runtime": {
+    "python": "3.14.5",
+    "platform": "Windows-11-10.0.26200-SP0",
+    "implementation": "cpython",
+    "dependencies": {
+      "torch": "2.13.0",
+      "torchvision": "0.28.0",
+      "numpy": "2.5.2",
+      "scikit-learn": "1.9.0"
+    },
+    "execution_device": "cpu"
+  },
+  "artifact_integrity_sha256": "443d885e1fc461ce324d3d0dbcbfff5fe86c83c9bcdde22eea5415ad5191e393"
+}
