@@ -19,14 +19,15 @@ IMAGE:
 TIME_SERIES:
     CSV containing numeric feature columns and one target column.
 
-If target_column is not supplied for a time-series dataset,
-the final CSV column is treated as the target.
+Time-series training requires an explicit target_column.
 """
 
 from __future__ import annotations
 
 import tempfile
 import zipfile
+from collections import Counter
+from io import BytesIO
 
 from dataclasses import dataclass
 from pathlib import Path
@@ -34,6 +35,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import torch
+
+from app.core.config.settings import settings
 
 from torch.utils.data import (
     DataLoader,
@@ -45,6 +48,7 @@ from torchvision import (
     datasets,
     transforms,
 )
+from PIL import Image
 
 
 # ============================================================
@@ -70,6 +74,94 @@ DEFAULT_VALIDATION_SPLIT = 0.20
 DEFAULT_RANDOM_SEED = 42
 
 DEFAULT_SEQUENCE_LENGTH = 10
+
+
+def inspect_image_archive(contents: bytes) -> dict:
+    try:
+        archive = zipfile.ZipFile(BytesIO(contents), "r")
+    except zipfile.BadZipFile as exc:
+        raise ValueError("The image dataset must be a valid ZIP archive.") from exc
+
+    with archive:
+        members = [
+            member for member in archive.infolist()
+            if not member.is_dir()
+            and Path(member.filename).suffix.lower() in SUPPORTED_IMAGE_EXTENSIONS
+        ]
+        if not members:
+            raise ValueError("The ZIP archive contains no supported image files.")
+        if len(archive.infolist()) > settings.ai_training_max_archive_entries:
+            raise ValueError("Image archive contains too many entries.")
+        if sum(member.file_size for member in archive.infolist()) > settings.ai_training_max_archive_bytes:
+            raise ValueError("Image archive is too large when extracted.")
+
+        paths = [Path(member.filename) for member in members]
+        common_wrapper = (
+            len({path.parts[0] for path in paths if len(path.parts) >= 3}) == 1
+            and all(len(path.parts) >= 3 for path in paths)
+        )
+        class_counts: Counter[str] = Counter()
+        dimensions: Counter[tuple[int, int]] = Counter()
+
+        for member, path in zip(members, paths):
+            class_index = 1 if common_wrapper else 0
+            if len(path.parts) <= class_index + 1:
+                raise ValueError("Images must be stored in one folder per class.")
+            class_counts[path.parts[class_index]] += 1
+            try:
+                with archive.open(member) as image_file, Image.open(image_file) as image:
+                    dimensions[(int(image.width), int(image.height))] += 1
+            except Exception as exc:
+                raise ValueError(f"Unable to inspect image '{path.name}'.") from exc
+
+    return {
+        "file_count": len(members),
+        "class_counts": dict(sorted(class_counts.items())),
+        "dimensions": [
+            {"width": width, "height": height, "count": count}
+            for (width, height), count in dimensions.most_common(20)
+        ],
+    }
+
+
+def inspect_time_series_csv(
+    contents: bytes,
+    target_column: str | None,
+) -> dict:
+    try:
+        dataframe = pd.read_csv(BytesIO(contents))
+    except Exception as exc:
+        raise ValueError("Unable to read the time-series CSV dataset.") from exc
+    if dataframe.empty:
+        raise ValueError("The time-series CSV dataset is empty.")
+    if len(dataframe) > settings.ai_training_max_rows:
+        raise ValueError("The time-series dataset exceeds the configured row limit.")
+
+    cleaned_target = str(target_column or "").strip()
+    target_exists = bool(cleaned_target and cleaned_target in dataframe.columns)
+    target_valid = False
+    target_error = None
+    if not cleaned_target:
+        target_error = "Select an explicit target column."
+    elif not target_exists:
+        target_error = f"Target column '{cleaned_target}' does not exist in the CSV."
+    else:
+        unique_targets = int(dataframe[cleaned_target].dropna().nunique())
+        target_valid = unique_targets >= 2
+        if not target_valid:
+            target_error = "Target column must contain at least two non-missing classes."
+
+    return {
+        "columns": [str(column) for column in dataframe.columns],
+        "row_count": len(dataframe),
+        "missing_values": {
+            str(column): int(count)
+            for column, count in dataframe.isna().sum().items()
+        },
+        "target_column": cleaned_target or None,
+        "target_valid": target_valid,
+        "target_error": target_error,
+    }
 
 
 # ============================================================
@@ -165,7 +257,15 @@ def _safe_extract_zip(
         "r",
     ) as archive:
 
-        for member in archive.infolist():
+        members = archive.infolist()
+
+        if len(members) > settings.ai_training_max_archive_entries:
+            raise ValueError("Image archive contains too many entries.")
+
+        if sum(member.file_size for member in members) > settings.ai_training_max_archive_bytes:
+            raise ValueError("Image archive is too large when extracted.")
+
+        for member in members:
 
             member_path = (
                 destination
@@ -816,10 +916,14 @@ def load_time_series_csv_dataset(
     # Target column
     # --------------------------------------------------------
 
-    if target_column is None:
+    if target_column is None or not str(target_column).strip():
+        raise ValueError(
+            "target_column is required for time-series training."
+        )
 
-        target_column = str(
-            dataframe.columns[-1]
+    if len(dataframe) > settings.ai_training_max_rows:
+        raise ValueError(
+            "The time-series dataset exceeds the configured row limit."
         )
 
 

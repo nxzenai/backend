@@ -33,6 +33,7 @@ from app.modules.autodl.algorithms.cnn import (
 from app.modules.autodl.algorithms.rnn import (
     train_rnn_model,
 )
+from app.modules.autodl.algorithms.transfer import train_resnet18_transfer_model
 
 from app.modules.autodl.constants import (
     DLArchitecture,
@@ -147,6 +148,9 @@ class AutoDLTrainer:
         architecture: str | DLArchitecture,
         dataset_path: str | Path,
         max_epochs: int | None = None,
+        target_column: str | None = None,
+        candidate_architectures: list[str] | None = None,
+        progress_callback=None,
     ) -> AutoDLResult:
 
         modality_name = (
@@ -160,6 +164,12 @@ class AutoDLTrainer:
                 architecture
             )
         )
+
+        candidates = [
+            self._normalize_architecture(item)
+            for item in (candidate_architectures or [architecture_name])
+        ]
+        candidates = list(dict.fromkeys(candidates))
 
         epochs = (
             self._normalize_epochs(
@@ -221,14 +231,13 @@ class AutoDLTrainer:
             == Modality.IMAGE.value
         ):
 
-            if (
-                architecture_name
-                != DLArchitecture.CNN.value
-            ):
+            if not set(candidates).issubset({
+                DLArchitecture.CNN.value,
+                DLArchitecture.RESNET18.value,
+            }):
 
                 raise ValueError(
-                    "IMAGE AutoDL currently "
-                    "supports CNN only."
+                    "IMAGE AutoDL supports cnn and resnet18 only."
                 )
 
 
@@ -241,8 +250,7 @@ class AutoDLTrainer:
                     load_image_zip_dataset(
                         dataset_path,
 
-                        image_size=
-                            self.config.image_size,
+                        image_size=(224 if DLArchitecture.RESNET18.value in candidates else self.config.image_size),
 
                         batch_size=
                             self.config.batch_size,
@@ -279,61 +287,54 @@ class AutoDLTrainer:
                     )
 
 
-                result = train_cnn_model(
+                training_results = []
+                failures: list[dict[str, Any]] = []
+                for candidate in candidates:
+                    try:
+                        if candidate == DLArchitecture.CNN.value:
+                            candidate_result = train_cnn_model(
+                                train_loader=prepared.train_loader,
+                                validation_loader=prepared.validation_loader,
+                                num_classes=prepared.num_classes,
+                                class_names=prepared.class_names,
+                                input_channels=prepared.input_channels,
+                                image_size=prepared.image_size,
+                                max_epochs=epochs,
+                                random_seed=self.config.random_seed,
+                                verbose=self.config.verbose,
+                                progress_callback=progress_callback,
+                            )
+                        else:
+                            candidate_result = train_resnet18_transfer_model(
+                                train_loader=prepared.train_loader,
+                                validation_loader=prepared.validation_loader,
+                                num_classes=prepared.num_classes,
+                                class_names=prepared.class_names,
+                                image_size=prepared.image_size,
+                                max_epochs=epochs,
+                                random_seed=self.config.random_seed,
+                                progress_callback=progress_callback,
+                            )
+                        training_results.append(candidate_result)
+                    except Exception as exc:
+                        failures.append({"model_name": candidate, "success": False, "error": str(exc)[:300]})
 
-                    train_loader=
-                        prepared.train_loader,
-
-                    validation_loader=
-                        prepared.validation_loader,
-
-                    num_classes=
-                        prepared.num_classes,
-
-                    class_names=
-                        prepared.class_names,
-
-                    input_channels=
-                        prepared.input_channels,
-
-                    image_size=
-                        prepared.image_size,
-
-                    max_epochs=
-                        epochs,
-
-                    random_seed=
-                        self.config.random_seed,
-
-                    verbose=
-                        self.config.verbose,
-                )
-
-
+                if not training_results:
+                    raise RuntimeError("All selected image architectures failed to train.")
+                training_results.sort(key=lambda item: (item.accuracy, -item.final_loss), reverse=True)
+                result = training_results[0]
                 leaderboard = [
                     {
-                        "rank":
-                            1,
-
-                        "model_name":
-                            result.model_name,
-
-                        "score":
-                            result.accuracy,
-
-                        "accuracy":
-                            result.accuracy,
-
-                        "final_loss":
-                            result.final_loss,
-
-                        "training_time":
-                            result.training_time,
-
-                        "success":
-                            result.success,
+                        "rank": rank,
+                        "model_name": item.model_name,
+                        "score": item.accuracy,
+                        "accuracy": item.accuracy,
+                        "final_loss": item.final_loss,
+                        "training_time": item.training_time,
+                        "success": item.success,
                     }
-                ]
+                    for rank, item in enumerate(training_results, 1)
+                ] + failures
 
 
                 dataset_summary = {
@@ -400,9 +401,7 @@ class AutoDLTrainer:
                     dataset_summary=
                         dataset_summary,
 
-                    training_results=[
-                        result
-                    ],
+                    training_results=training_results,
 
                     training_info=
                         training_info,
@@ -446,7 +445,7 @@ class AutoDLTrainer:
                     dataset_path,
 
                     target_column=
-                        None,
+                        target_column,
 
                     sequence_length=
                         self.config
@@ -562,6 +561,9 @@ class AutoDLTrainer:
                 verbose=
                     self.config
                     .verbose,
+
+                progress_callback=
+                    progress_callback,
             )
 
 
@@ -806,6 +808,7 @@ class AutoDLTrainer:
 
         implemented = {
             DLArchitecture.CNN.value,
+            DLArchitecture.RESNET18.value,
             DLArchitecture.RNN.value,
         }
 
@@ -817,7 +820,7 @@ class AutoDLTrainer:
                 f"'{value}' is not currently "
                 "implemented. "
                 "Available architectures: "
-                "cnn, rnn."
+                "cnn, resnet18, rnn."
             )
 
 

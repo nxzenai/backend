@@ -19,9 +19,9 @@ def validate_nlp_request(request: AutoNLPJobCreateRequest) -> None:
     if not request.text_column.strip():
         raise TextDatasetValidationError("Text column is required.")
         
-    if request.task in [NLPTask.TEXT_CLASSIFICATION, NLPTask.NAMED_ENTITY_RECOGNITION]:
+    if request.task in [NLPTask.TEXT_CLASSIFICATION, NLPTask.SENTIMENT_ANALYSIS]:
         if not request.target_column:
             raise TextDatasetValidationError(f"Task {request.task.value} requires a target_column.")
             
-    if request.architecture not in [NLPArchitecture.LSTM, NLPArchitecture.RNN]:
+    if request.architecture != NLPArchitecture.LSTM:
         raise TextDatasetValidationError(f"Architecture {request.architecture.value} is not supported for NLP.")

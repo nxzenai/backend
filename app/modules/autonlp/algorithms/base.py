@@ -84,6 +84,8 @@ class NLPModelResult:
     class_metrics: list[dict] = field(
         default_factory=list
     )
+    roc_auc: float | None = None
+    roc_curve: dict[str, list[float]] | None = None
 
     # -----------------------------------------------------
     # Artifact / Inference Data
@@ -94,6 +96,8 @@ class NLPModelResult:
     model_config: dict[str, Any] = field(
         default_factory=dict
     )
+    model: Any | None = None
+    tokenizer_object: Any | None = None
 
 
 ##########################################################

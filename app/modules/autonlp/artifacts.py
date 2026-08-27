@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
 from typing import Any
 
 import torch
+from transformers import AutoModelForSequenceClassification, AutoTokenizer
+from app.core.experiment_manifest import write_experiment_manifest
+from app.core.artifact_storage import get_artifact_storage
 
 from app.modules.autonlp.algorithms.lstm import (
     LSTMTextClassifier,
@@ -14,11 +16,6 @@ from app.modules.autonlp.algorithms.lstm import (
 ##########################################################
 # Artifact Paths
 ##########################################################
-
-ARTIFACT_ROOT = Path(
-    "artifacts"
-) / "autonlp"
-
 
 ##########################################################
 # Artifact Save
@@ -32,6 +29,11 @@ def save_autonlp_artifact(
     label_classes: list[str],
     oov_token: str,
     max_sequence_length: int,
+    dataset_hash: str = "unknown",
+    task: str = "text_classification",
+    random_seed: int = 42,
+    metrics: dict[str, Any] | None = None,
+    leaderboard: list[dict[str, Any]] | None = None,
 ) -> dict[str, str]:
     """
     Saves everything required to rebuild and use
@@ -45,10 +47,7 @@ def save_autonlp_artifact(
     metadata.json
     """
 
-    artifact_dir = (
-        ARTIFACT_ROOT
-        / job_id
-    )
+    artifact_dir = get_artifact_storage().artifact_directory("autonlp", job_id)
 
     artifact_dir.mkdir(
         parents=True,
@@ -153,6 +152,23 @@ def save_autonlp_artifact(
             indent=2,
         )
 
+    manifest = write_experiment_manifest(
+        artifact_dir,
+        dataset_hash=dataset_hash,
+        task=task,
+        model_configuration={"architecture": "lstm", **model_config},
+        random_seed=random_seed,
+        preprocessing_configuration={
+            "vocabulary_scope": "training_only",
+            "oov_token": oov_token,
+            "max_sequence_length": max_sequence_length,
+        },
+        training_metrics={**(metrics or {}), "leaderboard": leaderboard or []},
+        integrity_paths=[model_path, tokenizer_path, labels_path, metadata_path],
+        packages=["torch", "transformers", "numpy", "scikit-learn"],
+    )
+    get_artifact_storage().commit("autonlp", job_id, artifact_dir)
+
 
     return {
         "artifact_id":
@@ -172,6 +188,63 @@ def save_autonlp_artifact(
             str(
                 metadata_path
             ),
+        "model_version_id": manifest["model_version_id"],
+        "artifact_integrity_sha256": manifest["artifact_integrity_sha256"],
+    }
+
+
+def save_transformer_artifact(
+    *,
+    job_id: str,
+    model,
+    tokenizer,
+    model_config: dict[str, Any],
+    label_classes: list[str],
+    dataset_hash: str,
+    task: str,
+    random_seed: int,
+    metrics: dict[str, Any],
+    leaderboard: list[dict[str, Any]],
+) -> dict[str, str]:
+    artifact_dir = get_artifact_storage().artifact_directory("autonlp", job_id)
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    transformer_dir = artifact_dir / "transformer"
+    model.save_pretrained(transformer_dir)
+    tokenizer.save_pretrained(transformer_dir)
+    labels_path = artifact_dir / "labels.json"
+    labels_path.write_text(json.dumps(label_classes, indent=2, ensure_ascii=False), encoding="utf-8")
+    metadata = {
+        "job_id": job_id,
+        "model_name": "DistilBERT",
+        "architecture": "distilbert",
+        "model_config": model_config,
+        "max_sequence_length": int(model_config.get("max_sequence_length", 128)),
+    }
+    metadata_path = artifact_dir / "metadata.json"
+    metadata_path.write_text(json.dumps(metadata, indent=2, ensure_ascii=False), encoding="utf-8")
+    integrity_paths = [labels_path, metadata_path] + [path for path in transformer_dir.rglob("*") if path.is_file()]
+    manifest = write_experiment_manifest(
+        artifact_dir,
+        dataset_hash=dataset_hash,
+        task=task,
+        model_configuration=model_config,
+        random_seed=random_seed,
+        preprocessing_configuration={
+            "tokenizer": model_config.get("pretrained_model_name"),
+            "tokenizer_scope": "pretrained_fixed_vocabulary",
+            "max_sequence_length": model_config.get("max_sequence_length"),
+        },
+        training_metrics={**metrics, "leaderboard": leaderboard},
+        integrity_paths=integrity_paths,
+        packages=["torch", "transformers", "numpy", "scikit-learn"],
+    )
+    get_artifact_storage().commit("autonlp", job_id, artifact_dir)
+    return {
+        "artifact_id": job_id,
+        "artifact_path": str(artifact_dir),
+        "metadata_path": str(metadata_path),
+        "model_version_id": manifest["model_version_id"],
+        "artifact_integrity_sha256": manifest["artifact_integrity_sha256"],
     }
 
 
@@ -186,10 +259,7 @@ def load_autonlp_artifact(
     Loads a previously saved AutoNLP artifact.
     """
 
-    artifact_dir = (
-        ARTIFACT_ROOT
-        / job_id
-    )
+    artifact_dir = get_artifact_storage().artifact_directory("autonlp", job_id)
 
 
     if not artifact_dir.exists():
@@ -198,6 +268,23 @@ def load_autonlp_artifact(
             f"for job '{job_id}'."
         )
 
+
+    metadata_path = artifact_dir / "metadata.json"
+    if not metadata_path.exists():
+        raise FileNotFoundError("AutoNLP artifact is incomplete. Missing file: metadata.json")
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    labels_path = artifact_dir / "labels.json"
+    if str(metadata.get("architecture", "lstm")).lower() == "distilbert":
+        transformer_dir = artifact_dir / "transformer"
+        if not transformer_dir.exists() or not labels_path.exists():
+            raise FileNotFoundError("AutoNLP transformer artifact is incomplete.")
+        return {
+            "model": AutoModelForSequenceClassification.from_pretrained(transformer_dir),
+            "tokenizer": AutoTokenizer.from_pretrained(transformer_dir),
+            "label_classes": json.loads(labels_path.read_text(encoding="utf-8")),
+            "metadata": metadata,
+            "artifact_path": str(artifact_dir),
+        }
 
     model_path = (
         artifact_dir
@@ -213,12 +300,6 @@ def load_autonlp_artifact(
         artifact_dir
         / "labels.json"
     )
-
-    metadata_path = (
-        artifact_dir
-        / "metadata.json"
-    )
-
 
     for required_path in [
         model_path,
@@ -238,16 +319,6 @@ def load_autonlp_artifact(
     # -------------------------------------------------
     # Metadata
     # -------------------------------------------------
-
-    with metadata_path.open(
-        "r",
-        encoding="utf-8",
-    ) as file:
-
-        metadata = json.load(
-            file
-        )
-
 
     # -------------------------------------------------
     # Tokenizer
@@ -375,5 +446,6 @@ def load_autonlp_artifact(
 
 __all__ = [
     "save_autonlp_artifact",
+    "save_transformer_artifact",
     "load_autonlp_artifact",
 ]
