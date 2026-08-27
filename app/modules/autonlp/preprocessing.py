@@ -29,6 +29,8 @@ class ProcessedNLPDataset:
     label_classes: list[str]
     label_encoder: Any
     tokenizer: dict[str, int]
+    train_text: list[str]
+    test_text: list[str]
 
 
 def build_tokenizer(
@@ -117,46 +119,38 @@ def preprocess_text_dataset(
             "At least 10 samples are required."
         )
 
-    # --------------------------------------------
-    # Encode labels
-    # --------------------------------------------
-
-    label_encoder = LabelEncoder()
-
-    encoded_labels = label_encoder.fit_transform(
-        labels
-    )
-
-    # --------------------------------------------
-    # Build vocabulary
-    # --------------------------------------------
-
-    tokenizer = build_tokenizer(
+    # Split raw samples before fitting any learned preprocessing.
+    train_text, test_text, train_labels, test_labels = train_test_split(
         text_data,
-        config,
-    )
-
-    sequences = texts_to_sequences(
-        text_data,
-        tokenizer,
-        config.oov_token,
-    )
-
-    padded_sequences = pad_sequences(
-        sequences,
-        config.max_sequence_length,
-    )
-
-    # --------------------------------------------
-    # Train / test split
-    # --------------------------------------------
-
-    X_train, X_test, y_train, y_test = train_test_split(
-        padded_sequences,
-        encoded_labels,
+        labels,
         test_size=config.test_size,
         random_state=config.random_state,
-        stratify=encoded_labels,
+        stratify=labels,
+    )
+
+    label_encoder = LabelEncoder()
+    y_train = label_encoder.fit_transform(train_labels)
+    y_test = label_encoder.transform(test_labels)
+
+    # Vocabulary is learned from training text only. Validation text
+    # uses the saved OOV token, matching prediction behavior.
+    tokenizer = build_tokenizer(train_text, config)
+
+    X_train = pad_sequences(
+        texts_to_sequences(
+            train_text,
+            tokenizer,
+            config.oov_token,
+        ),
+        config.max_sequence_length,
+    )
+    X_test = pad_sequences(
+        texts_to_sequences(
+            test_text,
+            tokenizer,
+            config.oov_token,
+        ),
+        config.max_sequence_length,
     )
 
     return ProcessedNLPDataset(
@@ -170,6 +164,8 @@ def preprocess_text_dataset(
         label_classes=label_encoder.classes_.tolist(),
         label_encoder=label_encoder,
         tokenizer=tokenizer,
+        train_text=list(train_text),
+        test_text=list(test_text),
     )
 
 

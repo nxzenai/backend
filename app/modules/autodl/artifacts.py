@@ -25,17 +25,20 @@ from typing import Any
 
 import torch
 from torch import nn
+from app.core.experiment_manifest import write_experiment_manifest
+from app.core.artifact_storage import get_artifact_storage
+from app.core.config.settings import settings
+from app.modules.autodl.mongo_artifacts import (
+    artifact_directory as mongo_artifact_directory,
+    artifact_reference as mongo_artifact_reference,
+    commit_artifact as commit_mongo_artifact,
+)
 
 
 # ============================================================
 # Constants
 # ============================================================
 
-
-AUTODL_ARTIFACT_ROOT = (
-    Path("artifacts")
-    / "autodl"
-)
 
 MODEL_FILENAME = "model.pt"
 
@@ -57,6 +60,8 @@ class AutoDLArtifact:
     metadata_path: str
     classes_path: str
     status: str = "ready"
+    model_version_id: str | None = None
+    artifact_integrity_sha256: str | None = None
 
 
 @dataclass
@@ -92,10 +97,15 @@ def _artifact_directory(
             "Invalid AutoDL artifact id."
         )
 
-    return (
-        AUTODL_ARTIFACT_ROOT
-        / safe_id
-    )
+    if settings.autodl_execution_mode.strip().lower() == "direct":
+        return mongo_artifact_directory(safe_id)
+    return get_artifact_storage().artifact_directory("autodl", safe_id)
+
+
+def _artifact_location(artifact_id: str, directory: Path) -> str:
+    if settings.autodl_execution_mode.strip().lower() == "direct":
+        return mongo_artifact_reference(artifact_id)
+    return str(directory)
 
 
 def _json_safe(
@@ -175,6 +185,10 @@ def save_autodl_artifact(
     dataset_summary: dict[str, Any] | None = None,
     training_info: dict[str, Any] | None = None,
     training_history: dict[str, Any] | None = None,
+    dataset_hash: str = "unknown",
+    random_seed: int = 42,
+    task: str = "image_classification",
+    leaderboard: list[dict[str, Any]] | None = None,
 ) -> AutoDLArtifact:
     """
     Persist a trained AutoDL model and its inference metadata.
@@ -284,6 +298,8 @@ def save_autodl_artifact(
 
         "training_history":
             training_history or {},
+
+        "leaderboard": leaderboard or [],
     }
 
     metadata_path.write_text(
@@ -297,11 +313,29 @@ def save_autodl_artifact(
         encoding="utf-8",
     )
 
+    manifest = write_experiment_manifest(
+        artifact_directory,
+        dataset_hash=dataset_hash,
+        task=task,
+        model_configuration={"architecture": architecture, **model_config},
+        random_seed=random_seed,
+        preprocessing_configuration={
+            key: model_config.get(key)
+            for key in ("image_size", "input_channels", "sequence_length", "feature_names", "feature_mean", "feature_std")
+            if key in model_config
+        },
+        training_metrics=metrics or {},
+        integrity_paths=[model_path, metadata_path, classes_path],
+        packages=["torch", "torchvision", "numpy", "scikit-learn"],
+    )
+    if settings.autodl_execution_mode.strip().lower() == "direct":
+        commit_mongo_artifact(artifact_id, artifact_directory)
+    else:
+        get_artifact_storage().commit("autodl", artifact_id, artifact_directory)
+
     return AutoDLArtifact(
         artifact_id=artifact_id,
-        artifact_path=str(
-            artifact_directory
-        ),
+        artifact_path=_artifact_location(artifact_id, artifact_directory),
         model_path=str(
             model_path
         ),
@@ -312,6 +346,8 @@ def save_autodl_artifact(
             classes_path
         ),
         status="ready",
+        model_version_id=manifest["model_version_id"],
+        artifact_integrity_sha256=manifest["artifact_integrity_sha256"],
     )
 
 
@@ -375,6 +411,12 @@ def load_autodl_artifact(
         metadata_path.read_text(
             encoding="utf-8"
         )
+    )
+    manifest_path = artifact_directory / "experiment_manifest.json"
+    manifest = (
+        json.loads(manifest_path.read_text(encoding="utf-8"))
+        if manifest_path.exists()
+        else {}
     )
 
     class_names = json.loads(
@@ -440,6 +482,12 @@ def get_autodl_artifact_info(
             encoding="utf-8"
         )
     )
+    manifest_path = artifact_directory / "experiment_manifest.json"
+    manifest = (
+        json.loads(manifest_path.read_text(encoding="utf-8"))
+        if manifest_path.exists()
+        else {}
+    )
 
     return {
         "artifact_id":
@@ -458,10 +506,9 @@ def get_autodl_artifact_info(
         "status":
             "ready",
 
-        "artifact_path":
-            str(
-                artifact_directory
-            ),
+        "artifact_path": _artifact_location(artifact_id, artifact_directory),
+        "model_version_id": manifest.get("model_version_id"),
+        "artifact_integrity_sha256": manifest.get("artifact_integrity_sha256"),
     }
 
 

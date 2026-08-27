@@ -13,3 +13,4 @@ class TrainingTimeoutError(AutoDLException): pass
 class InvalidArchitectureError(AutoDLException): pass
 class ModelArtifactError(AutoDLException): pass
 class QueueDispatchError(AutoDLException): pass
+class AutoDLJobCancelledError(AutoDLException): pass

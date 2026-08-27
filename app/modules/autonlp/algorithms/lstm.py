@@ -11,12 +11,15 @@ import time
 import numpy as np
 import torch
 import torch.nn as nn
+from app.core.ai_device import resolve_execution_device
 
 from sklearn.metrics import (
     accuracy_score,
     classification_report,
     confusion_matrix,
     precision_recall_fscore_support,
+    roc_auc_score,
+    roc_curve,
 )
 
 from app.modules.autonlp.algorithms.base import (
@@ -200,6 +203,8 @@ def train_lstm_model(
         )
     )
 
+    progress_callback = config.get("progress_callback")
+
 
     # -------------------------------------------------
     # Reproducibility
@@ -218,11 +223,7 @@ def train_lstm_model(
     # Device
     # -------------------------------------------------
 
-    device = torch.device(
-        "cuda"
-        if torch.cuda.is_available()
-        else "cpu"
-    )
+    device = resolve_execution_device()
 
 
     # -------------------------------------------------
@@ -443,6 +444,16 @@ def train_lstm_model(
             )
         )
 
+        if progress_callback is not None:
+            progress_callback({
+                "current_epoch": epoch + 1,
+                "total_epochs": epochs,
+                "train_loss": train_loss_history[-1],
+                "validation_loss": validation_loss_history[-1],
+                "train_accuracy": train_accuracy_history[-1],
+                "validation_accuracy": validation_accuracy_history[-1],
+            })
+
 
         # ---------------------------------------------
         # Best Model + Early Stopping
@@ -659,6 +670,20 @@ def train_lstm_model(
             }
         )
 
+    binary_roc_auc = None
+    binary_roc_curve = None
+    if num_classes == 2 and probabilities:
+        false_positive_rate, true_positive_rate, thresholds = roc_curve(
+            y_true,
+            np.asarray(probabilities)[:, 1],
+        )
+        binary_roc_auc = round(float(roc_auc_score(y_true, np.asarray(probabilities)[:, 1])), 6)
+        binary_roc_curve = {
+            "false_positive_rate": false_positive_rate.tolist(),
+            "true_positive_rate": true_positive_rate.tolist(),
+            "thresholds": [float(value) if np.isfinite(value) else 1.0 for value in thresholds],
+        }
+
 
     # -------------------------------------------------
     # Human-Friendly Assessment
@@ -824,6 +849,9 @@ def train_lstm_model(
 
         class_metrics=
             class_metrics,
+
+        roc_auc=binary_roc_auc,
+        roc_curve=binary_roc_curve,
 
         # ---------------------------------------------
         # Artifact Support
