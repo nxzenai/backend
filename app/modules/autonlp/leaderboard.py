@@ -5,6 +5,7 @@ AutoNLP Leaderboard
 
 This module provides enterprise-grade leaderboard
 generation and ranking for all trained NLP models.
+Deprecated: the authoritative validation ranking lives in AutoNLPTrainer.
 """
 
 from __future__ import annotations
@@ -20,7 +21,6 @@ from app.modules.autonlp.metrics import (
 
 class NLPLeaderboardType(str, Enum):
     CLASSIFICATION = "classification"
-    NER = "ner"
 
 @dataclass
 class NLPLeaderboardConfig:

@@ -1,0 +1,17 @@
+{
+  "job_id": "be6ddf47-dd03-4e74-99aa-76f4013b8a4d",
+  "model_name": "GRU",
+  "architecture": "gru",
+  "model_config": {
+    "architecture": "gru",
+    "vocab_size": 25000,
+    "num_classes": 3,
+    "embedding_dim": 64,
+    "hidden_dim": 64,
+    "max_sequence_length": 102,
+    "padding_idx": 0,
+    "batch_size": 32
+  },
+  "oov_token": "<OOV>",
+  "max_sequence_length": 102
+}

@@ -267,10 +267,6 @@ class Settings(BaseSettings):
         default="sqlite:///./autodl.db",
         alias="AUTODL_DATABASE_URL",
     )
-    autonlp_database_url: str = Field(
-        default="sqlite:///./autonlp.db",
-        alias="AUTONLP_DATABASE_URL",
-    )
     ai_registry_database_url: str = Field(
         default="sqlite:///./ai_registry.db",
         alias="AI_REGISTRY_DATABASE_URL",

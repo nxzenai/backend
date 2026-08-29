@@ -4,6 +4,7 @@ NxZen AI Studio
 AutoNLP Metrics
 
 Enterprise metric contracts used by the AutoNLP module.
+Deprecated: retained for compatibility; active metrics are produced by trainer adapters.
 
 Supported Tasks
 ---------------
