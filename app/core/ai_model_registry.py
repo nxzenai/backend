@@ -241,6 +241,11 @@ def change_stage(model_id: str, actor_id: str, stage: str, *, admin: bool = Fals
             raise LookupError("Model not found.")
         if stage == "production" and not admin:
             raise PermissionError("Only an administrator can promote a model to production.")
+        if stage == "production" and model.module == "autonlp":
+            result = ((model.configuration or {}).get("result") or {})
+            readiness = (result.get("metrics") or {}).get("readiness")
+            if readiness == "not_reliable":
+                raise ValueError("This AutoNLP model is not reliable enough for production promotion.")
         previous = model.lifecycle_stage
         if previous == "production" and stage != "production" and not admin:
             raise PermissionError("Only an administrator can change a production model.")

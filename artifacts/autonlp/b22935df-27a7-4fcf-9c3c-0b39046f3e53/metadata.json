@@ -1,0 +1,47 @@
+{
+  "artifact_key": "b22935df-27a7-4fcf-9c3c-0b39046f3e53",
+  "model_name": "TF-IDF + Naive Bayes",
+  "architecture": "naive_bayes",
+  "artifact_type": "classical_sklearn",
+  "model_config": {
+    "architecture": "naive_bayes",
+    "model_name": "TF-IDF + Naive Bayes",
+    "artifact_type": "classical_sklearn",
+    "num_classes": 4,
+    "temperature": 0.5,
+    "score_calibrated": true,
+    "vectorizer": {
+      "type": "tfidf",
+      "lowercase": true,
+      "analyzer": "word",
+      "ngram_range": [
+        1,
+        2
+      ],
+      "sublinear_tf": true,
+      "min_df": 2,
+      "max_features": 25000,
+      "fitted_feature_count": 642,
+      "vocabulary_scope": "training_only"
+    }
+  },
+  "preprocessing": {
+    "preprocessing_type": "sklearn_tfidf",
+    "text_pipeline": "sklearn_tfidf_word_v1",
+    "unicode_normalization": "NFKC",
+    "whitespace_normalization": true,
+    "lowercase": true,
+    "analyzer": "word",
+    "ngram_range": [
+      1,
+      2
+    ],
+    "vocabulary_scope": "training_only"
+  },
+  "label_display_mapping": {
+    "finance": "finance",
+    "health": "health",
+    "sports": "sports",
+    "technology": "technology"
+  }
+}

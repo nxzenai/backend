@@ -1,0 +1,17 @@
+{
+  "artifact_key": "7b4abca6-eb88-4cac-bc04-19500f127f9d",
+  "model_name": "BiLSTM",
+  "architecture": "bilstm",
+  "model_config": {
+    "architecture": "bilstm",
+    "vocab_size": 9588,
+    "num_classes": 3,
+    "embedding_dim": 64,
+    "hidden_dim": 64,
+    "max_sequence_length": 42,
+    "padding_idx": 0,
+    "batch_size": 32
+  },
+  "oov_token": "<OOV>",
+  "max_sequence_length": 42
+}

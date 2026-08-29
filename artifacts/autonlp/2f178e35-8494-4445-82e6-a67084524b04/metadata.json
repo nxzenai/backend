@@ -1,0 +1,17 @@
+{
+  "job_id": "2f178e35-8494-4445-82e6-a67084524b04",
+  "model_name": "LSTM",
+  "architecture": "lstm",
+  "model_config": {
+    "architecture": "lstm",
+    "vocab_size": 174,
+    "num_classes": 3,
+    "embedding_dim": 64,
+    "hidden_dim": 64,
+    "max_sequence_length": 17,
+    "padding_idx": 0,
+    "batch_size": 32
+  },
+  "oov_token": "<OOV>",
+  "max_sequence_length": 17
+}

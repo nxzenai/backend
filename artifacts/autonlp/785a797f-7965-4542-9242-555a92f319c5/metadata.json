@@ -1,0 +1,37 @@
+{
+  "artifact_key": "785a797f-7965-4542-9242-555a92f319c5",
+  "model_name": "LSTM",
+  "architecture": "lstm",
+  "model_config": {
+    "architecture": "lstm",
+    "vocab_size": 769,
+    "num_classes": 3,
+    "embedding_dim": 64,
+    "hidden_dim": 64,
+    "max_sequence_length": 44,
+    "padding_idx": 0,
+    "batch_size": 32,
+    "dropout": 0.3,
+    "gradient_clip": 1.0,
+    "embedding": {
+      "type": "random",
+      "dimension": 64,
+      "freeze_policy": "trainable",
+      "pretrained_requested": "glove_6b_100d",
+      "fallback_reason": "AUTONLP_GLOVE_PATH is not configured."
+    },
+    "temperature": 0.619938,
+    "score_calibrated": true
+  },
+  "oov_token": "<OOV>",
+  "max_sequence_length": 44,
+  "preprocessing": {
+    "text_pipeline": "canonical_words_v1",
+    "unicode_normalization": "NFKC",
+    "lowercase": true,
+    "whitespace_normalization": true,
+    "tokenization": "unicode_words_with_internal_apostrophes",
+    "padding": "post",
+    "truncation": "post"
+  }
+}

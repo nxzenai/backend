@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+
 from typing import Literal
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
@@ -196,6 +198,19 @@ async def registry_retrain(
     response = None
     active_service = autodl_service if model.module == "autodl" else autonlp_service
     try:
+        if model.module == "autonlp":
+            dataframe = await load_nlp_dataset(file, contents)
+            result = await asyncio.to_thread(
+                autonlp_service.train_model,
+                dataframe=dataframe, filename=filename, owner_id=model.owner_id,
+                text_column=config["text_column"], target_column=config["target_column"],
+                task=NLPTask(config["task"]), max_epochs=int(config.get("max_epochs", 30)),
+                candidate_architectures=config.get("candidate_architectures") or [model.model_type],
+                strategy=config.get("strategy", "custom"), dataset_hash=config["dataset_hash"],
+                source_model_id=model.id,
+            )
+            record_retraining(model.id, actor, result.model_id)
+            return result
         if model.module == "autodl":
             response = autodl_service.create_autodl_job(
                 filename=filename, owner_id=model.owner_id,
@@ -203,14 +218,6 @@ async def registry_retrain(
                 max_epochs=int(config.get("max_epochs", 10)),
                 target_column=config.get("target_column"),
                 candidate_architectures=config.get("candidate_architectures") or [config["architecture"]],
-            )
-        elif model.module == "autonlp":
-            dataframe = await load_nlp_dataset(file, contents)
-            response = autonlp_service.create_autonlp_job(
-                dataframe=dataframe, filename=filename, owner_id=model.owner_id,
-                text_column=config["text_column"], target_column=config["target_column"],
-                task=NLPTask(config["task"]), max_epochs=int(config.get("max_epochs", 30)),
-                candidate_architectures=config.get("candidate_architectures") or [model.model_type],
             )
         else:
             raise ValueError("Unsupported registry module.")
