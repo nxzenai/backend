@@ -1,0 +1,17 @@
+{
+  "artifact_key": "7ed840a0-e4e6-42ab-ab29-90fa3fb1f6a9",
+  "model_name": "LSTM",
+  "architecture": "lstm",
+  "model_config": {
+    "architecture": "lstm",
+    "vocab_size": 1131,
+    "num_classes": 3,
+    "embedding_dim": 64,
+    "hidden_dim": 64,
+    "max_sequence_length": 44,
+    "padding_idx": 0,
+    "batch_size": 32
+  },
+  "oov_token": "<OOV>",
+  "max_sequence_length": 44
+}

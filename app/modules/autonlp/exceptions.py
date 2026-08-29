@@ -42,27 +42,6 @@ class TextDatasetValidationError(AutoNLPException):
 
 
 ##########################################################
-# Job Exceptions
-##########################################################
-
-class AutoNLPJobNotFoundError(AutoNLPException):
-    """
-    Raised when an AutoNLP job does not exist.
-    """
-
-    pass
-
-
-class InvalidJobStateError(AutoNLPException):
-    """
-    Raised when an operation is attempted
-    on a job in an invalid state.
-    """
-
-    pass
-
-
-##########################################################
 # Training Exceptions
 ##########################################################
 
@@ -102,13 +81,3 @@ class ModelArtifactError(AutoNLPException):
     pass
 
 
-##########################################################
-# Queue Exceptions
-##########################################################
-
-class QueueDispatchError(AutoNLPException):
-    """
-    Raised when a training job cannot be dispatched.
-    """
-
-    pass

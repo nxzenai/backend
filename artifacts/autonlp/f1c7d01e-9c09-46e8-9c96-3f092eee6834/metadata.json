@@ -1,0 +1,45 @@
+{
+  "artifact_key": "f1c7d01e-9c09-46e8-9c96-3f092eee6834",
+  "model_name": "TF-IDF + Naive Bayes",
+  "architecture": "naive_bayes",
+  "artifact_type": "classical_sklearn",
+  "model_config": {
+    "architecture": "naive_bayes",
+    "model_name": "TF-IDF + Naive Bayes",
+    "artifact_type": "classical_sklearn",
+    "num_classes": 2,
+    "temperature": 0.5,
+    "score_calibrated": true,
+    "vectorizer": {
+      "type": "tfidf",
+      "lowercase": true,
+      "analyzer": "word",
+      "ngram_range": [
+        1,
+        2
+      ],
+      "sublinear_tf": true,
+      "min_df": 2,
+      "max_features": 25000,
+      "fitted_feature_count": 933,
+      "vocabulary_scope": "training_only"
+    }
+  },
+  "preprocessing": {
+    "preprocessing_type": "sklearn_tfidf",
+    "text_pipeline": "sklearn_tfidf_word_v1",
+    "unicode_normalization": "NFKC",
+    "whitespace_normalization": true,
+    "lowercase": true,
+    "analyzer": "word",
+    "ngram_range": [
+      1,
+      2
+    ],
+    "vocabulary_scope": "training_only"
+  },
+  "label_display_mapping": {
+    "not_spam": "Not Spam",
+    "spam": "Spam"
+  }
+}
