@@ -6,9 +6,7 @@ AutoNLP Constants
 Defines the enums and constants used throughout the
 AutoNLP module.
 
-This module strictly supports sequence-based deep learning
-for text data. Classical ML belongs to AutoML, and spatial
-data (Image/Audio) belongs to AutoDL.
+This module supports supervised text-classification model families.
 """
 
 from __future__ import annotations
@@ -25,20 +23,8 @@ class NLPTask(str, Enum):
     """
     TEXT_CLASSIFICATION = "text_classification"
     SENTIMENT_ANALYSIS = "sentiment_analysis"
-
-##########################################################
-# Job Status
-##########################################################
-
-class JobStatus(str, Enum):
-    """
-    AutoNLP job lifecycle.
-    """
-    QUEUED = "queued"
-    PENDING = "pending"
-    RUNNING = "running"
-    COMPLETED = "completed"
-    FAILED = "failed"
+    INTENT_CLASSIFICATION = "intent_classification"
+    SPAM_CLASSIFICATION = "spam_classification"
 
 ##########################################################
 # Supported NLP Architectures
@@ -46,26 +32,28 @@ class JobStatus(str, Enum):
 
 class NLPArchitecture(str, Enum):
     """
-    Deep learning architectures supported by AutoNLP.
-    Classical ML algorithms are intentionally excluded.
+    Trainable architectures supported by AutoNLP.
     """
+    LOGISTIC_REGRESSION = "logistic_regression"
+    LINEAR_SVM = "linear_svm"
+    NAIVE_BAYES = "naive_bayes"
+    SGD_CLASSIFIER = "sgd_classifier"
     LSTM = "lstm"
+    BILSTM = "bilstm"
+    GRU = "gru"
     DISTILBERT = "distilbert"
+    MINILM = "minilm"
 
 ##########################################################
 # Default Architectures
 ##########################################################
 
 DEFAULT_CLASSIFICATION_ARCHITECTURES = [
-    NLPArchitecture.LSTM,
-    NLPArchitecture.DISTILBERT,
+    NLPArchitecture.LOGISTIC_REGRESSION,
+    NLPArchitecture.LINEAR_SVM,
+    NLPArchitecture.NAIVE_BAYES,
+    NLPArchitecture.SGD_CLASSIFIER,
 ]
-
-##########################################################
-# Queue
-##########################################################
-
-TRAINING_QUEUE = "autonlp_gpu_training_queue"
 
 ##########################################################
 # Training Defaults

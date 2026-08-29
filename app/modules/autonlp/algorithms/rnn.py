@@ -2,6 +2,9 @@
 NxZen AI Studio
 
 AutoNLP Algorithm: RNN
+
+Deprecated: retained for source compatibility only. The authoritative recurrent
+training path is algorithms.lstm.train_recurrent_model.
 """
 
 from __future__ import annotations

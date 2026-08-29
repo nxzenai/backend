@@ -4,6 +4,7 @@ NxZen AI Studio
 AutoNLP Analyzer
 
 Analyzes AutoNLP training results and provides insights.
+Deprecated: not used by the authoritative AutoNLP service lifecycle.
 """
 
 from __future__ import annotations

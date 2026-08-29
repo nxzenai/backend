@@ -1,0 +1,30 @@
+{
+  "artifact_key": "81125a9d-4a4b-4d54-8914-8ecec7dcf61a",
+  "model_name": "GRU",
+  "architecture": "gru",
+  "model_config": {
+    "architecture": "gru",
+    "vocab_size": 769,
+    "num_classes": 3,
+    "embedding_dim": 64,
+    "hidden_dim": 64,
+    "max_sequence_length": 44,
+    "padding_idx": 0,
+    "batch_size": 32,
+    "dropout": 0.3,
+    "gradient_clip": 1.0,
+    "temperature": 0.05,
+    "score_calibrated": true
+  },
+  "oov_token": "<OOV>",
+  "max_sequence_length": 44,
+  "preprocessing": {
+    "text_pipeline": "canonical_words_v1",
+    "unicode_normalization": "NFKC",
+    "lowercase": true,
+    "whitespace_normalization": true,
+    "tokenization": "unicode_words_with_internal_apostrophes",
+    "padding": "post",
+    "truncation": "post"
+  }
+}

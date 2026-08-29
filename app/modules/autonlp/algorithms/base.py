@@ -86,6 +86,11 @@ class NLPModelResult:
     )
     roc_auc: float | None = None
     roc_curve: dict[str, list[float]] | None = None
+    validation_metrics: dict[str, Any] = field(default_factory=dict)
+    test_metrics: dict[str, Any] | None = None
+    architecture: str = "lstm"
+    eligible_for_selection: bool = True
+    selection_rejection_reason: str | None = None
 
     # -----------------------------------------------------
     # Artifact / Inference Data
