@@ -49,6 +49,8 @@ from app.modules.automl.exceptions import (
     PreprocessingError,
 )
 from app.modules.automl.schemas import PredictionValuesRequest
+from app.modules.auth.dependencies import get_current_user
+from app.modules.auth.models import UserModel
 from app.modules.automl.service import (
 
     AutoMLService,
@@ -104,6 +106,15 @@ def get_automl_service() -> AutoMLService:
     return AutoMLService(
         AutoMLServiceConfig()
     )
+
+
+def authenticated_owner(user: UserModel) -> str:
+    if not user.id:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authenticated user identity is unavailable.",
+        )
+    return str(user.id)
 
 
 # ================================================================
@@ -369,6 +380,7 @@ async def train_service(
 async def save_training_artifact(
     service: AutoMLService,
     result,
+    owner_id: str,
 ) -> str:
 
     if (
@@ -385,6 +397,11 @@ async def save_training_artifact(
         )
 
     try:
+        result.model_artifact.metadata = {
+            **(result.model_artifact.metadata or {}),
+            "owner_id": owner_id,
+            "ownership_version": 1,
+        }
         filepath = await asyncio.to_thread(
             service.save_best_model_unique,
             result,
@@ -435,6 +452,7 @@ async def train_dataset(
     service: AutoMLService = Depends(
         get_automl_service,
     ),
+    current_user: UserModel = Depends(get_current_user),
 ):
 
     try:
@@ -472,8 +490,7 @@ async def train_dataset(
         )
 
         model_filename = await save_training_artifact(
-            service,
-            result,
+            service, result, authenticated_owner(current_user),
         )
 
         return service.complete_response(
@@ -516,9 +533,8 @@ async def train_from_file(
     cluster_count_mode: Optional[str] = None,
     number_of_clusters: Optional[int] = None,
     require_prediction_support: Optional[bool] = None,
-    service: AutoMLService = Depends(
-        get_automl_service,
-    ),
+    service: AutoMLService = Depends(get_automl_service),
+    current_user: UserModel = Depends(get_current_user),
 ):
 
     try:
@@ -550,8 +566,7 @@ async def train_from_file(
         )
 
         model_filename = await save_training_artifact(
-            service,
-            result,
+            service, result, authenticated_owner(current_user),
         )
 
         return service.complete_response(
@@ -744,9 +759,8 @@ async def preview_dataset(
 async def predict(
     model_filename: str = Form(...),
     file: UploadFile = File(...),
-    service: AutoMLService = Depends(
-        get_automl_service,
-    ),
+    service: AutoMLService = Depends(get_automl_service),
+    current_user: UserModel = Depends(get_current_user),
 ):
 
     try:
@@ -757,9 +771,7 @@ async def predict(
             )
         )
 
-        artifact = service.load_artifact(
-            model_filename
-        )
+        artifact = service.load_owned_artifact(model_filename, authenticated_owner(current_user))
 
         result = await asyncio.to_thread(
             service.predict_artifact_values,
@@ -811,15 +823,12 @@ async def predict(
 )
 async def predict_values(
     request: PredictionValuesRequest,
-    service: AutoMLService = Depends(
-        get_automl_service,
-    ),
+    service: AutoMLService = Depends(get_automl_service),
+    current_user: UserModel = Depends(get_current_user),
 ):
 
     try:
-        artifact = service.load_artifact(
-            request.model_filename
-        )
+        artifact = service.load_owned_artifact(request.model_filename, authenticated_owner(current_user))
         service.ensure_prediction_supported(artifact)
         dataframe = pd.DataFrame(request.rows)
         result = await asyncio.to_thread(
@@ -871,16 +880,13 @@ async def predict_values(
     status_code=status.HTTP_200_OK,
 )
 async def list_models(
-    service: AutoMLService = Depends(
-        get_automl_service,
-    ),
+    service: AutoMLService = Depends(get_automl_service),
+    current_user: UserModel = Depends(get_current_user),
 ):
-
+    models = service.list_models_for_owner(authenticated_owner(current_user))
     return {
-        "models": service.list_models(),
-        "count": len(
-            service.list_models()
-        ),
+        "models": models,
+        "count": len(models),
     }
 
 
@@ -895,22 +901,28 @@ async def list_models(
 )
 async def model_information(
     filename: str,
-    service: AutoMLService = Depends(
-        get_automl_service
-    ),
+    service: AutoMLService = Depends(get_automl_service),
+    current_user: UserModel = Depends(get_current_user),
 ):
 
     try:
 
+        service.load_owned_artifact(filename, authenticated_owner(current_user))
         return service.saved_model_information(
             filename
         )
 
-    except FileNotFoundError as exc:
+    except (FileNotFoundError, ModelNotFoundError) as exc:
 
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=str(exc),
+        ) from exc
+
+    except ModelArtifactError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=exc.message,
         ) from exc
 
     except ValueError as exc:
@@ -931,13 +943,23 @@ async def model_information(
 )
 async def delete_model(
     filename: str,
-    service: AutoMLService = Depends(
-        get_automl_service,
-    ),
+    service: AutoMLService = Depends(get_automl_service),
+    current_user: UserModel = Depends(get_current_user),
 ):
 
     try:
+        service.load_owned_artifact(filename, authenticated_owner(current_user))
         deleted = service.delete_model(filename)
+    except ModelNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=exc.message,
+        ) from exc
+    except ModelArtifactError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=exc.message,
+        ) from exc
     except ValueError as exc:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,

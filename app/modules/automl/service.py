@@ -1095,6 +1095,23 @@ class AutoMLService:
             }
         )
 
+    def load_owned_artifact(self, filename: str, owner_id: str) -> ModelArtifact:
+        artifact = self.load_artifact(filename)
+        stored_owner = str((artifact.metadata or {}).get("owner_id") or "")
+        if not stored_owner or stored_owner != str(owner_id):
+            raise ModelNotFoundError(f"Model '{filename}' was not found.")
+        return artifact
+
+    def list_models_for_owner(self, owner_id: str) -> list[str]:
+        owned: list[str] = []
+        for filename in self.list_models():
+            try:
+                self.load_owned_artifact(filename, owner_id)
+                owned.append(filename)
+            except (ModelNotFoundError, ModelArtifactError, ValueError):
+                continue
+        return owned
+
     # ============================================================
     # LEADERBOARD
     # ============================================================
