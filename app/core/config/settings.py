@@ -361,6 +361,49 @@ class Settings(BaseSettings):
     )
 
     # -------------------------------------------------
+    # GenAI external inference
+    # -------------------------------------------------
+
+    genai_fast_base_url: str | None = Field(
+        default="http://127.0.0.1:8080/v1", alias="GENAI_FAST_BASE_URL",
+    )
+    genai_fast_api_key: str | None = Field(default=None, alias="GENAI_FAST_API_KEY")
+    genai_fast_model: str = Field(
+        default="Llama-3.2-1B-Instruct-Q4_K_M.gguf", alias="GENAI_FAST_MODEL",
+    )
+    genai_balanced_base_url: str | None = Field(default=None, alias="GENAI_BALANCED_BASE_URL")
+    genai_balanced_api_key: str | None = Field(default=None, alias="GENAI_BALANCED_API_KEY")
+    genai_balanced_model: str = Field(default="llama-balanced", alias="GENAI_BALANCED_MODEL")
+    genai_deep_base_url: str | None = Field(default=None, alias="GENAI_DEEP_BASE_URL")
+    genai_deep_api_key: str | None = Field(default=None, alias="GENAI_DEEP_API_KEY")
+    genai_deep_model: str = Field(default="llama-deep", alias="GENAI_DEEP_MODEL")
+    genai_fast_context_tokens: int = Field(default=4096, alias="GENAI_FAST_CONTEXT_TOKENS", ge=1024)
+    genai_balanced_context_tokens: int = Field(default=16384, alias="GENAI_BALANCED_CONTEXT_TOKENS", ge=1024)
+    genai_deep_context_tokens: int = Field(default=32768, alias="GENAI_DEEP_CONTEXT_TOKENS", ge=1024)
+    genai_fast_max_output_tokens: int = Field(default=512, alias="GENAI_FAST_MAX_OUTPUT_TOKENS", ge=64)
+    genai_balanced_max_output_tokens: int = Field(default=1200, alias="GENAI_BALANCED_MAX_OUTPUT_TOKENS", ge=64)
+    genai_deep_max_output_tokens: int = Field(default=2000, alias="GENAI_DEEP_MAX_OUTPUT_TOKENS", ge=64)
+    genai_inference_timeout_seconds: float = Field(default=120.0, alias="GENAI_INFERENCE_TIMEOUT_SECONDS", ge=5)
+    genai_tool_timeout_seconds: float = Field(default=20.0, alias="GENAI_TOOL_TIMEOUT_SECONDS", ge=2, le=120)
+    genai_web_search_provider: str = Field(default="generic", alias="GENAI_WEB_SEARCH_PROVIDER")
+    genai_web_search_url: str | None = Field(default=None, alias="GENAI_WEB_SEARCH_URL")
+    genai_web_search_api_key: str | None = Field(default=None, alias="GENAI_WEB_SEARCH_API_KEY")
+    genai_google_search_engine_id: str | None = Field(
+        default=None, alias="GENAI_GOOGLE_SEARCH_ENGINE_ID",
+    )
+    genai_web_max_results: int = Field(default=5, alias="GENAI_WEB_MAX_RESULTS", ge=1, le=10)
+    genai_weather_base_url: str | None = Field(
+        default="https://api.openweathermap.org/data/2.5", alias="GENAI_WEATHER_BASE_URL",
+    )
+    genai_weather_api_key: str | None = Field(default=None, alias="GENAI_WEATHER_API_KEY")
+    genai_weather_geocoding_url: str | None = Field(
+        default="https://api.openweathermap.org/geo/1.0/direct",
+        alias="GENAI_WEATHER_GEOCODING_URL",
+    )
+    genai_weather_units: str = Field(default="metric", alias="GENAI_WEATHER_UNITS")
+    genai_max_attachment_bytes: int = Field(default=10_485_760, alias="GENAI_MAX_ATTACHMENT_BYTES", ge=1024)
+
+    # -------------------------------------------------
     # Email
     # -------------------------------------------------
 
