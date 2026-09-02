@@ -1,30 +1,24 @@
-"""
-NxZen AI Studio
-
-GenAI Dependencies
-"""
-
 from __future__ import annotations
+
 from fastapi import Depends
-from sqlalchemy.orm import Session, sessionmaker
-from sqlalchemy import create_engine
-from app.modules.genai.models import Base
+from motor.motor_asyncio import AsyncIOMotorDatabase
 
-# Create an isolated SQLite DB for the AI module to bypass MongoDB
-engine = create_engine("sqlite:///./genai.db", connect_args={"check_same_thread": False})
-Base.metadata.create_all(bind=engine)
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
-
+from app.core.database import get_database
 from app.modules.genai.repository import GenAIRepository
 from app.modules.genai.service import GenAIService
+from app.modules.genai.lab_adapters import GenAILabAdapters
 
-def get_genai_service(db: Session = Depends(get_db)) -> GenAIService:
-    repo = GenAIRepository(db)
-    return GenAIService(repo=repo)
+
+async def get_genai_repository(
+    database: AsyncIOMotorDatabase = Depends(get_database),
+) -> GenAIRepository:
+    repository = GenAIRepository(database)
+    await repository.ensure_indexes()
+    return repository
+
+
+def get_genai_service(
+    repository: GenAIRepository = Depends(get_genai_repository),
+    database: AsyncIOMotorDatabase = Depends(get_database),
+) -> GenAIService:
+    return GenAIService(repository, GenAILabAdapters(database))
