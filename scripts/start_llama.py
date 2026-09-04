@@ -22,7 +22,7 @@ MODEL_ALIAS = os.getenv(
 
 MODEL_DIR = os.getenv(
     "GENAI_MODEL_DIR",
-    "/tmp/nxzenai-models",
+    "/opt/models",
 )
 
 LLAMA_PORT = os.getenv(
@@ -51,18 +51,18 @@ def find_model_file() -> str:
     return candidates[0]
 
 
-def main() -> None:
-    os.makedirs(MODEL_DIR, exist_ok=True)
+def resolve_model_path(filename: str) -> str:
+    model_path = os.path.join(MODEL_DIR, filename)
 
-    filename = find_model_file()
+    if os.path.exists(model_path):
+        print(
+            f"[GenAI] Model ready: {model_path}",
+            flush=True,
+        )
+        return model_path
 
     print(
-        f"[GenAI] Selected model: {filename}",
-        flush=True,
-    )
-
-    print(
-        "[GenAI] Downloading model if required...",
+        "[GenAI] Model not found locally. Downloading...",
         flush=True,
     )
 
@@ -77,6 +77,10 @@ def main() -> None:
         flush=True,
     )
 
+    return model_path
+
+
+def start_llama_server(model_path: str) -> subprocess.Popen:
     command = [
         "/usr/local/bin/llama-server",
         "--model",
@@ -101,7 +105,22 @@ def main() -> None:
         flush=True,
     )
 
-    process = subprocess.Popen(command)
+    return subprocess.Popen(command)
+
+
+def main() -> None:
+    os.makedirs(MODEL_DIR, exist_ok=True)
+
+    filename = find_model_file()
+
+    print(
+        f"[GenAI] Selected model: {filename}",
+        flush=True,
+    )
+
+    model_path = resolve_model_path(filename)
+
+    process = start_llama_server(model_path)
 
     while True:
         return_code = process.poll()
@@ -117,6 +136,7 @@ def main() -> None:
 if __name__ == "__main__":
     try:
         main()
+
     except Exception as exc:
         print(
             f"[GenAI] Inference startup failed: {exc}",
