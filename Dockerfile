@@ -38,6 +38,9 @@ ENV PYTHONUNBUFFERED=1
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1
 
+# Baked Llama model location
+ENV GENAI_MODEL_DIR=/opt/models
+
 WORKDIR /app
 
 RUN apt-get update \
@@ -47,7 +50,7 @@ RUN apt-get update \
         libstdc++6 \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy llama-server and required shared libraries
+# Copy llama-server
 COPY --from=llama-builder \
     /build/llama.cpp/build/bin/llama-server \
     /usr/local/bin/llama-server
@@ -63,13 +66,20 @@ RUN python -m pip install \
     --no-cache-dir \
     -r /app/requirements-docker.txt
 
-# CPU-only PyTorch for the CPU DigitalOcean server
+# CPU-only PyTorch for DigitalOcean CPU server
 RUN python -m pip install \
     --no-cache-dir \
     torch==2.11.0 \
     torchvision==0.26.0 \
     --index-url https://download.pytorch.org/whl/cpu
 
+# =========================================================
+# Download Fast Llama model during Docker build
+# =========================================================
+RUN mkdir -p /opt/models \
+    && python -c "from huggingface_hub import hf_hub_download; hf_hub_download(repo_id='hugging-quants/Llama-3.2-1B-Instruct-Q4_K_M-GGUF', filename='llama-3.2-1b-instruct-q4_k_m.gguf', local_dir='/opt/models')"
+
+# Copy application
 COPY . /app
 
 RUN chmod +x /app/start.sh
