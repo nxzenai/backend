@@ -41,6 +41,9 @@ ENV PIP_DISABLE_PIP_VERSION_CHECK=1
 # Baked Llama model location
 ENV GENAI_MODEL_DIR=/opt/models
 
+# llama.cpp runtime libraries
+ENV LD_LIBRARY_PATH=/usr/local/lib/llama
+
 WORKDIR /app
 
 RUN apt-get update \
@@ -50,28 +53,41 @@ RUN apt-get update \
         libstdc++6 \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy llama-server
+
+# =========================================================
+# Copy llama-server and required shared libraries
+# =========================================================
 COPY --from=llama-builder \
-    /build/llama.cpp/build/bin/llama-server \
+    /build/llama.cpp/build/bin/ \
+    /usr/local/lib/llama/
+
+RUN ln -s /usr/local/lib/llama/llama-server \
     /usr/local/bin/llama-server
 
-# Install Python dependencies, excluding PyTorch first
+
+# =========================================================
+# Install Python dependencies
+# =========================================================
 COPY requirements.txt /app/requirements.txt
 
 RUN grep -v -E '^(torch|torchvision)([<>=!~]|$)' \
-        /app/requirements.txt \
-        > /app/requirements-docker.txt
+    /app/requirements.txt \
+    > /app/requirements-docker.txt
 
 RUN python -m pip install \
     --no-cache-dir \
     -r /app/requirements-docker.txt
 
-# CPU-only PyTorch for DigitalOcean CPU server
+
+# =========================================================
+# Install CPU-only PyTorch
+# =========================================================
 RUN python -m pip install \
     --no-cache-dir \
     torch==2.11.0 \
     torchvision==0.26.0 \
     --index-url https://download.pytorch.org/whl/cpu
+
 
 # =========================================================
 # Download Fast Llama model during Docker build
@@ -79,11 +95,22 @@ RUN python -m pip install \
 RUN mkdir -p /opt/models \
     && python -c "from huggingface_hub import hf_hub_download; hf_hub_download(repo_id='hugging-quants/Llama-3.2-1B-Instruct-Q4_K_M-GGUF', filename='llama-3.2-1b-instruct-q4_k_m.gguf', local_dir='/opt/models')"
 
-# Copy application
+
+# =========================================================
+# Copy NxZenAI application
+# =========================================================
 COPY . /app
 
 RUN chmod +x /app/start.sh
 
+
+# =========================================================
+# Application port
+# =========================================================
 EXPOSE 8080
 
+
+# =========================================================
+# Start FastAPI + local llama-server
+# =========================================================
 CMD ["/app/start.sh"]
