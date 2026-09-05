@@ -1,0 +1,46 @@
+{
+  "artifact_key": "dc919a65-9ee3-48c0-9121-4268dcc52907",
+  "model_name": "TF-IDF + SGD Classifier",
+  "architecture": "sgd_classifier",
+  "artifact_type": "classical_sklearn",
+  "model_config": {
+    "architecture": "sgd_classifier",
+    "model_name": "TF-IDF + SGD Classifier",
+    "artifact_type": "classical_sklearn",
+    "num_classes": 3,
+    "temperature": 0.611585,
+    "score_calibrated": true,
+    "vectorizer": {
+      "type": "tfidf",
+      "lowercase": true,
+      "analyzer": "word",
+      "ngram_range": [
+        1,
+        2
+      ],
+      "sublinear_tf": true,
+      "min_df": 1,
+      "max_features": 10000,
+      "fitted_feature_count": 249,
+      "vocabulary_scope": "training_only"
+    }
+  },
+  "preprocessing": {
+    "preprocessing_type": "sklearn_tfidf",
+    "text_pipeline": "sklearn_tfidf_word_v1",
+    "unicode_normalization": "NFKC",
+    "whitespace_normalization": true,
+    "lowercase": true,
+    "analyzer": "word",
+    "ngram_range": [
+      1,
+      2
+    ],
+    "vocabulary_scope": "training_only"
+  },
+  "label_display_mapping": {
+    "negative": "Negative",
+    "neutral": "Neutral",
+    "positive": "Positive"
+  }
+}

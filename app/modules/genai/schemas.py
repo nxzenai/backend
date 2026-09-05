@@ -42,6 +42,9 @@ class ChatMessage(BaseModel):
 
 class ConversationDetail(ConversationSummary):
     messages: list[ChatMessage] = Field(default_factory=list)
+    pending_prediction: dict[str, Any] | None = None
+    pending_confirmation: dict[str, Any] | None = None
+    active_lab_resources: dict[str, dict[str, Any]] = Field(default_factory=dict)
 
 
 class ChatRequest(BaseModel):
@@ -54,6 +57,7 @@ class ChatRequest(BaseModel):
     attachment_ids: list[str] = Field(default_factory=list, max_length=50)
     project_id: str | None = Field(default=None, max_length=100)
     confirmed_tools: list[str] = Field(default_factory=list, max_length=10)
+    confirmation_id: str | None = Field(default=None, max_length=100)
     tool_arguments: dict[str, dict[str, Any]] = Field(default_factory=dict, max_length=10)
 
 
