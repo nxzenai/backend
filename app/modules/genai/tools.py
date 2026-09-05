@@ -12,8 +12,10 @@ from typing import Any, Awaitable, Callable
 from urllib.parse import urljoin, urlparse
 
 import httpx
+from fastapi import HTTPException
 
 from app.core.config.settings import settings
+from app.modules.autonlp.exceptions import AutoNLPException
 
 
 @dataclass
@@ -103,12 +105,23 @@ class GenAIToolRegistry:
         if not status["available"] or not definition.handler:
             return ToolResult(name, False, error_code="TOOL_UNAVAILABLE", error_message=status["message"] or "This tool is unavailable.")
         try:
+            if name in {"automl", "autonlp", "autodl"} and str((arguments or {}).get("action") or "").casefold() == "train":
+                # Native trainers own their execution and resource controls.
+                return await definition.handler(context, arguments or {})
             return await asyncio.wait_for(
                 definition.handler(context, arguments or {}),
                 timeout=settings.genai_tool_timeout_seconds,
             )
         except TimeoutError:
             return ToolResult(name, False, error_code="TOOL_TIMEOUT", error_message="The tool timed out safely.")
+        except HTTPException as exc:
+            detail = exc.detail
+            if isinstance(detail, dict):
+                detail = detail.get("message") or detail.get("detail") or "The native lab rejected the request."
+            message = str(detail).strip()[:500] if detail else "The native lab rejected the request."
+            return ToolResult(name, False, error_code="TOOL_INPUT_INVALID", error_message=message)
+        except AutoNLPException as exc:
+            return ToolResult(name, False, error_code="TOOL_INPUT_INVALID", error_message=str(exc)[:500])
         except (ValueError, LookupError) as exc:
             return ToolResult(name, False, error_code="TOOL_INPUT_INVALID", error_message=str(exc)[:500])
         except Exception:
@@ -124,10 +137,21 @@ class ToolRouter:
     _module = re.compile(r"\b(automl|autodl|autonlp|eda|python lab|sql lab|nxzenai workflow)\b", re.I)
     _module_aliases = (
         (re.compile(r"\b(exploratory data analysis|data quality|data profiling)\b", re.I), "eda"),
-        (re.compile(r"\b(automl|machine learning|clustering)\b", re.I), "automl"),
-        (re.compile(r"\b(autonlp|natural language processing|text classification|sentiment analysis)\b", re.I), "autonlp"),
+        (re.compile(r"\b(autonlp|natural language processing|text classification|sentiment(?: analysis)?|intent(?: classification)?|spam(?: classification)?)\b", re.I), "autonlp"),
         (re.compile(r"\b(autodl|deep learning|image classification|time[- ]series neural)\b", re.I), "autodl"),
+        (re.compile(r"\b(automl|machine learning|clustering)\b", re.I), "automl"),
     )
+
+    @classmethod
+    def explicit_lab(cls, query: str) -> str | None:
+        for pattern, tool in cls._module_aliases:
+            if pattern.search(query):
+                return tool
+        if cls._python.search(query):
+            return "python_lab"
+        if cls._sql.search(query):
+            return "sql_lab"
+        return None
 
     def route(self, query: str, requested: list[str], attachment_ids: list[str]) -> list[str]:
         if requested:
@@ -138,10 +162,21 @@ class ToolRouter:
             return ["python_lab"]
         for pattern, tool in self._module_aliases:
             if pattern.search(query) and re.search(
-                r"\b(list|analy[sz]e|inspect|overview|preview|profile|quality|transform|report|train|predict|result|readiness|models?|monitor|execute|promote|archive)\b",
+                r"\b(list|analy[sz]e|inspect|overview|preview|profile|quality|transform|report|train|training|retrain|build|create|fit|predict|result|status|progress|ready|cancel|readiness|models?|monitor|execute|promote|archive|latest|last)\b",
                 query, re.I,
             ):
                 return [tool]
+        training = re.search(r"\btrain\b", query, re.I) or (
+            re.search(r"\b(retrain|build|create|fit)\b", query, re.I)
+            and re.search(r"\bmodel\b", query, re.I)
+        )
+        if training:
+            if re.search(r"\b(sentiment|intent|spam|text\s+classif|autonlp)\b", query, re.I):
+                return ["autonlp"]
+            if re.search(r"\b(autodl|deep learning|neural|image\s+classif\w*|time[- ]series|tabular\s+(?:classif\w*|regress\w*))\b", query, re.I):
+                return ["autodl"]
+            if re.search(r"\b(automl|churn|classif|regress|cluster|machine learning)\b", query, re.I):
+                return ["automl"]
         attachment_intent = re.search(r"\b(summari[sz]e|review|analy[sz]e|explain|what.+(?:say|contain))\b", query, re.I)
         if attachment_ids and (self._files.search(query) or attachment_intent):
             return ["files"]
