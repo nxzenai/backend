@@ -1,0 +1,384 @@
+{
+  "schema_version": 1,
+  "model_version_id": "sentiment_analysis-da5c3a2fcac4-8e98ee34d451",
+  "dataset_hash": "da5c3a2fcac4aa38466dac871706f4cff847e4697d834ffbb7cfc8de2e11f0b5",
+  "task": "sentiment_analysis",
+  "model_configuration": {
+    "architecture": "sgd_classifier",
+    "model_name": "TF-IDF + SGD Classifier",
+    "artifact_type": "classical_sklearn",
+    "num_classes": 3,
+    "temperature": 0.611585,
+    "score_calibrated": true,
+    "vectorizer": {
+      "type": "tfidf",
+      "lowercase": true,
+      "analyzer": "word",
+      "ngram_range": [
+        1,
+        2
+      ],
+      "sublinear_tf": true,
+      "min_df": 1,
+      "max_features": 10000,
+      "fitted_feature_count": 249,
+      "vocabulary_scope": "training_only"
+    }
+  },
+  "random_seed": 42,
+  "preprocessing_configuration": {
+    "preprocessing_type": "sklearn_tfidf",
+    "text_pipeline": "sklearn_tfidf_word_v1",
+    "unicode_normalization": "NFKC",
+    "whitespace_normalization": true,
+    "lowercase": true,
+    "analyzer": "word",
+    "ngram_range": [
+      1,
+      2
+    ],
+    "vocabulary_scope": "training_only"
+  },
+  "training_metrics": {
+    "validation_metrics": {
+      "accuracy": 0.9231,
+      "precision": 0.9341,
+      "recall": 0.9231,
+      "f1_score": 0.9132,
+      "macro_f1": 0.8632,
+      "final_loss": 0.129447,
+      "predictions": [
+        1,
+        0,
+        2,
+        2,
+        2,
+        0,
+        2,
+        2,
+        2,
+        0,
+        2,
+        0,
+        0
+      ],
+      "probabilities": [
+        [
+          0.006904399635126971,
+          0.9844007933409346,
+          0.008694807023938414
+        ],
+        [
+          0.980178358184519,
+          0.006648076239429485,
+          0.01317356557605149
+        ],
+        [
+          0.14313078954323072,
+          0.3235097120462053,
+          0.533359498410564
+        ],
+        [
+          0.0030151599115653843,
+          0.002386794637671838,
+          0.9945980454507628
+        ],
+        [
+          0.003865945590736478,
+          0.0020327466850010795,
+          0.9941013077242624
+        ],
+        [
+          0.6372795748172649,
+          0.24679534188163618,
+          0.11592508330109896
+        ],
+        [
+          0.007488836546958752,
+          0.002498457055084289,
+          0.9900127063979569
+        ],
+        [
+          0.0034439882948168947,
+          0.004195111371731663,
+          0.9923609003334515
+        ],
+        [
+          0.0031005437326856993,
+          0.00248079375639627,
+          0.9944186625109181
+        ],
+        [
+          0.9929697221066855,
+          0.001793254218998825,
+          0.005237023674315701
+        ],
+        [
+          0.0035102274222368482,
+          0.0028098972306193487,
+          0.9936798753471439
+        ],
+        [
+          0.9855794468722024,
+          0.00659881846957147,
+          0.00782173465822597
+        ],
+        [
+          0.994572657360933,
+          0.001740022575958722,
+          0.0036873200631083727
+        ]
+      ],
+      "confusion_matrix": [
+        [
+          5,
+          0,
+          0
+        ],
+        [
+          0,
+          1,
+          1
+        ],
+        [
+          0,
+          0,
+          6
+        ]
+      ],
+      "class_metrics": [
+        {
+          "class_id": 0,
+          "precision": 1.0,
+          "recall": 1.0,
+          "f1_score": 1.0,
+          "support": 5
+        },
+        {
+          "class_id": 1,
+          "precision": 1.0,
+          "recall": 0.5,
+          "f1_score": 0.6667,
+          "support": 2
+        },
+        {
+          "class_id": 2,
+          "precision": 0.8571,
+          "recall": 1.0,
+          "f1_score": 0.9231,
+          "support": 6
+        }
+      ],
+      "roc_auc": null,
+      "roc_curve": null,
+      "sample_count": 13
+    },
+    "test_metrics": {
+      "accuracy": 0.9231,
+      "precision": 0.9385,
+      "recall": 0.9231,
+      "f1_score": 0.9239,
+      "macro_f1": 0.9327,
+      "final_loss": 0.312397,
+      "predictions": [
+        0,
+        0,
+        1,
+        2,
+        2,
+        2,
+        1,
+        0,
+        0,
+        1,
+        0,
+        2,
+        2
+      ],
+      "probabilities": [
+        [
+          0.9944610207869695,
+          0.0017602618883788182,
+          0.0037787173246516693
+        ],
+        [
+          0.9723900356025309,
+          0.007519876185028472,
+          0.02009008821244078
+        ],
+        [
+          0.008402596571197088,
+          0.9767065352132032,
+          0.014890868215599784
+        ],
+        [
+          0.005092949055584659,
+          0.004135979720796033,
+          0.9907710712236194
+        ],
+        [
+          0.003335145813231057,
+          0.001713084617869795,
+          0.9949517695688992
+        ],
+        [
+          0.003071546387341907,
+          0.0031370314405691807,
+          0.9937914221720889
+        ],
+        [
+          0.008402596571197088,
+          0.9767065352132032,
+          0.014890868215599784
+        ],
+        [
+          0.9803304259199833,
+          0.006450759644716487,
+          0.013218814435300359
+        ],
+        [
+          0.9941736933763805,
+          0.002049907299504365,
+          0.0037763993241152947
+        ],
+        [
+          0.009657418996914278,
+          0.9800960872605003,
+          0.010246493742585374
+        ],
+        [
+          0.9822316479124792,
+          0.006062515618563253,
+          0.011705836468957492
+        ],
+        [
+          0.0059032204051962444,
+          0.0041910329064614215,
+          0.9899057466883423
+        ],
+        [
+          0.00381096052932106,
+          0.002657748588058338,
+          0.9935312908826206
+        ]
+      ],
+      "confusion_matrix": [
+        [
+          4,
+          0,
+          0
+        ],
+        [
+          0,
+          3,
+          0
+        ],
+        [
+          1,
+          0,
+          5
+        ]
+      ],
+      "class_metrics": [
+        {
+          "class_id": 0,
+          "precision": 0.8,
+          "recall": 1.0,
+          "f1_score": 0.8889,
+          "support": 4
+        },
+        {
+          "class_id": 1,
+          "precision": 1.0,
+          "recall": 1.0,
+          "f1_score": 1.0,
+          "support": 3
+        },
+        {
+          "class_id": 2,
+          "precision": 1.0,
+          "recall": 0.8333,
+          "f1_score": 0.9091,
+          "support": 6
+        }
+      ],
+      "roc_auc": null,
+      "roc_curve": null,
+      "sample_count": 13
+    },
+    "leaderboard": [
+      {
+        "rank": 1,
+        "model_name": "TF-IDF + SGD Classifier",
+        "score": 0.8632,
+        "accuracy": 0.9231,
+        "precision": 0.9341,
+        "recall": 0.9231,
+        "f1_score": 0.9132,
+        "macro_f1": 0.8632,
+        "validation_loss": 0.129447,
+        "training_time": 0.1815,
+        "success": true,
+        "eligible_for_selection": true,
+        "rejection_reason": null
+      },
+      {
+        "rank": 2,
+        "model_name": "TF-IDF + Naive Bayes",
+        "score": 0.8632,
+        "accuracy": 0.9231,
+        "precision": 0.9341,
+        "recall": 0.9231,
+        "f1_score": 0.9132,
+        "macro_f1": 0.8632,
+        "validation_loss": 0.290855,
+        "training_time": 0.184,
+        "success": true,
+        "eligible_for_selection": true,
+        "rejection_reason": null
+      },
+      {
+        "rank": 3,
+        "model_name": "TF-IDF + Linear SVM",
+        "score": 0.8632,
+        "accuracy": 0.9231,
+        "precision": 0.9341,
+        "recall": 0.9231,
+        "f1_score": 0.9132,
+        "macro_f1": 0.8632,
+        "validation_loss": 0.38858,
+        "training_time": 0.0647,
+        "success": true,
+        "eligible_for_selection": true,
+        "rejection_reason": null
+      },
+      {
+        "rank": 4,
+        "model_name": "TF-IDF + Logistic Regression",
+        "score": 0.8632,
+        "accuracy": 0.9231,
+        "precision": 0.9341,
+        "recall": 0.9231,
+        "f1_score": 0.9132,
+        "macro_f1": 0.8632,
+        "validation_loss": 0.404299,
+        "training_time": 0.3913,
+        "success": true,
+        "eligible_for_selection": true,
+        "rejection_reason": null
+      }
+    ]
+  },
+  "runtime": {
+    "python": "3.14.5",
+    "platform": "Windows-11-10.0.26200-SP0",
+    "implementation": "cpython",
+    "dependencies": {
+      "joblib": "1.5.3",
+      "numpy": "2.5.2",
+      "scikit-learn": "1.9.0"
+    },
+    "execution_device": "cpu"
+  },
+  "artifact_integrity_sha256": "8e98ee34d4513358763ecc036ee005538fc03b01c51ab11d5d1fcce0fb32e679"
+}

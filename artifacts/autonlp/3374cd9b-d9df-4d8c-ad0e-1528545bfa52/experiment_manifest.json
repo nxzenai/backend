@@ -1,0 +1,192 @@
+{
+  "schema_version": 1,
+  "model_version_id": "sentiment_analysis-6f5e10694143-5b1c3e842270",
+  "dataset_hash": "6f5e1069414322ab6809e79503e1ec35dbada9fa890ebecdac966b3fdfca22a0",
+  "task": "sentiment_analysis",
+  "model_configuration": {
+    "architecture": "logistic_regression",
+    "model_name": "TF-IDF + Logistic Regression",
+    "artifact_type": "classical_sklearn",
+    "num_classes": 3,
+    "temperature": 5.0,
+    "score_calibrated": true,
+    "vectorizer": {
+      "type": "tfidf",
+      "lowercase": true,
+      "analyzer": "word",
+      "ngram_range": [
+        1,
+        2
+      ],
+      "sublinear_tf": true,
+      "min_df": 1,
+      "max_features": 10000,
+      "fitted_feature_count": 148,
+      "vocabulary_scope": "training_only"
+    }
+  },
+  "random_seed": 42,
+  "preprocessing_configuration": {
+    "preprocessing_type": "sklearn_tfidf",
+    "text_pipeline": "sklearn_tfidf_word_v1",
+    "unicode_normalization": "NFKC",
+    "whitespace_normalization": true,
+    "lowercase": true,
+    "analyzer": "word",
+    "ngram_range": [
+      1,
+      2
+    ],
+    "vocabulary_scope": "training_only"
+  },
+  "training_metrics": {
+    "validation_metrics": {
+      "accuracy": 0.3333,
+      "precision": 0.3333,
+      "recall": 0.3333,
+      "f1_score": 0.3333,
+      "macro_f1": 0.3333,
+      "final_loss": 1.153307,
+      "predictions": [
+        2,
+        0,
+        1
+      ],
+      "probabilities": [
+        [
+          0.2829106900612442,
+          0.33571761907083403,
+          0.3813716908679218
+        ],
+        [
+          0.40204261985505707,
+          0.29801797475643943,
+          0.29993940538850344
+        ],
+        [
+          0.3155520746425464,
+          0.37041864390748047,
+          0.31402928144997316
+        ]
+      ],
+      "confusion_matrix": [
+        [
+          0,
+          0,
+          1
+        ],
+        [
+          0,
+          1,
+          0
+        ],
+        [
+          1,
+          0,
+          0
+        ]
+      ],
+      "class_metrics": [
+        {
+          "class_id": 0,
+          "precision": 0.0,
+          "recall": 0.0,
+          "f1_score": 0.0,
+          "support": 1
+        },
+        {
+          "class_id": 1,
+          "precision": 1.0,
+          "recall": 1.0,
+          "f1_score": 1.0,
+          "support": 1
+        },
+        {
+          "class_id": 2,
+          "precision": 0.0,
+          "recall": 0.0,
+          "f1_score": 0.0,
+          "support": 1
+        }
+      ],
+      "roc_auc": null,
+      "roc_curve": null,
+      "sample_count": 3
+    },
+    "test_metrics": null,
+    "leaderboard": [
+      {
+        "rank": 1,
+        "model_name": "TF-IDF + Logistic Regression",
+        "score": 0.3333,
+        "accuracy": 0.3333,
+        "precision": 0.3333,
+        "recall": 0.3333,
+        "f1_score": 0.3333,
+        "macro_f1": 0.3333,
+        "validation_loss": 1.153307,
+        "training_time": 0.2189,
+        "success": true,
+        "eligible_for_selection": true,
+        "rejection_reason": null
+      },
+      {
+        "rank": 2,
+        "model_name": "TF-IDF + Naive Bayes",
+        "score": 0.3333,
+        "accuracy": 0.3333,
+        "precision": 0.3333,
+        "recall": 0.3333,
+        "f1_score": 0.3333,
+        "macro_f1": 0.3333,
+        "validation_loss": 1.167126,
+        "training_time": 0.0687,
+        "success": true,
+        "eligible_for_selection": true,
+        "rejection_reason": null
+      },
+      {
+        "rank": 3,
+        "model_name": "TF-IDF + Linear SVM",
+        "score": 0.3333,
+        "accuracy": 0.3333,
+        "precision": 0.3333,
+        "recall": 0.3333,
+        "f1_score": 0.3333,
+        "macro_f1": 0.3333,
+        "validation_loss": 1.213268,
+        "training_time": 0.2501,
+        "success": true,
+        "eligible_for_selection": true,
+        "rejection_reason": null
+      },
+      {
+        "rank": 4,
+        "model_name": "TF-IDF + SGD Classifier",
+        "score": 0.3333,
+        "accuracy": 0.3333,
+        "precision": 0.3333,
+        "recall": 0.3333,
+        "f1_score": 0.3333,
+        "macro_f1": 0.3333,
+        "validation_loss": 2.056412,
+        "training_time": 0.0774,
+        "success": true,
+        "eligible_for_selection": true,
+        "rejection_reason": null
+      }
+    ]
+  },
+  "runtime": {
+    "python": "3.14.5",
+    "platform": "Windows-11-10.0.26200-SP0",
+    "implementation": "cpython",
+    "dependencies": {
+      "joblib": "1.5.3",
+      "numpy": "2.5.2",
+      "scikit-learn": "1.9.0"
+    },
+    "execution_device": "cpu"
+  },
+  "artifact_integrity_sha256": "5b1c3e8422704f6768c8f056224f7636fcabeb9c4e169370b45f21fd2799016b"
+}
