@@ -4,6 +4,7 @@ import asyncio
 import re
 import time
 import uuid
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, AsyncIterator
 
@@ -33,14 +34,38 @@ class GenAIService:
     @staticmethod
     def _tool_arguments(tool_name: str, query: str, supplied: dict[str, Any]) -> dict[str, Any]:
         values = dict(supplied)
+        requested_fields = [str(item) for item in values.pop("_requested_fields", [])]
         lowered = query.casefold()
+        training_intent = bool(
+            re.search(r"\b(?:train|retrain)\b", query, re.I)
+            or re.search(r"\b(?:build|create|fit)\b", query, re.I)
+            and re.search(r"\bmodel\b", query, re.I)
+        )
+        prediction_intent = bool(re.search(r"\bpredict(?:ion)?\b", query, re.I))
+        if training_intent and prediction_intent:
+            values["action"] = "ambiguous"
+        elif tool_name == "autodl" and re.search(r"\bcancel\b", query, re.I):
+            values["action"] = "cancel"
+        elif tool_name == "autodl" and re.search(r"\bresults?\b", query, re.I):
+            values["action"] = "result"
+        elif tool_name == "autodl" and re.search(
+            r"\b(?:status|progress|ready|latest\s+(?:autodl\s+)?run|last\s+(?:autodl\s+)?(?:run|training))\b",
+            query, re.I,
+        ):
+            values["action"] = "status"
+        elif (
+            tool_name == "autonlp" and not training_intent
+            and re.search(r"\b(?:sentiment|intent|spam)\b", query, re.I)
+            and re.search(r"\b(?:analy[sz]e|classif(?:y|ication)|predict)\b", query, re.I)
+        ):
+            values["action"] = "predict"
         action_keywords = {
             "python_lab": (("execute", "execute"), ("run", "execute"), ("inspect", "inspect"), ("notebook", "inspect"), ("cells", "inspect"), ("status", "status"), ("runtime", "runtime")),
             "sql_lab": (("schema", "schema"), ("statistics", "statistics"), ("run", "query"), ("execute", "query"), ("query", "query"), ("select", "query"), ("with", "query"), ("explain", "query"), ("insert", "query"), ("update", "query"), ("delete", "query"), ("create", "query"), ("alter", "query"), ("drop", "query"), ("truncate", "query")),
             "eda": (("analyze", "analyze"), ("analyse", "analyze"), ("perform", "analyze"), ("use", "analyze"), ("do", "analyze"), ("upload", "upload"), ("transform", "transform"), ("report", "report"), ("preview", "preview"), ("profile", "profile"), ("quality", "quality"), ("overview", "overview"), ("list", "list")),
-            "autodl": (("analyze", "inspection"), ("analyse", "inspection"), ("perform", "inspection"), ("use", "inspection"), ("inspect", "inspection"), ("train", "train"), ("promote", "stage"), ("archive", "stage"), ("predict", "predict"), ("result", "result"), ("models", "models"), ("model", "models"), ("run", "inspection"), ("readiness", "readiness")),
-            "autonlp": (("analyze", "inspect"), ("analyse", "inspect"), ("perform", "inspect"), ("use", "inspect"), ("train", "train"), ("inspect", "inspect"), ("predict", "predict"), ("monitor", "monitoring"), ("model", "models")),
-            "automl": (("analyze", "inspect"), ("analyse", "inspect"), ("perform", "inspect"), ("use", "inspect"), ("train", "train"), ("predict", "predict"), ("preview", "preview"), ("inspect", "inspect"), ("model", "models")),
+            "autodl": (("analyze", "inspection"), ("analyse", "inspection"), ("perform", "inspection"), ("use", "inspection"), ("inspect", "inspection"), ("retrain", "train"), ("train", "train"), ("build", "train"), ("create", "train"), ("fit", "train"), ("promote", "stage"), ("archive", "stage"), ("predict", "predict"), ("result", "result"), ("status", "status"), ("progress", "status"), ("ready", "status"), ("models", "models"), ("model", "models"), ("run", "inspection"), ("readiness", "readiness")),
+            "autonlp": (("analyze", "inspect"), ("analyse", "inspect"), ("perform", "inspect"), ("use", "inspect"), ("retrain", "train"), ("train", "train"), ("build", "train"), ("create", "train"), ("fit", "train"), ("inspect", "inspect"), ("predict", "predict"), ("monitor", "monitoring"), ("model", "models")),
+            "automl": (("analyze", "inspect"), ("analyse", "inspect"), ("perform", "inspect"), ("use", "inspect"), ("retrain", "train"), ("train", "train"), ("build", "train"), ("create", "train"), ("fit", "train"), ("predict", "predict"), ("preview", "preview"), ("inspect", "inspect"), ("model", "models")),
         }
         if not values.get("action"):
             for keyword, action in action_keywords.get(tool_name, ()):
@@ -78,11 +103,63 @@ class GenAIService:
                 match = re.search(rf"\b{key}\s*[:=]\s*(?:\"([^\"]+)\"|'([^']+)'|([^,;\s]+))", query, re.I)
                 if match:
                     values[key] = next(group for group in match.groups() if group).strip()
+        if not values.get("target_column"):
+            match = re.search(r"\b(?:target|label)(?:\s+column)?\s*(?:is|=|:)\s*[\"']?([A-Za-z_][A-Za-z0-9 _.-]{0,99})", query, re.I)
+            if match:
+                values["target_column"] = re.split(r"[,.]|\s+and\s+", match.group(1), 1, flags=re.I)[0].strip(" '\"")
+        if not values.get("text_column"):
+            match = re.search(r"\btext(?:\s+column)?\s*(?:is|=|:)\s*[\"']?([A-Za-z_][A-Za-z0-9 _.-]{0,99})", query, re.I)
+            if match:
+                values["text_column"] = re.split(r"[,.]|\s+and\s+", match.group(1), 1, flags=re.I)[0].strip(" '\"")
+            else:
+                match = re.search(
+                    r"\buse\s+[\"']?([A-Za-z_][A-Za-z0-9_ -]{0,99}?)['\"]?\s+as\s+(?:the\s+)?(?:input|text)\s+column\b",
+                    query, re.I,
+                )
+                if match:
+                    values["text_column"] = match.group(1).strip(" '\"")
+        if not values.get("task"):
+            task_patterns = (
+                (r"\bsentiment\b", "sentiment_analysis"),
+                (r"\bintent\b", "intent_classification"),
+                (r"\bspam\b", "spam_classification"),
+                (r"\bclustering\b|\bcluster\b", "clustering"),
+                (r"\bregression\b|\bforecast", "regression"),
+                (r"\bclassification\b|\bclassify\b", "classification"),
+            )
+            for pattern, task in task_patterns:
+                if re.search(pattern, query, re.I):
+                    values["task"] = task
+                    break
+        if len(requested_fields) == 1:
+            bare_value = query.strip().strip("'\"")
+            if re.fullmatch(r"[A-Za-z_][A-Za-z0-9 _.-]{0,99}", bare_value):
+                requested = requested_fields[0].casefold().replace("_", " ")
+                if requested == "target column":
+                    values.setdefault("target_column", bare_value)
+                elif requested == "text column":
+                    values.setdefault("text_column", bare_value)
+                elif requested == "task":
+                    values.setdefault("task", bare_value.casefold().replace(" ", "_"))
         if "stage" not in values:
             match = re.search(r"\b(?:stage\s*[:=]\s*|to\s+)(draft|validated|production|archived)\b", query, re.I)
             if match:
                 values["stage"] = match.group(1).casefold()
         return values
+
+    @staticmethod
+    def _confirmation_message(tool_name: str, arguments: dict[str, Any], attachments: list[dict[str, Any]]) -> str:
+        labels = {"automl": "AutoML", "autonlp": "AutoNLP", "autodl": "AutoDL"}
+        details = [f"Lab: {labels.get(tool_name, tool_name.replace('_', ' ').title())}"]
+        if attachments:
+            details.append(f"Dataset: {attachments[0].get('filename') or 'selected attachment'}")
+        for key, label in (("task", "Task"), ("confirmed_task", "Task"), ("target_column", "Target"), ("confirmed_target", "Target"), ("text_column", "Text column")):
+            value = arguments.get(key)
+            entry = f"{label}: {value}" if value else None
+            if entry and entry not in details:
+                details.append(entry)
+        action = str(arguments.get("action") or "action").replace("_", " ")
+        return f"Confirm {action}: " + "; ".join(details) + "."
 
     async def create_conversation(self, owner_id: str, title: str | None, tier: str, reasoning: str, project_id: str | None = None) -> dict[str, Any]:
         if project_id and not await self.repository.get_project(project_id, owner_id):
@@ -188,9 +265,44 @@ class GenAIService:
             raise GenAIException("Message cannot be empty.")
         conversation = await self._resolve_conversation(request, owner_id)
         conversation_id = str(conversation["id"])
+        pending_prediction = conversation.get("pending_prediction") if not request.regenerate else None
+        explicit_lab = self.tool_router.explicit_lab(query)
+        requested_lab = next((item for item in request.tools if item in {"automl", "autonlp", "autodl"}), None)
+        if (
+            pending_prediction and not request.confirmation_id
+            and (requested_lab or explicit_lab)
+            and (requested_lab or explicit_lab) != pending_prediction.get("tool")
+        ):
+            await self.repository.clear_pending_prediction(conversation_id, owner_id)
+            await self.repository.clear_pending_confirmation(conversation_id, owner_id)
+            pending_prediction = None
+        confirmed_action = None
+        if request.confirmation_id:
+            confirmed_action = await self.repository.consume_pending_confirmation(
+                conversation_id, owner_id, request.confirmation_id,
+            )
+            if not confirmed_action:
+                raise GenAIException("This confirmation is invalid, expired, or has already been used.")
+        pending_confirmation = conversation.get("pending_confirmation")
+        if (pending_prediction or pending_confirmation) and re.fullmatch(r"\s*(?:cancel|stop|never mind|nevermind)\s*[.!]?\s*", query, re.I):
+            pending_action = str((pending_prediction or pending_confirmation or {}).get("action") or "action").replace("_", " ")
+            await self.repository.clear_pending_prediction(conversation_id, owner_id)
+            await self.repository.clear_pending_confirmation(conversation_id, owner_id)
+            await self.repository.add_message(owner_id, conversation_id, "user", query)
+            message = await self.repository.add_message(
+                owner_id, conversation_id, "assistant", f"{pending_action.title()} cancelled.",
+            )
+            yield {
+                "type": "metadata", "conversation_id": conversation_id,
+                "generation_id": str(uuid.uuid4()), "requested_tier": request.tier.value,
+                "model_tier": ModelTier.FAST.value, "model_name": "prediction-router",
+                "reasoning": request.reasoning.value, "route_reason": "Pending prediction cancelled.",
+            }
+            yield {"type": "done", "status": "completed", "message": message, "duration_ms": 0}
+            return
         if request.regenerate:
             await self.repository.delete_latest_assistant(conversation_id, owner_id)
-        acknowledgement = await self._memory_intent(owner_id, query)
+        acknowledgement = None if pending_prediction else await self._memory_intent(owner_id, query)
         if acknowledgement is not None:
             if not request.regenerate:
                 await self.repository.add_message(owner_id, conversation_id, "user", query)
@@ -210,27 +322,97 @@ class GenAIService:
             yield {"type": "done", "status": "completed", "message": message, "duration_ms": 0}
             return
         config, route_reason = self.router.route(request.tier, query, request.reasoning)
-        selected_attachments = await self.repository.attach_files_to_conversation(
-            owner_id, request.attachment_ids, conversation_id, conversation.get("project_id"),
+        pending_attachment_ids = list((pending_prediction or {}).get("attachment_ids") or [])
+        confirmed_attachment_ids = list((confirmed_action or {}).get("attachment_ids") or [])
+        # A continuation remains bound to the exact selected dataset/image. A
+        # different lab request clears the state above; attachments cannot
+        # silently replace a resource while collecting fields or confirming.
+        attachment_replaced = bool(
+            pending_attachment_ids and request.attachment_ids
+            and set(pending_attachment_ids) != set(request.attachment_ids)
         )
-        if request.attachment_ids and len(selected_attachments) != len(set(request.attachment_ids)):
+        effective_attachment_ids = confirmed_attachment_ids or (
+            request.attachment_ids if attachment_replaced
+            else pending_attachment_ids or request.attachment_ids
+        )
+        selected_attachments = await self.repository.attach_files_to_conversation(
+            owner_id, effective_attachment_ids, conversation_id, conversation.get("project_id"),
+        )
+        if effective_attachment_ids and len(selected_attachments) != len(set(effective_attachment_ids)):
+            if pending_prediction:
+                await self.repository.clear_pending_prediction(conversation_id, owner_id)
             raise GenAIException("One or more selected attachments are unavailable or are not owned by this user.")
         # Only attachments explicitly selected for this message may reach a tool.
-        attachment_ids = list(dict.fromkeys(request.attachment_ids))[:50]
+        attachment_ids = list(dict.fromkeys(effective_attachment_ids))[:50]
         image_prediction = bool(
             selected_attachments
             and any(str(item.get("content_type") or "").startswith("image/") for item in selected_attachments)
             and re.search(r"\b(classif(?:y|ication)|predict)\b", query, re.I)
         )
-        selected_tools = ["autodl"] if image_prediction and not request.tools else self.tool_router.route(
-            query, request.tools, attachment_ids,
+        pending_tool = str((pending_prediction or {}).get("tool") or "")
+        confirmed_tool = str((confirmed_action or {}).get("tool") or "")
+        requested_tools = [confirmed_tool] if confirmed_tool else [pending_tool] if pending_tool else request.tools
+        selected_tools = ["autodl"] if image_prediction and not requested_tools else self.tool_router.route(
+            query, requested_tools, attachment_ids,
         )
+        structured_automl = False
+        if (
+            not selected_tools and not pending_tool and self.lab_adapters and current_user
+            and len(re.findall(r"\b[A-Za-z][A-Za-z0-9_ ]{0,80}\s*[:=]\s*[-+]?\d+(?:\.\d+)?", query)) >= 2
+            and await self.lab_adapters.has_compatible_automl_structured_input(current_user, query)
+        ):
+            selected_tools = ["automl"]
+            structured_automl = True
         tool_results = []
+        completed_native_action: tuple[Any, str] | None = None
         for tool_name in selected_tools:
             definition = tool_registry.get(tool_name)
-            arguments = self._tool_arguments(tool_name, query, request.tool_arguments.get(tool_name, {}))
+            pending_arguments = dict((pending_prediction or {}).get("arguments") or {}) if pending_tool == tool_name else {}
+            request_arguments = request.tool_arguments.get(tool_name, {})
+            supplied_arguments = {**pending_arguments, **request_arguments}
+            if pending_arguments:
+                explicit_resource_change = bool(re.search(
+                    r"\b(?:model_id|model_filename|run_id|attachment_id)\s*[:=]", query, re.I,
+                ))
+                friendly_model_change = bool(re.search(
+                    r"\b(?:use|switch|change|select)\b.+(?:\binstead\b|\bmodel\b)", query, re.I,
+                ))
+                selected_resource_supplied = any(
+                    request_arguments.get(key) for key in ("model_id", "model_filename", "run_id")
+                )
+                if explicit_resource_change or friendly_model_change:
+                    if not selected_resource_supplied:
+                        for key in ("model_id", "model_filename", "run_id"):
+                            supplied_arguments.pop(key, None)
+                    supplied_arguments["_explicit_resource_switch"] = True
+                else:
+                    for key in ("model_id", "model_filename", "run_id", "attachment_id"):
+                        if pending_arguments.get(key):
+                            supplied_arguments[key] = pending_arguments[key]
+                if attachment_replaced:
+                    supplied_arguments.pop("attachment_id", None)
+            arguments = (
+                dict((confirmed_action or {}).get("arguments") or {})
+                if confirmed_tool == tool_name else self._tool_arguments(tool_name, query, supplied_arguments)
+            )
+            if (
+                tool_name == "autodl" and arguments.get("action") in {"status", "result"}
+                and not arguments.get("run_id")
+            ):
+                bound = ((conversation.get("active_lab_resources") or {}).get("autodl") or {})
+                if bound.get("run_id"):
+                    arguments["run_id"] = str(bound["run_id"])
+            if structured_automl and tool_name == "automl":
+                arguments["action"] = "predict"
+                arguments["_schema_match_required"] = True
             if image_prediction and tool_name == "autodl":
                 arguments.setdefault("action", "predict")
+            if str(arguments.get("action") or "").casefold() == "ambiguous":
+                message = "Please choose one action: train a model or make a prediction."
+                yield {"type": "error", "code": "LAB_ACTION_AMBIGUOUS", "message": message}
+                return
+            if attachment_replaced:
+                arguments.pop("attachment_id", None)
             if len(attachment_ids) == 1 and not arguments.get("attachment_id"):
                 arguments["attachment_id"] = attachment_ids[0]
             attachment_action = (tool_name, str(arguments.get("action") or "").casefold())
@@ -242,7 +424,7 @@ class GenAIService:
                 ("eda", "upload"), ("eda", "import"), ("eda", "analyze"),
                 ("eda", "overview"), ("eda", "preview"), ("eda", "profile"), ("eda", "quality"),
                 ("automl", "inspect"), ("automl", "preview"), ("automl", "train"),
-                ("autonlp", "inspect"), ("autonlp", "train"),
+                ("autonlp", "inspect"), ("autonlp", "train"), ("autonlp", "predict"),
                 ("autodl", "inspection"), ("autodl", "train"), ("autodl", "predict"),
                 }
             ):
@@ -251,6 +433,13 @@ class GenAIService:
                     for item in selected_attachments
                 ]
                 message = "Choose one attached file: " + ", ".join(str(item["filename"]) for item in candidates) + "."
+                if attachment_action[0] in {"automl", "autonlp", "autodl"} and attachment_action[1] in {"predict", "train"}:
+                    await self.repository.set_pending_prediction(conversation_id, owner_id, {
+                        "tool": tool_name, "action": attachment_action[1], "arguments": {**arguments, "original_query": query},
+                        "attachment_ids": attachment_ids, "collected_values": {}, "missing_fields": ["dataset"],
+                        "requested_fields": ["dataset"], "candidates": candidates, "original_action": query,
+                        "prompt": message,
+                    })
                 yield {"type": "tool", "tool": tool_name, "status": "failed", "message": message}
                 yield {
                     "type": "error", "code": "LAB_RESOURCE_SELECTION_REQUIRED", "message": message,
@@ -260,7 +449,7 @@ class GenAIService:
                             "tool": tool_name, "action": arguments.get("action"),
                             "attachment_ids": attachment_ids,
                             "arguments": {**arguments, "original_query": query}, "query": query,
-                        },
+                        }, "conversation_id": conversation_id,
                     },
                 }
                 return
@@ -275,6 +464,16 @@ class GenAIService:
                     arguments = await self.lab_adapters.resolve(
                         tool_name, current_user, arguments, query, selected_attachments,
                     )
+                    resolved_attachment_id = str(arguments.get("attachment_id") or "").strip()
+                    if resolved_attachment_id and tool_name in {"automl", "autonlp", "autodl"}:
+                        matching = [
+                            item for item in selected_attachments
+                            if str(item.get("id")) == resolved_attachment_id
+                        ]
+                        if not matching:
+                            raise ValueError("The selected dataset is no longer available. Please attach it again.")
+                        attachment_ids = [resolved_attachment_id]
+                        selected_attachments = matching
                 except (ValueError, LookupError) as exc:
                     message = str(exc)[:500]
                     candidates = getattr(exc, "candidates", None)
@@ -284,8 +483,26 @@ class GenAIService:
                         **resolved_arguments,
                         "original_query": str(resolved_arguments.get("original_query") or query),
                     }
+                    if missing_fields:
+                        resolved_arguments["_requested_fields"] = missing_fields
+                    resumable_action = str(resolved_arguments.get("action") or "").casefold()
+                    if resumable_action in {"predict", "train"} and (candidates or missing_fields):
+                        collected = resolved_arguments.get("rows") or resolved_arguments.get("input") or {}
+                        await self.repository.set_pending_prediction(conversation_id, owner_id, {
+                            "tool": tool_name, "action": resumable_action, "arguments": resolved_arguments,
+                            "attachment_ids": attachment_ids, "collected_values": collected,
+                            "missing_fields": missing_fields or [], "requested_fields": missing_fields or [],
+                            "candidates": candidates or [],
+                            "prompt": message,
+                            "original_action": resolved_arguments.get("original_query") or query,
+                        })
+                    elif pending_prediction:
+                        await self.repository.clear_pending_prediction(conversation_id, owner_id)
                     yield {"type": "tool", "tool": tool_name, "status": "failed", "message": message}
-                    details = {"candidates": candidates or [], "missing_fields": missing_fields or []}
+                    details = {
+                        "candidates": candidates or [], "missing_fields": missing_fields or [],
+                        "conversation_id": conversation_id, "prompt": message,
+                    }
                     if candidates or missing_fields:
                         details["resume"] = {
                             "tool": tool_name, "action": resolved_arguments.get("action"),
@@ -302,10 +519,26 @@ class GenAIService:
                 definition and definition.requires_confirmation
                 or self.lab_adapters and self.lab_adapters.requires_confirmation(tool_name, arguments)
             )
-            if definition and definition.status()["available"] and confirmation_needed and tool_name not in request.confirmed_tools:
+            confirmation_granted = bool(confirmed_tool == tool_name)
+            if definition and definition.status()["available"] and confirmation_needed and not confirmation_granted:
+                if str(arguments.get("action") or "").casefold() in {"predict", "train"}:
+                    await self.repository.set_pending_prediction(conversation_id, owner_id, {
+                        "tool": tool_name, "action": str(arguments.get("action") or "").casefold(), "arguments": arguments,
+                        "attachment_ids": attachment_ids,
+                        "collected_values": arguments.get("rows") or arguments.get("input") or arguments.get("text") or {},
+                        "missing_fields": [], "requested_fields": [],
+                        "original_action": arguments.get("original_query") or query,
+                    })
+                confirmation_id = str(uuid.uuid4())
+                await self.repository.set_pending_confirmation(conversation_id, owner_id, {
+                    "id": confirmation_id, "tool": tool_name, "action": arguments.get("action"),
+                    "arguments": arguments, "attachment_ids": attachment_ids,
+                    "expires_at": datetime.now(UTC) + timedelta(minutes=15),
+                })
                 yield {
-                    "type": "confirmation_required", "tool": tool_name,
-                    "message": f"Confirm before allowing {tool_name.replace('_', ' ')} to act on your behalf.",
+                    "type": "confirmation_required", "conversation_id": conversation_id, "tool": tool_name,
+                    "confirmation_id": confirmation_id,
+                    "message": self._confirmation_message(tool_name, arguments, selected_attachments),
                     "action": arguments.get("action"), "attachment_ids": attachment_ids,
                     "arguments": arguments,
                 }
@@ -317,11 +550,65 @@ class GenAIService:
                 arguments,
             )
             tool_results.append(result)
+            native_action = str(arguments.get("action") or "").casefold()
+            native_payload = (result.data or {}).get("result") if isinstance(result.data, dict) else None
+            native_run_id = str((native_payload or {}).get("run_id") or arguments.get("run_id") or "").strip()
+            if tool_name == "autodl" and result.ok and native_run_id:
+                await self.repository.set_active_autodl_run(
+                    conversation_id, owner_id, native_run_id,
+                    {
+                        "status": (native_payload or {}).get("status"),
+                        "task": (native_payload or {}).get("task") or (native_payload or {}).get("detected_task"),
+                    },
+                )
+            if native_action in {"predict", "train"}:
+                await self.repository.clear_pending_prediction(conversation_id, owner_id)
+                if result.ok:
+                    completed_native_action = (result, native_action)
+            elif tool_name == "autodl" and native_action in {"status", "result", "cancel"} and result.ok:
+                completed_native_action = (result, native_action)
             yield {
                 "type": "tool", "tool": result.tool, "status": "completed" if result.ok else "failed",
                 "message": "Tool completed." if result.ok else result.error_message,
                 "citations": result.citations,
             }
+        if completed_native_action is not None:
+            completed_result, completed_action = completed_native_action
+            if not request.regenerate:
+                await self.repository.add_message(owner_id, conversation_id, "user", query)
+            reply = completed_result.content
+            message = await self.repository.add_message(
+                owner_id, conversation_id, "assistant", reply,
+                metadata={
+                    "handled_by": completed_result.tool,
+                    "native_action": completed_action,
+                    "real_prediction": completed_action == "predict",
+                    **(
+                        {"autodl_run": {
+                            "run_id": str(((completed_result.data or {}).get("result") or {}).get("run_id") or ""),
+                            "status": ((completed_result.data or {}).get("result") or {}).get("status"),
+                            "task": ((completed_result.data or {}).get("result") or {}).get("task")
+                            or ((completed_result.data or {}).get("result") or {}).get("detected_task"),
+                        }}
+                        if completed_result.tool == "autodl" and completed_action in {"train", "status", "result"}
+                        else {}
+                    ),
+                },
+            )
+            if conversation.get("title") == DEFAULT_CONVERSATION_TITLE:
+                await self.repository.rename_conversation(
+                    conversation_id, owner_id,
+                    "Model prediction" if completed_action == "predict" else "Model training",
+                )
+            yield {
+                "type": "metadata", "conversation_id": conversation_id,
+                "generation_id": str(uuid.uuid4()), "requested_tier": request.tier.value,
+                "model_tier": ModelTier.FAST.value, "model_name": "prediction-adapter",
+                "reasoning": request.reasoning.value,
+                "route_reason": f"Native {completed_result.tool} {completed_action}.",
+            }
+            yield {"type": "done", "status": "completed", "message": message, "duration_ms": 0}
+            return
         if selected_tools and tool_results and not any(result.ok for result in tool_results):
             message = tool_results[0].error_message or "The required tool is unavailable."
             yield {"type": "error", "code": tool_results[0].error_code or "GENAI_TOOL_UNAVAILABLE", "message": message}

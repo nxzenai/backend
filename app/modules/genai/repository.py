@@ -11,7 +11,7 @@ from typing import Any
 import gridfs
 from gridfs.errors import NoFile
 from motor.motor_asyncio import AsyncIOMotorDatabase
-from pymongo import ASCENDING, DESCENDING
+from pymongo import ASCENDING, DESCENDING, ReturnDocument
 
 from app.modules.genai.constants import DEFAULT_CONVERSATION_TITLE
 
@@ -91,6 +91,57 @@ class GenAIRepository:
         await self.conversations.update_one(
             {"_id": conversation_id, "owner_id": owner_id},
             {"$set": {"selected_tier": tier, "reasoning_level": reasoning, "updated_at": _now()}},
+        )
+
+    async def set_pending_prediction(
+        self, conversation_id: str, owner_id: str, state: dict[str, Any],
+    ) -> None:
+        await self.conversations.update_one(
+            {"_id": conversation_id, "owner_id": owner_id},
+            {"$set": {"pending_prediction": state, "updated_at": _now()}},
+        )
+
+    async def clear_pending_prediction(self, conversation_id: str, owner_id: str) -> None:
+        await self.conversations.update_one(
+            {"_id": conversation_id, "owner_id": owner_id},
+            {"$unset": {"pending_prediction": ""}, "$set": {"updated_at": _now()}},
+        )
+
+    async def set_active_autodl_run(
+        self, conversation_id: str, owner_id: str, run_id: str, metadata: dict[str, Any] | None = None,
+    ) -> None:
+        safe = {"run_id": str(run_id), **(metadata or {})}
+        await self.conversations.update_one(
+            {"_id": conversation_id, "owner_id": owner_id},
+            {"$set": {"active_lab_resources.autodl": safe, "updated_at": _now()}},
+        )
+
+    async def set_pending_confirmation(
+        self, conversation_id: str, owner_id: str, state: dict[str, Any],
+    ) -> None:
+        await self.conversations.update_one(
+            {"_id": conversation_id, "owner_id": owner_id},
+            {"$set": {"pending_confirmation": state, "updated_at": _now()}},
+        )
+
+    async def consume_pending_confirmation(
+        self, conversation_id: str, owner_id: str, confirmation_id: str,
+    ) -> dict[str, Any] | None:
+        document = await self.conversations.find_one_and_update(
+            {
+                "_id": conversation_id, "owner_id": owner_id,
+                "pending_confirmation.id": confirmation_id,
+                "pending_confirmation.expires_at": {"$gt": _now()},
+            },
+            {"$unset": {"pending_confirmation": ""}, "$set": {"updated_at": _now()}},
+            return_document=ReturnDocument.BEFORE,
+        )
+        return dict(document.get("pending_confirmation") or {}) if document else None
+
+    async def clear_pending_confirmation(self, conversation_id: str, owner_id: str) -> None:
+        await self.conversations.update_one(
+            {"_id": conversation_id, "owner_id": owner_id},
+            {"$unset": {"pending_confirmation": ""}, "$set": {"updated_at": _now()}},
         )
 
     async def set_conversation_project(self, conversation_id: str, owner_id: str, project_id: str | None) -> dict[str, Any] | None:

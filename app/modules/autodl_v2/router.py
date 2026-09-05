@@ -152,7 +152,7 @@ async def train_run(
             confirmed_timestamp=confirmed_timestamp, rows_are_ordered=rows_are_ordered,
             timestamp_handling=timestamp_handling,
         )
-        runtime.submit_reserved(service.execute_direct(run_id, owner_id))
+        runtime.submit_reserved(service.execute_direct(run_id, owner_id), run_id)
         reserved = False
         return TrainingSubmissionResponse(
             run_id=run_id, status="queued", stage="preparing",
