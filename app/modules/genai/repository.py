@@ -107,6 +107,17 @@ class GenAIRepository:
             {"$unset": {"pending_prediction": ""}, "$set": {"updated_at": _now()}},
         )
 
+    async def set_active_attachment_ids(
+        self, conversation_id: str, owner_id: str, attachment_ids: list[str],
+    ) -> None:
+        await self.conversations.update_one(
+            {"_id": conversation_id, "owner_id": owner_id},
+            {"$set": {
+                "active_attachment_ids": list(dict.fromkeys(attachment_ids))[:50],
+                "updated_at": _now(),
+            }},
+        )
+
     async def set_active_autodl_run(
         self, conversation_id: str, owner_id: str, run_id: str, metadata: dict[str, Any] | None = None,
     ) -> None:
@@ -114,6 +125,21 @@ class GenAIRepository:
         await self.conversations.update_one(
             {"_id": conversation_id, "owner_id": owner_id},
             {"$set": {"active_lab_resources.autodl": safe, "updated_at": _now()}},
+        )
+
+    async def set_active_lab_resource(
+        self, conversation_id: str, owner_id: str, tool: str, metadata: dict[str, Any],
+    ) -> None:
+        if tool not in {"automl", "autonlp", "autodl"}:
+            raise ValueError("Unsupported native lab resource.")
+        safe = {str(key): value for key, value in metadata.items() if value is not None}
+        await self.conversations.update_one(
+            {"_id": conversation_id, "owner_id": owner_id},
+            {"$set": {
+                f"active_lab_resources.{tool}": safe,
+                "active_lab_resources.current": {"tool": tool, **safe},
+                "updated_at": _now(),
+            }},
         )
 
     async def set_pending_confirmation(
