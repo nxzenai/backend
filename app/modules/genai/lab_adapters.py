@@ -177,10 +177,7 @@ def _prediction_text(query: str) -> str:
         return quoted.group(1).strip()
     if "\n" in query:
         follow_up = query.rsplit("\n", 1)[-1].strip()
-        if follow_up and not re.fullmatch(
-            r"(?:(?:use|choose|select)\s+\S+|manual(?:\s+values?)?|csv|upload(?:\s+a\s+csv)?)",
-            follow_up, re.I,
-        ):
+        if follow_up and not re.fullmatch(r"(?:use|choose|select)\s+\S+", follow_up, re.I):
             return follow_up
     return ""
 
@@ -286,23 +283,6 @@ def _prediction_result(tool: str, value: Any, *, label: str | None = None) -> To
     if tool == "automl":
         task = str(raw.get("task") or "")
         predictions = raw.get("predictions") or []
-        if raw.get("input_mode") == "csv" or len(predictions) > 1:
-            lines.append(f"**Batch prediction:** {len(predictions)} of {raw.get('rows', len(predictions))} rows completed")
-            counts: dict[str, int] = {}
-            display_predictions = raw.get("segment_labels") or raw.get("prediction_labels") or predictions
-            for item in display_predictions:
-                counts[str(item)] = counts.get(str(item), 0) + 1
-            if task in {"classification", "clustering"} and counts:
-                lines.append("**Result counts:** " + ", ".join(
-                    f"{_display(key)}: {count}" for key, count in sorted(counts.items())
-                ))
-            scores = raw.get("prediction_confidences") or []
-            for index, item in enumerate(display_predictions[:5]):
-                score = _percentage(scores[index]) if index < len(scores) else None
-                lines.append(f"- Row {index + 1}: {_display(item)}" + (f" (model score {score})" if score else ""))
-            if raw.get("model_name"):
-                lines.append(f"**Model:** {_display(raw['model_name'])}")
-            return ToolResult(tool, True, content="\n\n".join(lines), data={"result": raw})
         prediction = predictions[0] if predictions else None
         meanings = raw.get("prediction_meanings") or []
         encoded_fallback = False
@@ -394,30 +374,6 @@ def _prediction_result(tool: str, value: Any, *, label: str | None = None) -> To
                 lines.append(f"**Warning:** {_display(item)}")
 
     elif tool == "autodl":
-        if isinstance(raw.get("predictions"), list):
-            predictions = raw["predictions"]
-            errors = raw.get("errors") or []
-            valid = int(raw.get("valid_rows") if raw.get("valid_rows") is not None else len(predictions))
-            total = valid + len(errors)
-            lines.append(f"**Batch prediction:** {valid} of {total} rows completed")
-            if errors:
-                lines.append(f"**Warning:** {len(errors)} row(s) could not be predicted.")
-            counts: dict[str, int] = {}
-            for item in predictions:
-                result_value = item.get("predicted_class", item.get("predicted_category", item.get("predicted_value"))) if isinstance(item, dict) else item
-                if result_value is not None:
-                    counts[str(result_value)] = counts.get(str(result_value), 0) + 1
-            if counts and str((raw.get("problem") or {}).get("task") or "").endswith("classification"):
-                lines.append("**Result counts:** " + ", ".join(f"{_display(key)}: {count}" for key, count in sorted(counts.items())))
-            for index, item in enumerate(predictions[:5]):
-                value = item.get("predicted_class", item.get("predicted_category", item.get("predicted_value"))) if isinstance(item, dict) else item
-                score_value = item.get("confidence", item.get("model_score")) if isinstance(item, dict) else None
-                score = _percentage(score_value)
-                lines.append(f"- Row {index + 1}: {_display(value)}" + (f" (model score {score})" if score else ""))
-            model = raw.get("model") or {}
-            if model.get("name"):
-                lines.append(f"**Model:** {_display(model['name'])}")
-            return ToolResult(tool, True, content="\n\n".join(lines), data={"result": raw})
         prediction = raw.get("prediction") or {}
         category = prediction.get("predicted_class", prediction.get("predicted_category"))
         if category is not None:
@@ -669,72 +625,6 @@ class GenAILabAdapters:
                 return True
         return False
 
-    async def _load_tabular_attachment(
-        self, owner_id: str, attachment_id: str,
-    ) -> tuple[dict[str, Any], bytes, Any]:
-        metadata, contents = await self.genai_repository.read_attachment(attachment_id, owner_id)
-        from io import BytesIO
-        from fastapi import UploadFile
-        from app.modules.automl.router import dataframe_from_upload
-        upload = UploadFile(file=BytesIO(contents), filename=str(metadata.get("filename") or "dataset.csv"))
-        dataframe = await dataframe_from_upload(upload)
-        return metadata, contents, dataframe
-
-    async def inspect_training_intake(
-        self, user: Any, attachment: dict[str, Any], rows: int = 5,
-    ) -> dict[str, Any]:
-        """Build a deterministic, basic preview from existing native inspectors."""
-        owner_id = _owner(user)
-        attachment_id = str(attachment.get("id") or "")
-        metadata, _, dataframe = await self._load_tabular_attachment(owner_id, attachment_id)
-        information = self.automl.dataset_information(dataframe)
-        from app.modules.autonlp.dataset_loader import inspect_nlp_dataframe
-        nlp = inspect_nlp_dataframe(dataframe, str(metadata.get("filename") or "dataset.csv"))
-        missing_by_column = {
-            str(name): int(details.get("missing") or 0)
-            for name, details in (information.get("columns_info") or {}).items()
-        }
-        heavy = [
-            name for name, details in (information.get("columns_info") or {}).items()
-            if float(details.get("missing_percentage") or 0) >= 40
-        ]
-        numeric = [name for name, dtype in (information.get("dtypes") or {}).items() if any(
-            token in str(dtype).casefold() for token in ("int", "float", "decimal")
-        )]
-        categorical = [name for name in information.get("column_names") or [] if name not in numeric]
-        tasks = ["classification", "regression", "clustering"]
-        if nlp.get("text_candidates"):
-            tasks.extend(["text_classification", "sentiment_analysis", "intent_classification", "spam_classification"])
-        sample = self.automl.preview_dataset(dataframe, min(max(rows, 1), 5)).to_dict(orient="records")
-        observations = [
-            f"Numeric columns: {', '.join(numeric[:8])}." if numeric else "No obvious numeric columns were detected.",
-            f"Categorical/text columns: {', '.join(categorical[:8])}." if categorical else "No obvious categorical/text columns were detected.",
-        ]
-        duplicate_count = int(dataframe.duplicated().sum())
-        if duplicate_count:
-            observations.append(f"Duplicate rows: {duplicate_count}.")
-        if heavy:
-            observations.append(f"Missing-heavy columns: {', '.join(heavy[:8])}.")
-        if nlp.get("text_candidates"):
-            observations.append(f"Candidate text columns: {', '.join(nlp['text_candidates'][:8])}.")
-        if nlp.get("target_candidates"):
-            observations.append(f"Candidate target columns: {', '.join(nlp['target_candidates'][:8])}.")
-        return {
-            "attachment_id": attachment_id,
-            "filename": str(metadata.get("filename") or "dataset.csv"),
-            "rows": int(information.get("rows") or len(dataframe)),
-            "columns": int(information.get("columns") or len(dataframe.columns)),
-            "column_names": list(information.get("column_names") or []),
-            "dtypes": dict(information.get("dtypes") or {}),
-            "missing_values": int(information.get("missing_values") or 0),
-            "missing_by_column": missing_by_column,
-            "sample_rows": _safe_value(sample),
-            "observations": observations,
-            "supported_tasks": list(dict.fromkeys(tasks)),
-            "text_candidates": list(nlp.get("text_candidates") or []),
-            "target_candidates": list(nlp.get("target_candidates") or []),
-        }
-
     async def resolve(
         self, tool: str, user: Any, arguments: dict[str, Any], query: str = "",
         selected_attachments: list[dict[str, Any]] | None = None,
@@ -795,31 +685,12 @@ class GenAILabAdapters:
                 "Please attach the dataset you want to use.", ["dataset"], values,
             )
 
-        if tool == "automl" and action == "train" and not values.get("_native_validated"):
-            task = str(values.get("task") or "").casefold().replace("tabular_", "")
-            if not task:
-                raise LabPredictionInputRequired(
-                    "What would you like to train this dataset for? Supported tasks: classification, regression, or clustering.",
-                    ["task"], values,
-                )
-            if task not in {"classification", "regression", "clustering"}:
-                raise ValueError("AutoML supports classification, regression, and clustering.")
-            values["task"] = task
+        if tool == "automl" and action == "train":
+            task = str(values.get("task") or "").casefold()
             if task in {"classification", "regression"} and not values.get("target_column"):
                 raise LabPredictionInputRequired(
-                    "Which column should be used as the target?", ["target column"], values,
+                    "Please provide only the target column.", ["target column"], values,
                 )
-            metadata, _, dataframe = await self._load_tabular_attachment(
-                owner_id, str(values["attachment_id"]),
-            )
-            await asyncio.to_thread(
-                self.automl.validate_dataset, dataframe, values.get("target_column"), task=task,
-            )
-            values["_training_summary"] = {
-                "filename": str(metadata.get("filename") or "dataset.csv"),
-                "rows": len(dataframe), "features": len(dataframe.columns) - (1 if values.get("target_column") else 0),
-            }
-            values["_native_validated"] = True
 
         elif tool == "automl" and action in {"model", "information", "predict"} and not values.get("model_filename"):
             if values.get("model_id"):
@@ -857,30 +728,8 @@ class GenAILabAdapters:
                 values["model_filename"] = selected["model_filename"]
 
         if tool == "automl" and action == "predict" and values.get("model_filename"):
-            if values.get("_prediction_csv_requested") and not selected_attachments:
-                raise LabPredictionInputRequired(
-                    "Please attach the CSV to use for prediction.", ["prediction CSV"], values,
-                )
             artifact = await asyncio.to_thread(self.automl.load_owned_artifact, str(values["model_filename"]), owner_id)
             schema = (artifact.metadata or {}).get("prediction_schema") or {}
-            csv_attachment = (
-                selected_attachments[0]
-                if len(selected_attachments) == 1 and _is_csv_attachment(selected_attachments[0])
-                else None
-            )
-            if csv_attachment:
-                _, _, dataframe = await self._load_tabular_attachment(owner_id, str(csv_attachment["id"]))
-                required = schema.get("required_fields") or schema.get("expected_features") or artifact.original_feature_names
-                missing = [str(field) for field in required if field not in dataframe.columns]
-                if missing:
-                    raise ValueError("Prediction CSV is missing required columns: " + ", ".join(missing) + ".")
-                if len(dataframe) > artifact.max_prediction_rows:
-                    raise ValueError(f"Prediction request exceeds the maximum allowed rows ({artifact.max_prediction_rows}).")
-                values["attachment_id"] = csv_attachment["id"]
-                values["_batch_prediction"] = True
-                values["original_query"] = source_query
-                values.pop("rows", None)
-                return values
             existing = values.get("rows")
             row = dict(existing[0]) if isinstance(existing, list) and existing and isinstance(existing[0], dict) else {}
             extracted, _ = _schema_values(source_query, schema)
@@ -917,10 +766,6 @@ class GenAILabAdapters:
 
         if tool == "autonlp" and action == "predict":
             has_csv = len(selected_attachments) == 1 and _is_csv_attachment(selected_attachments[0])
-            if values.get("_prediction_csv_requested") and not has_csv:
-                raise LabPredictionInputRequired(
-                    "Please attach the CSV to use for prediction.", ["prediction CSV"], values,
-                )
             if has_csv and len(selected_attachments) == 1:
                 values["attachment_id"] = selected_attachments[0]["id"]
             values["text"] = str(values.get("text") or ("" if has_csv else _prediction_text(source_query))).strip()
@@ -929,45 +774,12 @@ class GenAILabAdapters:
                 raise LabPredictionInputRequired(
                     "What text would you like me to analyze?", ["prediction text"], values,
                 )
-            if has_csv and values.get("attachment_id"):
-                try:
-                    _, _, dataframe = await self._load_tabular_attachment(owner_id, str(values["attachment_id"]))
-                except TypeError:
-                    # Resolver-only unit doubles may not expose a database.
-                    dataframe = None
-                registered = (
-                    self.autonlp._registered_model(str(values["model_id"]), owner_id)
-                    if hasattr(self.autonlp, "_registered_model") else None
-                )
-                text_column = str(
-                    values.get("text_column")
-                    or ((registered.configuration or {}).get("text_column") if registered is not None else "")
-                    or ""
-                ).strip()
-                if not text_column:
-                    if dataframe is None:
-                        return values
-                    raise LabPredictionInputRequired(
-                        "Which column contains the text to analyze?", ["text column"], values,
-                    )
-                if dataframe is not None and text_column not in dataframe.columns:
-                    raise ValueError(f"Prediction CSV is missing required text column '{text_column}'.")
-                values["text_column"] = text_column
 
         elif tool == "autodl" and values.get("model_id") and not values.get("run_id"):
             model = await asyncio.to_thread(self.autodl_training.repository.get_model, str(values["model_id"]), owner_id)
             values["run_id"] = str(model.get("run_id"))
 
-        if tool == "autodl" and action == "predict" and values.get("_prediction_csv_requested") and not selected_attachments:
-            raise LabPredictionInputRequired(
-                "Please attach the CSV to use for prediction.", ["prediction CSV"], values,
-            )
-
-        elif (
-            tool == "autodl" and action == "train" and selected_attachments
-            and not values.get("_native_validated")
-            and (not values.get("run_id") or values.get("target_column"))
-        ):
+        elif tool == "autodl" and action == "train" and not values.get("run_id") and selected_attachments:
             if len(selected_attachments) != 1:
                 candidates = [{"attachment_id": item.get("id"), "filename": item.get("filename")} for item in selected_attachments]
                 raise self._selection_required("AutoDL dataset", candidates, "attachment_id", values)
@@ -994,7 +806,6 @@ class GenAILabAdapters:
                 values.setdefault("confirmed_task", detected_value)
             if values.get("confirmed_task"):
                 values.setdefault("confirmed_target", values.get("target_column"))
-                values.setdefault("confirmed_timestamp", values.get("timestamp_column"))
 
         elif tool == "autodl" and action not in {"readiness", "cancel"} and not values.get("run_id"):
             def owner_runs() -> list[dict[str, Any]]:
@@ -1050,46 +861,15 @@ class GenAILabAdapters:
                 values["model_id"] = selected["model_id"]
         if tool == "eda" and action == "transform" and not values.get("transformation"):
             raise ValueError("EDA transformation requires a structured transformation operation payload.")
-        if tool == "autonlp" and action == "train" and not values.get("_native_validated"):
+        if tool == "autonlp" and action == "train":
             if values.get("task") in {"classification", "binary", "multiclass"}:
                 values["task"] = "text_classification"
-            if not values.get("task"):
+            missing = [key for key in ("text_column", "target_column", "task") if not values.get(key)]
+            if missing:
                 raise LabPredictionInputRequired(
-                    "What would you like to train this dataset for? Supported tasks: text classification, sentiment analysis, intent classification, or spam classification.",
-                    ["task"], values,
+                    "Please provide only: " + ", ".join(item.replace("_", " ") for item in missing) + ".",
+                    missing, values,
                 )
-            if not values.get("target_column"):
-                raise LabPredictionInputRequired(
-                    "Which column should be used as the target?", ["target column"], values,
-                )
-            if not values.get("text_column"):
-                raise LabPredictionInputRequired(
-                    "Which column contains the training text?", ["text column"], values,
-                )
-            metadata, _, dataframe = await self._load_tabular_attachment(
-                owner_id, str(values["attachment_id"]),
-            )
-            from app.modules.autonlp.constants import NLPTask
-            from app.modules.autonlp.dataset_loader import inspect_nlp_dataframe
-            task = NLPTask(str(values["task"]))
-            inspection = inspect_nlp_dataframe(
-                dataframe, str(metadata.get("filename") or "dataset.csv"),
-                str(values["text_column"]), str(values["target_column"]),
-            )
-            if inspection.get("label_mapping_reliable") and not values.get("label_display_mapping"):
-                values["label_display_mapping"] = inspection.get("label_display_mapping") or {}
-            candidates = [str(item) for item in values.get("candidate_architectures", [])]
-            await asyncio.to_thread(
-                self.autonlp._validate_request,
-                dataframe, str(values["text_column"]), str(values["target_column"]), task,
-                int(values.get("max_epochs") or 30), str(values.get("strategy") or "auto"), candidates,
-                values.get("label_display_mapping") or {},
-            )
-            values["_training_summary"] = {
-                "filename": str(metadata.get("filename") or "dataset.csv"),
-                "rows": len(dataframe), "features": max(1, len(dataframe.columns) - 1),
-            }
-            values["_native_validated"] = True
         if tool == "autodl" and values.get("run_id"):
             run = await asyncio.to_thread(self.autodl_training.repository.get_run, str(values["run_id"]), owner_id)
             if action == "train":
@@ -1113,46 +893,6 @@ class GenAILabAdapters:
                     raise LabPredictionInputRequired(
                         "Is this a classification or regression task?", ["task"], values,
                     )
-                target_required = str(values.get("confirmed_task")) != "image_classification"
-                if target_required and not values.get("target_column") and not values.get("confirmed_target"):
-                    raise LabPredictionInputRequired(
-                        "Which column should be used as the target?", ["target column"], values,
-                    )
-                if target_required:
-                    values["confirmed_target"] = values.get("target_column") or values.get("confirmed_target")
-                    tabular = inspection.get("tabular") or {}
-                    suitability = tabular.get("target_suitability") or {}
-                    if suitability and not suitability.get("suitable", False):
-                        raise ValueError(str(suitability.get("explanation") or "The selected target is not suitable."))
-                tabular = inspection.get("tabular") or {}
-                image = inspection.get("image") or {}
-                if str(values.get("confirmed_task") or "").startswith("time_series_"):
-                    timestamp_candidates = list(tabular.get("timestamp_candidates") or [])
-                    if values.get("timestamp_column"):
-                        values["confirmed_timestamp"] = values["timestamp_column"]
-                    if not values.get("confirmed_timestamp"):
-                        suggestion = f" Suggested: {timestamp_candidates[0]}." if len(timestamp_candidates) == 1 else ""
-                        raise LabPredictionInputRequired(
-                            "Which column defines the observation order?" + suggestion,
-                            ["timestamp column"], values,
-                        )
-                    quality = tabular.get("timestamp_quality") or {}
-                    if quality.get("cleaning_blocked"):
-                        raise ValueError("The selected timestamp column has too many invalid values for native time-series training.")
-                    if quality.get("missing_timestamps", 0) or quality.get("invalid_timestamps", 0):
-                        if not values.get("timestamp_handling"):
-                            raise LabPredictionInputRequired(
-                                "Some timestamp values are missing or invalid. Reply clean to use native timestamp cleaning.",
-                                ["timestamp handling"], values,
-                            )
-                        if values.get("timestamp_handling") != "clean":
-                            raise ValueError("Native time-series training requires clean timestamp handling for these invalid values.")
-                values["_training_summary"] = {
-                    "filename": str(run.get("filename") or (selected_attachments[0].get("filename") if selected_attachments else "dataset")),
-                    "rows": int(tabular.get("rows") or image.get("total_images") or 0),
-                    "features": max(0, int(tabular.get("columns") or 0) - (1 if target_required else 0)),
-                }
-                values["_native_validated"] = True
             if action == "stage" and not values.get("model_id"):
                 models = await asyncio.to_thread(self.autodl_training.repository.list_models, str(values["run_id"]), owner_id)
                 candidates = [{"model_id": str(item.get("_id")), "model_type": item.get("model_key")} for item in models]
@@ -1175,22 +915,6 @@ class GenAILabAdapters:
                     values["attachment_id"] = selected_attachments[0]["id"]
                 elif task.startswith("tabular_"):
                     schema = _autodl_schema(winner.get("preprocessing") or {})
-                    csv_attachment = (
-                        selected_attachments[0]
-                        if len(selected_attachments) == 1 and _is_csv_attachment(selected_attachments[0])
-                        else None
-                    )
-                    if csv_attachment:
-                        _, _, dataframe = await self._load_tabular_attachment(owner_id, str(csv_attachment["id"]))
-                        missing = [field for field in schema["required_fields"] if field not in dataframe.columns]
-                        if missing:
-                            raise ValueError("Prediction CSV is missing required columns: " + ", ".join(missing) + ".")
-                        values["attachment_id"] = csv_attachment["id"]
-                        values["_batch_prediction"] = True
-                        values.pop("input", None)
-                        values["original_query"] = source_query
-                        values.pop("_explicit_resource_switch", None)
-                        return values
                     existing = values.get("input") if isinstance(values.get("input"), dict) else {}
                     extracted, _ = _schema_values(source_query, schema)
                     row = {**existing, **extracted}
@@ -1203,18 +927,6 @@ class GenAILabAdapters:
                             "Please provide only these required values: " + ", ".join(missing) + ".",
                             missing, values,
                         )
-                elif task.startswith("time_series_"):
-                    csv_attachment = (
-                        selected_attachments[0]
-                        if len(selected_attachments) == 1 and _is_csv_attachment(selected_attachments[0])
-                        else None
-                    )
-                    if not csv_attachment:
-                        raise LabPredictionInputRequired(
-                            "Select a CSV containing the required time-series columns.", ["prediction CSV"], values,
-                        )
-                    values["attachment_id"] = csv_attachment["id"]
-                    values["_batch_prediction"] = True
                 else:
                     raise ValueError("Natural-language prediction currently supports completed AutoDL tabular and image models.")
         if tool == "autodl" and action == "train" and not values.get("attachment_id"):
@@ -1555,16 +1267,10 @@ class GenAILabAdapters:
             information.pop("path", None)
             return _result("automl", information)
         if action == "predict":
-            import pandas as pd
-            attachment_id = str(values.get("attachment_id") or "").strip()
-            if attachment_id and values.get("_batch_prediction"):
-                _, _, dataframe = await self._load_tabular_attachment(owner_id, attachment_id)
-                predicted = await asyncio.to_thread(self.automl.predict_artifact_values, artifact, dataframe)
-                predicted["input_mode"] = "csv"
-                return _prediction_result("automl", predicted)
             rows = values.get("rows")
             if not isinstance(rows, list) or not rows:
-                raise ValueError("AutoML prediction requires a non-empty rows list or a selected CSV attachment.")
+                raise ValueError("AutoML prediction requires a non-empty rows list.")
+            import pandas as pd
             return _prediction_result(
                 "automl", await asyncio.to_thread(self.automl.predict_artifact_values, artifact, pd.DataFrame(rows)),
             )

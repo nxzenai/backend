@@ -49,6 +49,3 @@ Thumbs.db
 .coverage
 .coverage.*
 htmlcov/
-
-# Local LLM models
-models/*.gguf

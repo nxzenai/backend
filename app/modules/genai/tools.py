@@ -135,10 +135,6 @@ class ToolRouter:
     _python = re.compile(r"\b(python lab|inspect (?:my )?notebook|notebook cells?|run (?:this )?(?:python|cell)|execute (?:this )?(?:python|cell))\b", re.I)
     _sql = re.compile(r"\b(sql lab|database schema|run (?:this )?(?:sql|query)|execute (?:this )?(?:sql|query)|query (?:my|the) database)\b", re.I)
     _module = re.compile(r"\b(automl|autodl|autonlp|eda|python lab|sql lab|nxzenai workflow)\b", re.I)
-    _native_training = re.compile(
-        r"\b(?:train|retrain|fit)\b|\b(?:start|begin)\s+training\b|\b(?:build|create)\b[\s\S]{0,80}\bmodel\b",
-        re.I,
-    )
     _module_aliases = (
         (re.compile(r"\b(exploratory data analysis|data quality|data profiling)\b", re.I), "eda"),
         (re.compile(r"\b(autonlp|natural language processing|text classification|sentiment(?: analysis)?|intent(?: classification)?|spam(?: classification)?)\b", re.I), "autonlp"),
@@ -148,11 +144,6 @@ class ToolRouter:
 
     @classmethod
     def explicit_lab(cls, query: str) -> str | None:
-        # An explicitly named native lab is authoritative.  Check these before
-        # broader task aliases such as "text classification".
-        for name in ("automl", "autonlp", "autodl"):
-            if re.search(rf"\b{name}\b", query, re.I):
-                return name
         for pattern, tool in cls._module_aliases:
             if pattern.search(query):
                 return tool
@@ -162,30 +153,9 @@ class ToolRouter:
             return "sql_lab"
         return None
 
-    @classmethod
-    def training_lab(cls, query: str) -> str | None:
-        explicit = cls.explicit_lab(query)
-        if explicit in {"automl", "autonlp", "autodl"}:
-            return explicit
-        if re.search(r"\b(sentiment|intent|spam|text\s+classif|natural language processing)\b", query, re.I):
-            return "autonlp"
-        if re.search(r"\b(deep learning|neural|image\s+classif\w*|time[- ]series)\b", query, re.I):
-            return "autodl"
-        if re.search(r"\b(tabular|classif\w*|regress\w*|cluster\w*|machine learning|churn)\b", query, re.I):
-            return "automl"
-        return None
-
-    @classmethod
-    def is_training_intent(cls, query: str) -> bool:
-        return bool(cls._native_training.search(query))
-
     def route(self, query: str, requested: list[str], attachment_ids: list[str]) -> list[str]:
-        explicit = self.explicit_lab(query)
-        if explicit and re.search(
-            r"\b(train|training|retrain|build|create|fit|predict|result|status|progress|inspect|preview)\b",
-            query, re.I,
-        ):
-            return [explicit]
+        if requested:
+            return list(dict.fromkeys(requested))
         if self._sql.search(query):
             return ["sql_lab"]
         if self._python.search(query):
@@ -196,17 +166,17 @@ class ToolRouter:
                 query, re.I,
             ):
                 return [tool]
-        training = self.is_training_intent(query)
+        training = re.search(r"\btrain\b", query, re.I) or (
+            re.search(r"\b(retrain|build|create|fit)\b", query, re.I)
+            and re.search(r"\bmodel\b", query, re.I)
+        )
         if training:
-            inferred_lab = self.training_lab(query)
-            if inferred_lab:
-                return [inferred_lab]
-            # A recognized training request must stay on the deterministic
-            # native intake path even when the client omitted the current
-            # attachment id. The service resolves conversation attachments.
-            return ["native_training"]
-        if requested:
-            return list(dict.fromkeys(requested))
+            if re.search(r"\b(sentiment|intent|spam|text\s+classif|autonlp)\b", query, re.I):
+                return ["autonlp"]
+            if re.search(r"\b(autodl|deep learning|neural|image\s+classif\w*|time[- ]series|tabular\s+(?:classif\w*|regress\w*))\b", query, re.I):
+                return ["autodl"]
+            if re.search(r"\b(automl|churn|classif|regress|cluster|machine learning)\b", query, re.I):
+                return ["automl"]
         attachment_intent = re.search(r"\b(summari[sz]e|review|analy[sz]e|explain|what.+(?:say|contain))\b", query, re.I)
         if attachment_ids and (self._files.search(query) or attachment_intent):
             return ["files"]
