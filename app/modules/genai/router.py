@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import json
-
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, Response, UploadFile, status
 from fastapi.responses import StreamingResponse
 
@@ -11,12 +9,13 @@ from app.core.config.settings import settings
 from app.modules.genai.dependencies import get_genai_service
 from app.modules.genai.exceptions import GenAIException, LlamaModelNotAvailableError
 from app.modules.genai.schemas import (
-    ChatRequest, ChatResponse, ConversationCreate, ConversationDetail,
+    ChatRequest, ChatResponse, ConversationAttachmentSelection, ConversationCreate, ConversationDetail,
     ConversationProjectUpdate, ConversationSummary, ConversationUpdate, HealthResponse, MemoryCreate,
     MemoryResponse, PreferencesResponse, PreferencesUpdate, ProjectCreate, ProjectResponse,
     ProjectUpdate, AttachmentResponse, ToolStatus,
 )
 from app.modules.genai.service import GenAIService
+from app.modules.genai.serialization import json_safe, json_safe_dumps
 
 
 router = APIRouter(prefix="/genai", tags=["GenAI"])
@@ -58,7 +57,7 @@ async def conversation_detail(
     current_user: UserModel = Depends(get_current_user),
 ):
     try:
-        return await service.conversation_detail(conversation_id, _owner(current_user))
+        return json_safe(await service.conversation_detail(conversation_id, _owner(current_user)))
     except GenAIException as exc:
         raise _http_error(exc) from exc
 
@@ -70,6 +69,23 @@ async def rename_conversation(
 ):
     try:
         return await service.rename_conversation(conversation_id, _owner(current_user), payload.title)
+    except GenAIException as exc:
+        raise _http_error(exc) from exc
+
+
+@router.put(
+    "/conversations/{conversation_id}/active-attachments",
+    response_model=ConversationAttachmentSelection,
+)
+async def set_active_attachments(
+    conversation_id: str, payload: ConversationAttachmentSelection,
+    service: GenAIService = Depends(get_genai_service),
+    current_user: UserModel = Depends(get_current_user),
+):
+    try:
+        return await service.set_active_attachments(
+            conversation_id, _owner(current_user), payload.attachment_ids,
+        )
     except GenAIException as exc:
         raise _http_error(exc) from exc
 
@@ -118,7 +134,7 @@ async def chat(
         raise HTTPException(status_code=503, detail={"code": "GENAI_EMPTY_RESPONSE", "message": "The inference service returned no response."})
     return ChatResponse(
         conversation_id=metadata["conversation_id"], generation_id=metadata["generation_id"],
-        message=completed["message"], requested_tier=metadata["requested_tier"],
+        message=json_safe(completed["message"]), requested_tier=metadata["requested_tier"],
         model_tier=metadata["model_tier"], model_name=metadata["model_name"],
         reasoning=metadata["reasoning"], route_reason=metadata["route_reason"],
     )
@@ -141,13 +157,13 @@ async def stream_chat(
                     if generation_id:
                         await service.cancel(generation_id, owner_id)
                     break
-                yield f"data: {json.dumps(event, default=str, ensure_ascii=False)}\n\n"
+                yield f"data: {json_safe_dumps(event)}\n\n"
         except LlamaModelNotAvailableError as exc:
-            yield f"data: {json.dumps({'type': 'error', 'code': 'GENAI_TIER_UNAVAILABLE', 'message': str(exc)})}\n\n"
+            yield f"data: {json_safe_dumps({'type': 'error', 'code': 'GENAI_TIER_UNAVAILABLE', 'message': str(exc)})}\n\n"
         except GenAIException as exc:
-            yield f"data: {json.dumps({'type': 'error', 'code': 'GENAI_REQUEST_INVALID', 'message': str(exc)})}\n\n"
+            yield f"data: {json_safe_dumps({'type': 'error', 'code': 'GENAI_REQUEST_INVALID', 'message': str(exc)})}\n\n"
         except Exception:
-            yield f"data: {json.dumps({'type': 'error', 'code': 'GENAI_STREAM_FAILED', 'message': 'The response stream could not be started.'})}\n\n"
+            yield f"data: {json_safe_dumps({'type': 'error', 'code': 'GENAI_STREAM_FAILED', 'message': 'The response stream could not be started.'})}\n\n"
 
     return StreamingResponse(events(), media_type="text/event-stream", headers={
         "Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no",

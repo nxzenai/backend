@@ -21,6 +21,10 @@ class ConversationUpdate(BaseModel):
     title: str = Field(min_length=1, max_length=MAX_TITLE_CHARACTERS)
 
 
+class ConversationAttachmentSelection(BaseModel):
+    attachment_ids: list[str] = Field(default_factory=list, max_length=50)
+
+
 class ConversationSummary(BaseModel):
     id: str
     title: str
@@ -42,6 +46,7 @@ class ChatMessage(BaseModel):
 
 class ConversationDetail(ConversationSummary):
     messages: list[ChatMessage] = Field(default_factory=list)
+    active_attachment_ids: list[str] = Field(default_factory=list)
     pending_prediction: dict[str, Any] | None = None
     pending_confirmation: dict[str, Any] | None = None
     active_lab_resources: dict[str, dict[str, Any]] = Field(default_factory=dict)

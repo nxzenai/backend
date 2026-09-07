@@ -9,13 +9,14 @@ from typing import Any
 import pandas as pd
 
 
-SUPPORTED_EXTENSIONS = {".pdf", ".docx", ".txt", ".csv", ".xlsx", ".py", ".sql", ".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}
+SUPPORTED_EXTENSIONS = {".pdf", ".docx", ".txt", ".csv", ".xlsx", ".zip", ".py", ".sql", ".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}
 SUPPORTED_CONTENT_TYPES = {
     ".pdf": {"application/pdf", "application/octet-stream"},
     ".docx": {"application/vnd.openxmlformats-officedocument.wordprocessingml.document", "application/octet-stream"},
     ".txt": {"text/plain", "application/octet-stream"},
     ".csv": {"text/csv", "application/csv", "text/plain", "application/vnd.ms-excel", "application/octet-stream"},
     ".xlsx": {"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "application/octet-stream"},
+    ".zip": {"application/zip", "application/x-zip-compressed", "application/octet-stream"},
     ".py": {"text/x-python", "text/python", "text/plain", "application/x-python-code", "application/octet-stream"},
     ".sql": {"application/sql", "application/x-sql", "text/sql", "text/plain", "application/octet-stream"},
     ".png": {"image/png", "application/octet-stream"},
@@ -35,7 +36,7 @@ def _clean(value: Any) -> str:
 def validate_attachment_type(filename: str, content_type: str) -> None:
     suffix = Path(filename).suffix.casefold()
     if suffix not in SUPPORTED_EXTENSIONS:
-        raise ValueError("Supported files are PDF, DOCX, TXT, CSV, XLSX, PY, SQL, PNG, JPG, WEBP, BMP, and TIFF.")
+        raise ValueError("Supported files are PDF, DOCX, TXT, CSV, XLSX, ZIP, PY, SQL, PNG, JPG, WEBP, BMP, and TIFF.")
     normalized_type = (content_type or "application/octet-stream").split(";", 1)[0].strip().casefold()
     if normalized_type not in SUPPORTED_CONTENT_TYPES[suffix]:
         raise ValueError("The file type does not match its extension.")
@@ -44,8 +45,8 @@ def validate_attachment_type(filename: str, content_type: str) -> None:
 def extract_text(filename: str, content: bytes) -> tuple[str, dict[str, Any]]:
     suffix = Path(filename).suffix.casefold()
     if suffix not in SUPPORTED_EXTENSIONS:
-        raise ValueError("Supported files are PDF, DOCX, TXT, CSV, XLSX, PY, SQL, PNG, JPG, WEBP, BMP, and TIFF.")
-    if suffix in {".docx", ".xlsx"}:
+        raise ValueError("Supported files are PDF, DOCX, TXT, CSV, XLSX, ZIP, PY, SQL, PNG, JPG, WEBP, BMP, and TIFF.")
+    if suffix in {".docx", ".xlsx", ".zip"}:
         try:
             with zipfile.ZipFile(io.BytesIO(content)) as archive:
                 entries = archive.infolist()

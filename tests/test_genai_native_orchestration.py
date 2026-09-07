@@ -1,9 +1,15 @@
 from __future__ import annotations
 
+import io
+import json
+import re
+import zipfile
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import numpy as np
+import pandas as pd
 from fastapi import HTTPException
 
 from app.modules.genai.lab_adapters import (
@@ -16,7 +22,10 @@ from app.modules.genai.lab_adapters import (
     _prediction_result,
     _schema_values,
 )
+from app.modules.genai.attachments import extract_text, validate_attachment_type
+from app.modules.genai.exceptions import GenAIException
 from app.modules.genai.schemas import ChatRequest
+from app.modules.genai.serialization import json_safe_dumps
 from app.modules.genai.service import GenAIService
 from app.modules.genai.tools import (
     GenAIToolRegistry, ToolDefinition, ToolExecutionContext, ToolResult, ToolRouter,
@@ -36,13 +45,30 @@ class FakeRepository:
         self.confirmation = None
         self.cleared_prediction = False
         self.messages = []
+        self.current_attachment_ids = []
+        self.attached_ids_seen = []
 
     async def get_conversation(self, conversation_id, owner_id):
         assert owner_id == OWNER
         return dict(self.conversation)
 
     async def attach_files_to_conversation(self, owner_id, attachment_ids, conversation_id, project_id):
+        self.attached_ids_seen.append(list(attachment_ids))
         return [{"id": value, "filename": "dataset.csv", "content_type": "text/csv", "extraction": {"format": "csv"}} for value in attachment_ids]
+
+    async def attachment_ids_for_conversation(self, owner_id, conversation_id):
+        assert owner_id == OWNER
+        return list(self.current_attachment_ids)
+
+    async def set_active_attachment_ids(self, conversation_id, owner_id, attachment_ids):
+        self.conversation["active_attachment_ids"] = list(attachment_ids)
+
+    async def list_attachments(self, owner_id, conversation_id=None, project_id=None):
+        active = self.conversation.get("active_attachment_ids") or []
+        return [{"id": value, "filename": "dataset.csv"} for value in active]
+
+    async def list_messages(self, conversation_id, owner_id):
+        return list(self.messages)
 
     async def set_pending_confirmation(self, conversation_id, owner_id, state):
         self.confirmation = dict(state)
@@ -66,6 +92,11 @@ class FakeRepository:
     async def set_active_autodl_run(self, conversation_id, owner_id, run_id, metadata=None):
         resources = self.conversation.setdefault("active_lab_resources", {})
         resources["autodl"] = {"run_id": run_id, **(metadata or {})}
+
+    async def set_active_lab_resource(self, conversation_id, owner_id, tool, metadata):
+        resources = self.conversation.setdefault("active_lab_resources", {})
+        resources[tool] = dict(metadata)
+        resources["current"] = {"tool": tool, **metadata}
 
     async def set_pending_prediction(self, conversation_id, owner_id, state):
         self.conversation["pending_prediction"] = dict(state)
@@ -107,7 +138,9 @@ def test_prediction_and_training_routes_are_lab_isolated():
     assert router.route("AutoDL predict feature_1=0.8", [], []) == ["autodl"]
     assert router.route("Train a churn classification model", [], ["file-1"]) == ["automl"]
     assert router.route("Train a sentiment model", [], ["file-1"]) == ["autonlp"]
-    assert router.route("Train a tabular classification model", [], ["file-1"]) == ["autodl"]
+    assert router.route("Train a tabular classification model", [], ["file-1"]) == ["automl"]
+    assert router.route("Train an AutoDL tabular classification model", [], ["file-1"]) == ["autodl"]
+    assert router.route("Train this dataset", [], ["file-1"]) == ["native_training"]
 
 
 def test_explicit_autodl_task_family_is_authoritative_after_detection():
@@ -765,12 +798,22 @@ async def test_native_failure_never_falls_back_to_llm_generation():
     assert not any(event["type"] == "delta" for event in events)
 
 
-def test_frontend_deduplicates_and_clears_native_attachment_state():
+def test_frontend_deduplicates_and_preserves_attachment_state_until_explicit_removal():
     hook = (Path(__file__).parents[2] / "frontend-main/src/hooks/useGenAIChat.ts").read_text(encoding="utf-8")
-    assert "current.filter(item => item.id !== attachment.id)" in hook
-    assert 'pendingResolution ? [id] : [...current, id]' in hook
+    assert "addComposerAttachment(selectedAttachmentIds, attachment.id)" in hook
+    assert "removeComposerAttachment(selectedAttachmentIds, id)" in hook
+    assert "attachmentIdsForMessage(" in hook
+    assert "preserveComposerAttachmentIds(current)" in hook
+    assert "restoreConversationAttachmentIds(conversation.active_attachment_ids)" in hook
+    assert "setActiveAttachments(activeConversationId, nextSelection)" in hook
     assert 'setSelectedAttachmentIds([]);' in hook
-    assert 'nlpPredictionIntent' in hook
+    assert "backend is the sole authority" in hook
+    assert "resolveToolRequest" not in hook
+    assert "completed && !preserveSelectedAttachments" not in hook
+    assert not re.search(
+        r'\["automl", "autonlp", "autodl"\][\s\S]{0,180}setSelectedAttachmentIds\(\[\]\)',
+        hook,
+    )
 
 
 def test_frontend_never_emits_internal_provide_slot_copy():
@@ -932,4 +975,853 @@ def test_frontend_and_backend_route_autodl_status_result_without_readiness_fallb
     assert result["action"] == "result"
     assert cancel["action"] == "cancel"
     hook = (Path(__file__).parents[2] / "frontend-main/src/hooks/useGenAIChat.ts").read_text(encoding="utf-8")
-    assert '[/\\b(status|progress|ready|latest|last)\\b/i, "status"]' in hook
+    assert "backend is the sole authority" in hook
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("query", ("Train this dataset.", "Build a model using this CSV.", "Train this."))
+async def test_vague_training_returns_native_preview_and_persists_task_continuation(query):
+    repository = FakeRepository()
+
+    class IntakeAdapters(FakeAdapters):
+        @staticmethod
+        async def inspect_training_intake(user, attachment):
+            return {
+                "attachment_id": attachment["id"], "filename": "dataset.csv",
+                "rows": 3, "columns": 2, "column_names": ["age", "label"],
+                "dtypes": {"age": "int64", "label": "object"},
+                "missing_values": 1, "missing_by_column": {"age": 0, "label": 1},
+                "sample_rows": [{"age": 20, "label": "yes"}],
+                "observations": ["Numeric columns: age.", "Candidate target columns: label."],
+                "supported_tasks": ["classification", "regression", "clustering"],
+            }
+
+    service = GenAIService(repository, IntakeAdapters())
+    events = [event async for event in service.stream_chat(ChatRequest(
+        conversation_id="conversation-1", message=query, attachment_ids=["attachment-1"],
+        tools=["files"],
+    ), OWNER, USER)]
+    done = next(event for event in events if event["type"] == "done")
+    content = done["message"]["content"]
+    assert all(value in content for value in (
+        "Dataset Preview", "Rows", "Columns", "age (int64)", "label (object)",
+        "Missing values", "First rows", "Basic observations", "Supported compatible tasks",
+    ))
+    question = "What would you like to train this dataset for?"
+    assert content.endswith(question)
+    assert repository.conversation["pending_prediction"]["tool"] == "native_training"
+    assert repository.conversation["pending_prediction"]["attachment_ids"] == ["attachment-1"]
+    assert not any(event["type"] == "delta" for event in events)
+    assert next(event for event in events if event["type"] == "metadata")["model_name"] == "native-training-router"
+
+
+@pytest.mark.asyncio
+async def test_native_preview_sse_payload_normalizes_dataframe_missing_values_to_json_null():
+    repository = FakeRepository()
+
+    class IntakeAdapters(FakeAdapters):
+        @staticmethod
+        async def inspect_training_intake(user, attachment):
+            return {
+                "attachment_id": attachment["id"], "filename": "dataset.csv",
+                "rows": 3, "columns": 4,
+                "column_names": ["society", "bath", "label", "created_at"],
+                "dtypes": {
+                    "society": "object", "bath": "float64",
+                    "label": "object", "created_at": "datetime64[ns]",
+                },
+                "missing_values": 4,
+                "missing_by_column": {"society": 1, "bath": 1, "label": 1, "created_at": 1},
+                "sample_rows": [{
+                    "society": float("nan"), "bath": np.float32(2.0),
+                    "label": pd.NA, "created_at": pd.NaT,
+                    "non_finite": float("inf"),
+                }],
+                "observations": ["Missing values are present."],
+                "supported_tasks": ["classification", "regression", "clustering"],
+            }
+
+    events = [event async for event in GenAIService(repository, IntakeAdapters()).stream_chat(
+        ChatRequest(
+            conversation_id="conversation-1", message="Train this dataset.",
+            attachment_ids=["attachment-1"],
+        ), OWNER, USER,
+    )]
+    done = next(event for event in events if event["type"] == "done")
+    serialized = json_safe_dumps(done)
+    assert not re.search(r"\b(?:NaN|Infinity|-Infinity)\b", serialized)
+    parsed = json.loads(serialized)
+    sample = parsed["message"]["metadata"]["inspection"]["sample_rows"][0]
+    assert sample == {
+        "society": None, "bath": 2.0, "label": None,
+        "created_at": None, "non_finite": None,
+    }
+    assert "Dataset Preview" in parsed["message"]["content"]
+    assert "null" in parsed["message"]["content"]
+    assert parsed["message"]["content"].endswith("What would you like to train this dataset for?")
+
+
+@pytest.mark.asyncio
+async def test_pending_vague_training_renders_stored_preview_without_llm_fallback():
+    inspection = {
+        "attachment_id": "attachment-1", "filename": "dataset.csv",
+        "rows": 3, "columns": 2, "column_names": ["age", "label"],
+        "dtypes": {"age": "int64", "label": "object"},
+        "missing_values": 1, "missing_by_column": {"age": 0, "label": 1},
+        "sample_rows": [{"age": 20, "label": "yes"}],
+        "observations": ["Numeric columns: age.", "Candidate target columns: label."],
+        "supported_tasks": ["classification", "regression", "clustering"],
+    }
+    repository = FakeRepository({
+        "tool": "native_training", "action": "train",
+        "arguments": {"action": "train", "attachment_id": "attachment-1", "_intake": inspection},
+        "attachment_ids": ["attachment-1"], "missing_fields": ["task"],
+        "requested_fields": ["task"], "prompt": "What would you like to train this dataset for?",
+    })
+
+    events = [event async for event in GenAIService(repository, FakeAdapters()).stream_chat(
+        ChatRequest(conversation_id="conversation-1", message="Train this dataset."), OWNER, USER,
+    )]
+
+    content = next(event for event in events if event["type"] == "done")["message"]["content"]
+    assert all(value in content for value in (
+        "Dataset Preview", "Rows", "Columns", "age (int64)", "label (object)",
+        "Missing values", "First rows", "Basic observations", "Supported compatible tasks",
+    ))
+    assert content.endswith("What would you like to train this dataset for?")
+    assert not any(event["type"] == "delta" for event in events)
+    assert next(event for event in events if event["type"] == "metadata")["model_name"] == "native-training-router"
+
+
+@pytest.mark.asyncio
+async def test_pending_vague_training_recovers_missing_stored_preview_from_bound_attachment():
+    repository = FakeRepository({
+        "tool": "native_training", "action": "train", "arguments": {"action": "train"},
+        "attachment_ids": ["attachment-1"], "missing_fields": ["task"],
+        "requested_fields": ["task"], "prompt": "What would you like to train this dataset for?",
+    })
+
+    class RecoveryAdapters(FakeAdapters):
+        inspections = 0
+
+        async def inspect_training_intake(self, user, attachment):
+            self.inspections += 1
+            return {
+                "attachment_id": attachment["id"], "filename": "dataset.csv",
+                "rows": 3, "columns": 2, "column_names": ["age", "label"],
+                "dtypes": {"age": "int64", "label": "object"},
+                "missing_values": 0, "missing_by_column": {"age": 0, "label": 0},
+                "sample_rows": [{"age": 20, "label": "yes"}],
+                "observations": ["Numeric columns: age."],
+                "supported_tasks": ["classification", "regression", "clustering"],
+            }
+
+    adapters = RecoveryAdapters()
+    events = [event async for event in GenAIService(repository, adapters).stream_chat(
+        ChatRequest(conversation_id="conversation-1", message="Train this."), OWNER, USER,
+    )]
+
+    content = next(event for event in events if event["type"] == "done")["message"]["content"]
+    assert adapters.inspections == 1
+    assert "Dataset Preview" in content and content.endswith("What would you like to train this dataset for?")
+    assert repository.conversation["pending_prediction"]["arguments"]["_intake"]["rows"] == 3
+    assert not any(event["type"] == "delta" for event in events)
+
+
+@pytest.mark.asyncio
+async def test_vague_image_archive_uses_native_autodl_inspection_and_suggests_only_confirmed_task():
+    class ImageRepository(FakeRepository):
+        async def attach_files_to_conversation(self, owner_id, attachment_ids, conversation_id, project_id):
+            self.attached_ids_seen.append(list(attachment_ids))
+            return [{
+                "id": value, "filename": "images.zip", "content_type": "application/zip",
+                "extraction": {"format": "zip", "dataset_kind": "image_archive"},
+            } for value in attachment_ids]
+
+        async def read_attachment(self, attachment_id, owner_id):
+            assert (attachment_id, owner_id) == ("images-1", OWNER)
+            return {"filename": "images.zip"}, b"native-image-archive"
+
+    class NativeInspection:
+        @staticmethod
+        def model_dump(mode="json"):
+            return {
+                "run_id": "run-image-1", "dataset_kind": "image", "filename": "images.zip",
+                "summary": "Found 8 readable images across 2 classes.",
+                "image": {
+                    "total_images": 8, "valid_images": 8, "invalid_images": 0,
+                    "classes": ["cats", "dogs"], "observed_dimensions": ["96x96"],
+                    "reliability_reason": "Each class has validation samples.",
+                },
+                "task_intelligence": {
+                    "detected_task": "image_classification", "display_name": "Image Classification",
+                    "requires_confirmation": False,
+                },
+            }
+
+    class AutoDLInspector:
+        @staticmethod
+        def inspect_dataset(**kwargs):
+            assert kwargs["owner_id"] == OWNER
+            assert kwargs["filename"] == "images.zip"
+            return NativeInspection()
+
+    repository = ImageRepository()
+    adapters = GenAILabAdapters(SimpleNamespace())
+    adapters.__dict__["genai_repository"] = repository
+    adapters.__dict__["autodl"] = AutoDLInspector()
+    events = [event async for event in GenAIService(repository, adapters).stream_chat(
+        ChatRequest(
+            conversation_id="conversation-1", message="Train this.",
+            attachment_ids=["images-1"],
+        ), OWNER, USER,
+    )]
+
+    content = next(event for event in events if event["type"] == "done")["message"]["content"]
+    assert all(value in content for value in (
+        "Dataset Preview", "Image archive", "8 readable of 8", "cats, dogs",
+        "image classification", "What would you like to train this dataset for?",
+    ))
+    assert "regression" not in content and "clustering" not in content
+    intake = repository.conversation["pending_prediction"]["arguments"]["_intake"]
+    assert intake["autodl_run_id"] == "run-image-1"
+    assert intake["supported_tasks"] == ["image_classification"]
+    assert not any(event["type"] == "delta" for event in events)
+
+
+@pytest.mark.asyncio
+async def test_vague_tabular_intake_adds_only_native_confirmed_autodl_task_when_target_is_supplied():
+    class DatasetRepository(FakeRepository):
+        async def read_attachment(self, attachment_id, owner_id):
+            assert (attachment_id, owner_id) == ("attachment-1", OWNER)
+            rows = "\n".join(f"{index},{index * 10}" for index in range(1, 13))
+            return {"filename": "dataset.csv"}, f"feature,price\n{rows}\n".encode()
+
+    class AutoMLInspector:
+        @staticmethod
+        def dataset_information(dataframe):
+            return {
+                "rows": len(dataframe), "columns": len(dataframe.columns),
+                "column_names": list(dataframe.columns),
+                "dtypes": {name: str(dtype) for name, dtype in dataframe.dtypes.items()},
+                "missing_values": 0,
+                "columns_info": {
+                    name: {"missing": 0, "missing_percentage": 0} for name in dataframe.columns
+                },
+            }
+
+        @staticmethod
+        def preview_dataset(dataframe, rows):
+            return dataframe.head(rows)
+
+    class NativeInspection:
+        @staticmethod
+        def model_dump(mode="json"):
+            return {
+                "run_id": "run-tabular-1",
+                "task_intelligence": {"detected_task": "tabular_regression"},
+            }
+
+    class AutoDLInspector:
+        @staticmethod
+        def inspect_dataset(**kwargs):
+            assert kwargs["target_column"] == "price"
+            assert kwargs["timestamp_column"] is None
+            return NativeInspection()
+
+    repository = DatasetRepository()
+    adapters = GenAILabAdapters(SimpleNamespace())
+    adapters.__dict__["genai_repository"] = repository
+    adapters.__dict__["automl"] = AutoMLInspector()
+    adapters.__dict__["autodl"] = AutoDLInspector()
+    events = [event async for event in GenAIService(repository, adapters).stream_chat(
+        ChatRequest(
+            conversation_id="conversation-1", message="Train this dataset using price as target.",
+            attachment_ids=["attachment-1"],
+        ), OWNER, USER,
+    )]
+
+    content = next(event for event in events if event["type"] == "done")["message"]["content"]
+    assert "tabular regression" in content
+    pending = repository.conversation["pending_prediction"]["arguments"]
+    assert pending["target_column"] == "price"
+    assert pending["_intake"]["autodl_run_id"] == "run-tabular-1"
+    assert not any(event["type"] == "delta" for event in events)
+
+
+@pytest.mark.asyncio
+async def test_current_conversation_attachment_is_resolved_before_vague_training_route():
+    repository = FakeRepository()
+    repository.current_attachment_ids = ["current-csv"]
+
+    class IntakeAdapters(FakeAdapters):
+        @staticmethod
+        async def inspect_training_intake(user, attachment):
+            assert attachment["id"] == "current-csv"
+            return {
+                "attachment_id": attachment["id"], "filename": "dataset.csv",
+                "rows": 1, "columns": 1, "column_names": ["value"],
+                "dtypes": {"value": "int64"}, "missing_values": 0,
+                "missing_by_column": {"value": 0}, "sample_rows": [{"value": 1}],
+                "observations": ["Numeric columns: value."], "supported_tasks": ["clustering"],
+            }
+
+    events = [event async for event in GenAIService(repository, IntakeAdapters()).stream_chat(
+        ChatRequest(conversation_id="conversation-1", message="TRAIN THE UPLOADED DATA!!!"), OWNER, USER,
+    )]
+    assert any(event["type"] == "done" for event in events)
+    assert ["current-csv"] in repository.attached_ids_seen
+    assert repository.conversation["pending_prediction"]["attachment_ids"] == ["current-csv"]
+    assert not any(event["type"] == "delta" for event in events)
+
+
+@pytest.mark.asyncio
+async def test_persisted_current_attachment_wins_over_empty_stale_pending_attachment_state():
+    repository = FakeRepository({
+        "tool": "native_training", "action": "train", "attachment_ids": [],
+        "arguments": {}, "missing_fields": ["dataset"],
+    })
+    repository.conversation["active_attachment_ids"] = ["current-csv"]
+    repository.current_attachment_ids = ["historical-1", "current-csv"]
+
+    class IntakeAdapters(FakeAdapters):
+        @staticmethod
+        async def inspect_training_intake(user, attachment):
+            assert attachment["id"] == "current-csv"
+            return {
+                "attachment_id": "current-csv", "filename": "Bengaluru_House_Data.csv",
+                "rows": 10, "columns": 2, "column_names": ["area", "price"],
+                "dtypes": {"area": "int64", "price": "float64"}, "missing_values": 0,
+                "missing_by_column": {"area": 0, "price": 0},
+                "sample_rows": [{"area": 1000, "price": 75.0}],
+                "observations": ["Numeric columns: area, price."],
+                "supported_tasks": ["classification", "regression", "clustering"],
+            }
+
+    events = [event async for event in GenAIService(repository, IntakeAdapters()).stream_chat(
+        ChatRequest(conversation_id="conversation-1", message="Train this dataset."), OWNER, USER,
+    )]
+    content = next(event for event in events if event["type"] == "done")["message"]["content"]
+    assert "Dataset Preview" in content
+    assert "What would you like to train this dataset for?" in content
+    assert "Please attach the dataset" not in content
+    assert repository.attached_ids_seen[-1] == ["current-csv"]
+    assert not any(event["type"] == "delta" for event in events)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("restored", (False, True))
+async def test_one_current_attachment_wins_over_historical_conversation_attachments(restored):
+    repository = FakeRepository()
+    repository.current_attachment_ids = ["historical-1", "current-csv", "historical-2"]
+    if restored:
+        repository.conversation["active_attachment_ids"] = ["current-csv"]
+
+    class IntakeAdapters(FakeAdapters):
+        @staticmethod
+        async def inspect_training_intake(user, attachment):
+            assert attachment["id"] == "current-csv"
+            return {
+                "attachment_id": "current-csv", "filename": "Bengaluru_House_Data.csv",
+                "rows": 10, "columns": 2, "column_names": ["area", "price"],
+                "dtypes": {"area": "int64", "price": "float64"}, "missing_values": 0,
+                "missing_by_column": {"area": 0, "price": 0},
+                "sample_rows": [{"area": 1000, "price": 75.0}],
+                "observations": ["Numeric columns: area, price."],
+                "supported_tasks": ["classification", "regression", "clustering"],
+            }
+
+    request_ids = [] if restored else ["current-csv"]
+    events = [event async for event in GenAIService(repository, IntakeAdapters()).stream_chat(
+        ChatRequest(
+            conversation_id="conversation-1", message="Train this dataset.",
+            attachment_ids=request_ids,
+        ), OWNER, USER,
+    )]
+    content = next(event for event in events if event["type"] == "done")["message"]["content"]
+    assert "Dataset Preview" in content
+    assert repository.attached_ids_seen[-1] == ["current-csv"]
+    assert "Choose one attached dataset" not in content
+    assert not any(event["type"] == "delta" for event in events)
+
+
+@pytest.mark.asyncio
+async def test_two_current_datasets_require_selection_but_zero_requires_attachment():
+    two_repository = FakeRepository()
+    two_events = [event async for event in GenAIService(two_repository, FakeAdapters()).stream_chat(
+        ChatRequest(
+            conversation_id="conversation-1", message="Train this dataset.",
+            attachment_ids=["current-1", "current-2"],
+        ), OWNER, USER,
+    )]
+    two_error = next(event for event in two_events if event["type"] == "error")
+    assert two_error["message"] == "Choose one attached dataset to train."
+    assert len(two_error["details"]["candidates"]) == 2
+    assert not any(event["type"] == "delta" for event in two_events)
+
+    zero_repository = FakeRepository()
+    zero_events = [event async for event in GenAIService(zero_repository, FakeAdapters()).stream_chat(
+        ChatRequest(conversation_id="conversation-1", message="Train this dataset."), OWNER, USER,
+    )]
+    zero_error = next(event for event in zero_events if event["type"] == "error")
+    assert zero_error["message"] == "Please attach the dataset you want to use."
+    assert not any(event["type"] == "delta" for event in zero_events)
+
+
+@pytest.mark.asyncio
+async def test_cancel_preserves_current_attachment_and_immediate_vague_retry_shows_preview():
+    repository = FakeRepository()
+
+    class IntakeAdapters(FakeAdapters):
+        inspections = 0
+
+        async def inspect_training_intake(self, user, attachment):
+            self.inspections += 1
+            assert attachment["id"] == "current-csv"
+            return {
+                "attachment_id": "current-csv", "filename": "Bengaluru_House_Data.csv",
+                "rows": 10, "columns": 2, "column_names": ["area", "price"],
+                "dtypes": {"area": "int64", "price": "float64"}, "missing_values": 0,
+                "missing_by_column": {"area": 0, "price": 0},
+                "sample_rows": [{"area": 1000, "price": 75.0}],
+                "observations": ["Numeric columns: area, price."],
+                "supported_tasks": ["classification", "regression", "clustering"],
+            }
+
+    adapters = IntakeAdapters()
+    service = GenAIService(repository, adapters)
+    first = [event async for event in service.stream_chat(ChatRequest(
+        conversation_id="conversation-1", message="Train this dataset!",
+        attachment_ids=["current-csv"],
+    ), OWNER, USER)]
+    assert "Dataset Preview" in next(event for event in first if event["type"] == "done")["message"]["content"]
+
+    cancelled = [event async for event in service.stream_chat(ChatRequest(
+        conversation_id="conversation-1", message="cancel", attachment_ids=["current-csv"],
+    ), OWNER, USER)]
+    cancelled_message = next(event for event in cancelled if event["type"] == "done")["message"]
+    assert cancelled_message["content"] == "Train cancelled."
+    assert cancelled_message["metadata"]["preserve_attachment_selection"] is True
+    assert cancelled_message["metadata"]["attachment_ids"] == ["current-csv"]
+    assert repository.conversation["pending_prediction"] is None
+    assert repository.conversation["active_attachment_ids"] == ["current-csv"]
+
+    retried = [event async for event in service.stream_chat(ChatRequest(
+        conversation_id="conversation-1", message="Train this dataset!",
+        attachment_ids=["current-csv"],
+    ), OWNER, USER)]
+    retry_content = next(event for event in retried if event["type"] == "done")["message"]["content"]
+    assert "Dataset Preview" in retry_content
+    assert "Please attach the dataset" not in retry_content
+    assert adapters.inspections == 2
+    assert not any(event["type"] == "delta" for event in retried)
+
+
+@pytest.mark.asyncio
+async def test_current_request_attachment_replaces_stale_native_intake_and_history():
+    repository = FakeRepository({
+        "tool": "native_training", "action": "train",
+        "attachment_ids": ["stale-current"], "missing_fields": ["task"],
+        "arguments": {
+            "action": "train", "attachment_id": "stale-current",
+            "_intake": {"attachment_id": "stale-current", "filename": "old.csv", "rows": 1},
+        },
+    })
+    repository.current_attachment_ids = ["historical-1", "historical-2"]
+
+    class ReplacementAdapters(FakeAdapters):
+        @staticmethod
+        async def inspect_training_intake(user, attachment):
+            assert attachment["id"] == "new-current"
+            return {
+                "attachment_id": "new-current", "filename": "new.csv",
+                "rows": 4, "columns": 2, "column_names": ["feature", "label"],
+                "dtypes": {"feature": "int64", "label": "object"}, "missing_values": 0,
+                "missing_by_column": {"feature": 0, "label": 0},
+                "sample_rows": [{"feature": 1, "label": "yes"}],
+                "observations": ["Numeric columns: feature."],
+                "supported_tasks": ["classification", "regression", "clustering"],
+            }
+
+    events = [event async for event in GenAIService(repository, ReplacementAdapters()).stream_chat(
+        ChatRequest(
+            conversation_id="conversation-1", message="Train this dataset!",
+            attachment_ids=["new-current"],
+        ), OWNER, USER,
+    )]
+    content = next(event for event in events if event["type"] == "done")["message"]["content"]
+    assert "new.csv" in content and "old.csv" not in content
+    assert repository.attached_ids_seen[-1] == ["new-current"]
+    assert repository.conversation["active_attachment_ids"] == ["new-current"]
+    assert repository.conversation["pending_prediction"]["attachment_ids"] == ["new-current"]
+    assert not any(event["type"] == "delta" for event in events)
+
+
+@pytest.mark.asyncio
+async def test_composer_attachment_selection_persists_owner_valid_id_across_refresh():
+    class SelectionRepository(FakeRepository):
+        valid_ids = {"current-csv"}
+
+        async def get_conversation(self, conversation_id, owner_id):
+            assert conversation_id == "conversation-1" and owner_id == OWNER
+            return dict(self.conversation)
+
+        async def attach_files_to_conversation(self, owner_id, attachment_ids, conversation_id, project_id):
+            self.attached_ids_seen.append(list(attachment_ids))
+            return [
+                {"id": value, "filename": "Bengaluru_House_Data.csv", "content_type": "text/csv"}
+                for value in attachment_ids if value in self.valid_ids
+            ]
+
+        async def list_attachments(self, owner_id, conversation_id=None, project_id=None):
+            return [
+                {"id": value, "filename": "Bengaluru_House_Data.csv"}
+                for value in self.valid_ids
+            ]
+
+    repository = SelectionRepository()
+    service = GenAIService(repository, FakeAdapters())
+    selected = await service.set_active_attachments("conversation-1", OWNER, ["current-csv"])
+    assert selected == {"attachment_ids": ["current-csv"]}
+
+    refreshed = await service.conversation_detail("conversation-1", OWNER)
+    assert refreshed["active_attachment_ids"] == ["current-csv"]
+    assert repository.conversation["active_attachment_ids"] == ["current-csv"]
+
+    with pytest.raises(GenAIException, match="unavailable or are not owned"):
+        await service.set_active_attachments("conversation-1", OWNER, ["foreign-csv"])
+
+    removed = await service.set_active_attachments("conversation-1", OWNER, [])
+    assert removed == {"attachment_ids": []}
+    assert (await service.conversation_detail("conversation-1", OWNER))["active_attachment_ids"] == []
+
+
+@pytest.mark.asyncio
+async def test_explicit_regression_ignores_frontend_tool_hint_and_preserves_target():
+    repository = FakeRepository()
+    events = [event async for event in GenAIService(repository, FakeAdapters()).stream_chat(
+        ChatRequest(
+            conversation_id="conversation-1",
+            message="Train a regression model using price as the target.",
+            attachment_ids=["attachment-1"], tools=["files"],
+        ), OWNER, USER,
+    )]
+    confirmation = next(event for event in events if event["type"] == "confirmation_required")
+    assert confirmation["tool"] == "automl"
+    assert confirmation["arguments"]["action"] == "train"
+    assert confirmation["arguments"]["task"] == "regression"
+    assert confirmation["arguments"]["target_column"] == "price"
+    assert confirmation["attachment_ids"] == ["attachment-1"]
+    assert not any(event["type"] == "delta" for event in events)
+
+
+@pytest.mark.parametrize("query", (
+    "TRAIN THIS CSV!!!", "Train the dataset?", "train for clustering...",
+    "TrAiN TeXt ClAsSiFiCaTiOn!", "TRAIN AUTODL.",
+))
+def test_native_training_detection_is_case_and_punctuation_tolerant(query):
+    router = ToolRouter()
+    routed = router.route(query, ["files"], ["attachment-1"])
+    assert routed[0] in {"native_training", "automl", "autonlp", "autodl"}
+    assert routed != ["files"]
+
+
+@pytest.mark.asyncio
+async def test_backend_overrides_conflicting_frontend_native_route():
+    repository = FakeRepository()
+    events = [event async for event in GenAIService(repository, FakeAdapters()).stream_chat(ChatRequest(
+        conversation_id="conversation-1", message="Train tabular classification with label as target",
+        tools=["autodl"], attachment_ids=["attachment-1"],
+        tool_arguments={"autodl": {"action": "train"}},
+    ), OWNER, USER)]
+    confirmation = next(event for event in events if event["type"] == "confirmation_required")
+    assert confirmation["tool"] == "automl"
+    assert confirmation["arguments"]["task"] == "classification"
+
+
+@pytest.mark.asyncio
+async def test_automl_clustering_reaches_confirmation_without_target():
+    repository = FakeRepository()
+
+    class ClusteringAdapters(FakeAdapters):
+        async def resolve(self, tool, user, arguments, query, selected_attachments):
+            assert tool == "automl" and arguments["task"] == "clustering"
+            assert not arguments.get("target_column")
+            return {**arguments, "_native_validated": True, "_training_summary": {
+                "filename": "dataset.csv", "rows": 20, "features": 4,
+            }}
+
+    events = [event async for event in GenAIService(repository, ClusteringAdapters()).stream_chat(
+        ChatRequest(
+            conversation_id="conversation-1", message="Train for clustering.",
+            attachment_ids=["attachment-1"],
+        ), OWNER, USER,
+    )]
+
+    confirmation = next(event for event in events if event["type"] == "confirmation_required")
+    assert confirmation["tool"] == "automl"
+    assert confirmation["arguments"]["task"] == "clustering"
+    assert not confirmation["arguments"].get("target_column")
+    assert not any(event["type"] == "delta" for event in events)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("tool", "binding"), (
+    ("automl", {"model_filename": "owned.pkl", "task": "classification"}),
+    ("autonlp", {"model_id": "nlp-1", "task": "sentiment_analysis"}),
+))
+async def test_active_context_routes_native_prediction_without_switching_labs(tool, binding):
+    repository = FakeRepository()
+    repository.conversation["active_lab_resources"] = {
+        tool: dict(binding), "current": {"tool": tool, **binding},
+    }
+    result_payload = {**binding, "status": "completed"}
+    if tool == "automl":
+        result_payload.update({"task": "classification", "rows": 1, "predictions": ["yes"]})
+    else:
+        result_payload.update({"predicted_label": "positive", "model_score": 0.9})
+
+    class ContextAdapters(FakeAdapters):
+        @staticmethod
+        def requires_confirmation(tool_name, arguments):
+            return False
+
+        async def resolve(self, tool_name, user, arguments, query, selected_attachments):
+            assert tool_name == tool
+            assert arguments.get("model_filename") == binding.get("model_filename")
+            assert arguments.get("model_id") == binding.get("model_id")
+            return arguments
+
+        async def execute(self, tool_name, user, arguments):
+            self.executions.append((tool_name, dict(arguments)))
+            return ToolResult(tool_name, True, "native prediction", data={"result": result_payload})
+
+    adapters = ContextAdapters()
+    for query in ("test this model", "predict this"):
+        events = [event async for event in GenAIService(repository, adapters).stream_chat(
+            ChatRequest(conversation_id="conversation-1", message=query), OWNER, USER,
+        )]
+        assert next(event for event in events if event["type"] == "done")["message"]["content"] == "native prediction"
+        assert not any(event["type"] == "delta" for event in events)
+    assert [item[0] for item in adapters.executions] == [tool, tool]
+
+
+@pytest.mark.asyncio
+async def test_active_autodl_context_routes_unqualified_status_and_result_without_llm():
+    repository = FakeRepository()
+    repository.conversation["active_lab_resources"] = {
+        "autodl": {"run_id": "run-1"}, "current": {"tool": "autodl", "run_id": "run-1"},
+    }
+
+    class StatusAdapters(FakeAdapters):
+        @staticmethod
+        def requires_confirmation(tool, arguments):
+            return False
+
+        async def resolve(self, tool, user, arguments, query, selected_attachments):
+            assert tool == "autodl" and arguments["run_id"] == "run-1"
+            return arguments
+
+        async def execute(self, tool, user, arguments):
+            self.executions.append((tool, dict(arguments)))
+            status = "running" if arguments["action"] == "status" else "completed"
+            return ToolResult(tool, True, f"native {arguments['action']}", data={
+                "result": {"run_id": "run-1", "status": status},
+            })
+
+    adapters = StatusAdapters()
+    for query, action in (("what is the status", "status"), ("show the result", "result")):
+        events = [event async for event in GenAIService(repository, adapters).stream_chat(
+            ChatRequest(conversation_id="conversation-1", message=query), OWNER, USER,
+        )]
+        content = next(event for event in events if event["type"] == "done")["message"]["content"]
+        assert content.startswith(f"native {action}")
+        assert ("manual values or upload a CSV" in content) is (action == "result")
+        assert not any(event["type"] == "delta" for event in events)
+    assert [item[1]["action"] for item in adapters.executions] == ["status", "result"]
+
+
+def test_natural_training_column_phrases_are_parsed():
+    automl = GenAIService._tool_arguments("automl", "Train regression using price as target.", {})
+    autonlp = GenAIService._tool_arguments("autonlp", "Train AutoNLP sentiment using text and sentiment.", {})
+    assert automl["task"] == "regression" and automl["target_column"] == "price"
+    assert autonlp["task"] == "sentiment_analysis"
+    assert autonlp["text_column"] == "text" and autonlp["target_column"] == "sentiment"
+    assert GenAIService._tool_arguments(
+        "autodl", "Train AutoDL time-series forecasting", {},
+    )["task"] == "time_series_regression"
+    assert GenAIService._tool_arguments(
+        "autodl", "Train AutoDL tabular classification", {},
+    )["task"] == "tabular_classification"
+
+
+def test_image_classification_archive_is_accepted_for_native_autodl_inspection():
+    payload = io.BytesIO()
+    with zipfile.ZipFile(payload, "w") as archive:
+        archive.writestr("cats/one.jpg", b"image-one")
+        archive.writestr("dogs/two.png", b"image-two")
+    validate_attachment_type("images.zip", "application/zip")
+    text, metadata = extract_text("images.zip", payload.getvalue())
+    assert "2 image files" in text
+    assert metadata["dataset_kind"] == "image_archive"
+    assert metadata["class_folders"] == ["cats", "dogs"]
+
+
+@pytest.mark.asyncio
+async def test_autodl_target_bearing_task_requests_only_target():
+    adapters = GenAILabAdapters(SimpleNamespace())
+
+    class TrainingRepository:
+        @staticmethod
+        def get_run(run_id, owner_id):
+            return {
+                "filename": "dataset.csv",
+                "inspection": {"dataset_kind": "tabular", "task_intelligence": {
+                    "detected_task": "tabular_classification", "requires_confirmation": True,
+                }, "tabular": {"rows": 20, "columns": 3}},
+                "advanced_details": {},
+            }
+
+    adapters.__dict__["autodl_training"] = SimpleNamespace(repository=TrainingRepository())
+    with pytest.raises(LabPredictionInputRequired) as error:
+        await adapters.resolve(
+            "autodl", USER, {"action": "train", "run_id": "run-1", "attachment_id": "file-1", "task": "classification"},
+            "Train AutoDL classification", [{"id": "file-1", "filename": "dataset.csv"}],
+        )
+    assert str(error.value) == "Which column should be used as the target?"
+    assert error.value.missing_fields == ["target column"]
+
+
+@pytest.mark.asyncio
+async def test_completed_training_persists_model_and_offers_prediction_but_queued_does_not():
+    completed_repository = FakeRepository()
+    completed = ToolResult(
+        "automl", True, "**AutoML training:** Completed",
+        data={"result": {"status": "completed", "model_filename": "owned.pkl", "task": "classification"}},
+    )
+    completed_repository.confirmation = {
+        "id": "confirm-1", "tool": "automl", "action": "train",
+        "arguments": {"action": "train", "task": "classification", "target_column": "label", "attachment_id": "file-1"},
+        "attachment_ids": ["file-1"],
+    }
+    completed_events = [event async for event in GenAIService(completed_repository, FakeAdapters(completed)).stream_chat(
+        ChatRequest(conversation_id="conversation-1", message="confirm", confirmation_id="confirm-1"), OWNER, USER,
+    )]
+    completed_message = next(event for event in completed_events if event["type"] == "done")["message"]["content"]
+    assert "manual values or upload a CSV" in completed_message
+    assert completed_repository.conversation["active_lab_resources"]["automl"]["model_filename"] == "owned.pkl"
+    assert completed_repository.conversation["pending_prediction"]["action"] == "prediction_mode"
+
+    queued_repository = FakeRepository()
+    queued = ToolResult("autodl", True, "**AutoDL training:** Queued", data={"result": {"status": "queued", "run_id": "run-1"}})
+    queued_repository.confirmation = {
+        "id": "confirm-2", "tool": "autodl", "action": "train",
+        "arguments": {"action": "train", "run_id": "run-1", "attachment_id": "file-1"},
+        "attachment_ids": ["file-1"],
+    }
+    queued_events = [event async for event in GenAIService(queued_repository, FakeAdapters(queued)).stream_chat(
+        ChatRequest(conversation_id="conversation-1", message="confirm", confirmation_id="confirm-2"), OWNER, USER,
+    )]
+    queued_message = next(event for event in queued_events if event["type"] == "done")["message"]["content"]
+    assert "manual values or upload a CSV" not in queued_message
+    assert queued_repository.conversation["pending_prediction"] is None
+
+
+def test_automl_and_autodl_batch_formatters_use_native_rows():
+    automl = _prediction_result("automl", {
+        "task": "classification", "model_name": "RF", "rows": 3, "input_mode": "csv",
+        "predictions": ["yes", "no", "yes"], "prediction_confidences": [0.9, 0.8, 0.7],
+    })
+    autodl = _prediction_result("autodl", {
+        "problem": {"task": "tabular_classification"}, "model": {"name": "MLP"},
+        "valid_rows": 2, "predictions": [{"predicted_class": "a"}, {"predicted_class": "b"}], "errors": [],
+    })
+    assert "3 of 3 rows" in automl.content and "yes: 2" in automl.content
+    assert "2 of 2 rows" in autodl.content and "MLP" in autodl.content
+
+
+@pytest.mark.asyncio
+async def test_automl_csv_prediction_reuses_native_artifact_prediction():
+    adapters = GenAILabAdapters(SimpleNamespace())
+
+    class Repository:
+        @staticmethod
+        async def read_attachment(attachment_id, owner_id):
+            assert (attachment_id, owner_id) == ("csv-1", OWNER)
+            return {"filename": "predict.csv"}, b"age,income\n20,100\n30,200\n"
+
+    class AutoML:
+        @staticmethod
+        def load_owned_artifact(filename, owner_id):
+            return SimpleNamespace()
+
+        @staticmethod
+        def predict_artifact_values(artifact, dataframe):
+            assert list(dataframe.columns) == ["age", "income"]
+            return {"task": "classification", "model_name": "RF", "rows": 2, "predictions": ["yes", "no"]}
+
+    adapters.__dict__["genai_repository"] = Repository()
+    adapters.__dict__["automl"] = AutoML()
+    result = await adapters.execute("automl", USER, {
+        "action": "predict", "model_filename": "owned.pkl", "attachment_id": "csv-1", "_batch_prediction": True,
+    })
+    assert result.ok and "2 of 2 rows" in result.content
+
+
+@pytest.mark.asyncio
+async def test_autodl_csv_resolution_bypasses_manual_feature_collection():
+    adapters = GenAILabAdapters(SimpleNamespace())
+
+    class Repository:
+        @staticmethod
+        async def read_attachment(attachment_id, owner_id):
+            return {"filename": "predict.csv"}, b"age,income\n20,100\n"
+
+    class TrainingRepository:
+        @staticmethod
+        def get_run(run_id, owner_id):
+            return {"status": "completed", "task": "tabular_classification", "inspection": {}, "advanced_details": {}}
+
+        @staticmethod
+        def get_winning_model(run_id, owner_id):
+            return {
+                "_id": "model-1", "task": "tabular_classification",
+                "preprocessing": {"feature_columns": ["age", "income"], "numeric": {"age": {}, "income": {}}},
+            }
+
+    adapters.__dict__["genai_repository"] = Repository()
+    adapters.__dict__["autodl_training"] = SimpleNamespace(repository=TrainingRepository())
+    resolved = await adapters.resolve(
+        "autodl", USER, {"action": "predict", "run_id": "run-1"}, "Use this CSV",
+        [{"id": "csv-1", "filename": "predict.csv", "content_type": "text/csv"}],
+    )
+    assert resolved["attachment_id"] == "csv-1"
+    assert resolved["_batch_prediction"] is True
+    assert "input" not in resolved
+
+
+@pytest.mark.asyncio
+async def test_autodl_image_training_does_not_request_target():
+    adapters = GenAILabAdapters(SimpleNamespace())
+
+    class TrainingRepository:
+        @staticmethod
+        def get_run(run_id, owner_id):
+            return {
+                "filename": "images.zip",
+                "inspection": {
+                    "dataset_kind": "image", "task_intelligence": {
+                        "detected_task": "image_classification", "requires_confirmation": False,
+                    }, "image": {"total_images": 20},
+                },
+                "advanced_details": {},
+            }
+
+    adapters.__dict__["autodl_training"] = SimpleNamespace(repository=TrainingRepository())
+    resolved = await adapters.resolve(
+        "autodl", USER, {"action": "train", "run_id": "run-1", "attachment_id": "images-1"},
+        "Continue image classification", [{"id": "images-1", "filename": "images.zip"}],
+    )
+    assert resolved["confirmed_task"] == "image_classification"
+    assert not resolved.get("confirmed_target")
+    assert resolved["_native_validated"] is True
