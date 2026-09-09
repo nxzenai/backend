@@ -404,6 +404,39 @@ class Settings(BaseSettings):
     genai_max_attachment_bytes: int = Field(default=10_485_760, alias="GENAI_MAX_ATTACHMENT_BYTES", ge=1024)
 
     # -------------------------------------------------
+    # Agentic local Docker build worker
+    # -------------------------------------------------
+
+    agentic_max_concurrent_builds: int = Field(
+        default=1, alias="AGENTIC_MAX_CONCURRENT_BUILDS", ge=1, le=1,
+    )
+    agentic_build_timeout_seconds: int = Field(
+        default=300, alias="AGENTIC_BUILD_TIMEOUT_SECONDS", ge=30, le=1800,
+    )
+    agentic_build_memory_mb: int = Field(
+        default=2048, alias="AGENTIC_BUILD_MEMORY_MB", ge=512, le=4096,
+    )
+    agentic_build_cpu_limit: float = Field(
+        default=1.5, alias="AGENTIC_BUILD_CPU_LIMIT", ge=0.25, le=4,
+    )
+    agentic_build_pids_limit: int = Field(
+        default=256, alias="AGENTIC_BUILD_PIDS_LIMIT", ge=32, le=512,
+    )
+    agentic_build_log_max_bytes: int = Field(
+        default=500_000, alias="AGENTIC_BUILD_LOG_MAX_BYTES", ge=10_000, le=2_000_000,
+    )
+    agentic_build_lease_seconds: int = Field(
+        default=45, alias="AGENTIC_BUILD_LEASE_SECONDS", ge=15, le=300,
+    )
+    agentic_build_poll_seconds: float = Field(
+        default=2.0, alias="AGENTIC_BUILD_POLL_SECONDS", ge=0.25, le=30,
+    )
+    agentic_build_image: str = Field(
+        default="nikolaik/python-nodejs:python3.12-nodejs22-bookworm",
+        alias="AGENTIC_BUILD_IMAGE",
+    )
+
+    # -------------------------------------------------
     # Email
     # -------------------------------------------------
 

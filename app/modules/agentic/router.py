@@ -4,7 +4,13 @@ import re
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
 
-from app.modules.agentic.dependencies import get_agentic_service, get_agentic_version_service
+from app.modules.agentic.dependencies import (
+    get_agentic_build_service,
+    get_agentic_service,
+    get_agentic_version_service,
+)
+from app.modules.agentic.build.schemas import BuildEventResponse, BuildResponse
+from app.modules.agentic.build.service import AgenticBuildService
 from app.modules.agentic.generation_schemas import (
     GeneratedFileContent,
     GeneratedFileMetadata,
@@ -237,3 +243,77 @@ async def download_source(
             "Content-Length": str(len(content)),
         },
     )
+
+
+@router.post(
+    "/projects/{project_id}/versions/{version_id}/builds",
+    response_model=BuildResponse,
+    status_code=202,
+)
+async def create_build(
+    project_id: str,
+    version_id: str,
+    service: AgenticBuildService = Depends(get_agentic_build_service),
+    current_user: UserModel = Depends(get_current_user),
+):
+    try:
+        return await service.create_build(_owner(current_user), project_id, version_id)
+    except AgenticError as exc:
+        raise _http_error(exc) from exc
+
+
+@router.get("/projects/{project_id}/builds", response_model=list[BuildResponse])
+async def list_builds(
+    project_id: str,
+    service: AgenticBuildService = Depends(get_agentic_build_service),
+    current_user: UserModel = Depends(get_current_user),
+):
+    try:
+        return await service.list_builds(_owner(current_user), project_id)
+    except AgenticError as exc:
+        raise _http_error(exc) from exc
+
+
+@router.get("/projects/{project_id}/builds/{build_id}", response_model=BuildResponse)
+async def get_build(
+    project_id: str,
+    build_id: str,
+    service: AgenticBuildService = Depends(get_agentic_build_service),
+    current_user: UserModel = Depends(get_current_user),
+):
+    try:
+        return await service.get_build(_owner(current_user), project_id, build_id)
+    except AgenticError as exc:
+        raise _http_error(exc) from exc
+
+
+@router.get(
+    "/projects/{project_id}/builds/{build_id}/events",
+    response_model=list[BuildEventResponse],
+)
+async def build_events(
+    project_id: str,
+    build_id: str,
+    service: AgenticBuildService = Depends(get_agentic_build_service),
+    current_user: UserModel = Depends(get_current_user),
+):
+    try:
+        return await service.events(_owner(current_user), project_id, build_id)
+    except AgenticError as exc:
+        raise _http_error(exc) from exc
+
+
+@router.post(
+    "/projects/{project_id}/builds/{build_id}/cancel",
+    response_model=BuildResponse,
+)
+async def cancel_build(
+    project_id: str,
+    build_id: str,
+    service: AgenticBuildService = Depends(get_agentic_build_service),
+    current_user: UserModel = Depends(get_current_user),
+):
+    try:
+        return await service.cancel(_owner(current_user), project_id, build_id)
+    except AgenticError as exc:
+        raise _http_error(exc) from exc
