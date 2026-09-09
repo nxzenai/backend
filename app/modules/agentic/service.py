@@ -67,7 +67,7 @@ class AgenticService:
     async def get_project(self, project_id: str, owner_id: str) -> dict[str, Any]:
         return await self._require_project(project_id, owner_id)
 
-    async def _attachment_context(self, project: dict[str, Any], owner_id: str) -> str:
+    async def attachment_context(self, project: dict[str, Any], owner_id: str) -> str:
         sections: list[str] = []
         for attachment_id in project.get("attachment_ids", []):
             try:
@@ -97,7 +97,7 @@ class AgenticService:
             project_id, owner_id, {"status": ProjectStatus.PLANNING.value}
         )
         try:
-            context = await self._attachment_context(project, owner_id)
+            context = await self.attachment_context(project, owner_id)
             architecture = await self.planner.generate(
                 name=str(project["name"]),
                 problem_statement=str(project["problem_statement"]),

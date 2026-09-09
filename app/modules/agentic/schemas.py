@@ -94,6 +94,7 @@ class ProjectResponse(StrictModel):
     status: ProjectStatus
     attachment_ids: list[str]
     current_plan_id: str | None
+    current_version_id: str | None = None
     created_at: datetime
     updated_at: datetime
 

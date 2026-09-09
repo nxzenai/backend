@@ -1,8 +1,19 @@
-from fastapi import APIRouter, Depends, HTTPException
+import io
+import re
 
-from app.modules.agentic.dependencies import get_agentic_service
+from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import StreamingResponse
+
+from app.modules.agentic.dependencies import get_agentic_service, get_agentic_version_service
+from app.modules.agentic.generation_schemas import (
+    GeneratedFileContent,
+    GeneratedFileMetadata,
+    SourceTreeNode,
+    VersionResponse,
+)
 from app.modules.agentic.schemas import PlanResponse, ProjectCreate, ProjectResponse, RevisionRequest
 from app.modules.agentic.service import AgenticError, AgenticService
+from app.modules.agentic.version_service import AgenticVersionService
 from app.modules.auth.dependencies import get_current_user
 from app.modules.auth.models import UserModel
 
@@ -115,3 +126,114 @@ async def get_plan(
         return await service.get_plan(project_id, plan_id, _owner(current_user))
     except AgenticError as exc:
         raise _http_error(exc) from exc
+
+
+@router.post("/projects/{project_id}/generate", response_model=VersionResponse)
+async def generate_application(
+    project_id: str,
+    service: AgenticVersionService = Depends(get_agentic_version_service),
+    current_user: UserModel = Depends(get_current_user),
+):
+    try:
+        return await service.generate(project_id, _owner(current_user))
+    except AgenticError as exc:
+        raise _http_error(exc) from exc
+
+
+@router.get("/projects/{project_id}/versions", response_model=list[VersionResponse])
+async def list_versions(
+    project_id: str,
+    service: AgenticVersionService = Depends(get_agentic_version_service),
+    current_user: UserModel = Depends(get_current_user),
+):
+    try:
+        return await service.list_versions(project_id, _owner(current_user))
+    except AgenticError as exc:
+        raise _http_error(exc) from exc
+
+
+@router.get("/projects/{project_id}/versions/{version_id}", response_model=VersionResponse)
+async def get_version(
+    project_id: str,
+    version_id: str,
+    service: AgenticVersionService = Depends(get_agentic_version_service),
+    current_user: UserModel = Depends(get_current_user),
+):
+    try:
+        return await service.get_version(project_id, version_id, _owner(current_user))
+    except AgenticError as exc:
+        raise _http_error(exc) from exc
+
+
+@router.get(
+    "/projects/{project_id}/versions/{version_id}/tree",
+    response_model=list[SourceTreeNode],
+)
+async def source_tree(
+    project_id: str,
+    version_id: str,
+    service: AgenticVersionService = Depends(get_agentic_version_service),
+    current_user: UserModel = Depends(get_current_user),
+):
+    try:
+        return await service.source_tree(project_id, version_id, _owner(current_user))
+    except AgenticError as exc:
+        raise _http_error(exc) from exc
+
+
+@router.get(
+    "/projects/{project_id}/versions/{version_id}/files",
+    response_model=list[GeneratedFileMetadata],
+)
+async def list_generated_files(
+    project_id: str,
+    version_id: str,
+    service: AgenticVersionService = Depends(get_agentic_version_service),
+    current_user: UserModel = Depends(get_current_user),
+):
+    try:
+        return await service.list_files(project_id, version_id, _owner(current_user))
+    except AgenticError as exc:
+        raise _http_error(exc) from exc
+
+
+@router.get(
+    "/projects/{project_id}/versions/{version_id}/file",
+    response_model=GeneratedFileContent,
+)
+async def read_generated_file(
+    project_id: str,
+    version_id: str,
+    path: str = Query(min_length=1, max_length=240),
+    service: AgenticVersionService = Depends(get_agentic_version_service),
+    current_user: UserModel = Depends(get_current_user),
+):
+    try:
+        return await service.read_file(project_id, version_id, _owner(current_user), path)
+    except AgenticError as exc:
+        raise _http_error(exc) from exc
+
+
+@router.get("/projects/{project_id}/versions/{version_id}/download")
+async def download_source(
+    project_id: str,
+    version_id: str,
+    service: AgenticVersionService = Depends(get_agentic_version_service),
+    current_user: UserModel = Depends(get_current_user),
+):
+    try:
+        content, project, version = await service.zip_download(
+            project_id, version_id, _owner(current_user)
+        )
+    except AgenticError as exc:
+        raise _http_error(exc) from exc
+    project_slug = re.sub(r"[^a-z0-9]+", "-", str(project["name"]).casefold()).strip("-")
+    filename = f"{project_slug or 'agentic-application'}-v{version['version_number']}.zip"
+    return StreamingResponse(
+        io.BytesIO(content),
+        media_type="application/zip",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Content-Length": str(len(content)),
+        },
+    )

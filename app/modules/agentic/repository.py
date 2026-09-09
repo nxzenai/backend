@@ -6,8 +6,9 @@ from typing import Any
 
 from motor.motor_asyncio import AsyncIOMotorDatabase
 from pymongo import ASCENDING, DESCENDING
+from pymongo.errors import DuplicateKeyError
 
-from app.modules.agentic.constants import PlanStatus, ProjectStatus
+from app.modules.agentic.constants import PlanStatus, ProjectStatus, VersionStatus
 
 
 def _now() -> datetime:
@@ -27,6 +28,8 @@ class AgenticRepository:
     def __init__(self, database: AsyncIOMotorDatabase):
         self.projects = database["agentic_projects"]
         self.plans = database["agentic_plans"]
+        self.versions = database["agentic_versions"]
+        self.files = database["agentic_files"]
 
     async def ensure_indexes(self) -> None:
         await self.projects.create_index(
@@ -34,6 +37,20 @@ class AgenticRepository:
         )
         await self.plans.create_index(
             [("owner_id", ASCENDING), ("project_id", ASCENDING), ("revision", ASCENDING)],
+            unique=True,
+        )
+        await self.versions.create_index(
+            [("owner_id", ASCENDING), ("project_id", ASCENDING), ("version_number", ASCENDING)],
+            unique=True,
+        )
+        await self.versions.create_index(
+            [("owner_id", ASCENDING), ("project_id", ASCENDING), ("status", ASCENDING)],
+            unique=True,
+            partialFilterExpression={"status": VersionStatus.GENERATING.value},
+            name="one_active_agentic_generation",
+        )
+        await self.files.create_index(
+            [("owner_id", ASCENDING), ("version_id", ASCENDING), ("normalized_path", ASCENDING)],
             unique=True,
         )
 
@@ -49,6 +66,7 @@ class AgenticRepository:
             "status": ProjectStatus.DRAFT.value,
             "attachment_ids": list(dict.fromkeys(attachment_ids)),
             "current_plan_id": None,
+            "current_version_id": None,
             "created_at": now,
             "updated_at": now,
         }
@@ -127,3 +145,130 @@ class AgenticRepository:
             {"$set": {"status": PlanStatus.APPROVED.value, "approved_at": approved_at}},
         )
         return await self.get_plan(project_id, plan_id, owner_id) if result.matched_count else None
+
+    async def create_version(
+        self,
+        project_id: str,
+        owner_id: str,
+        plan_id: str,
+        parent_version_id: str | None,
+    ) -> dict[str, Any] | None:
+        if await self.versions.find_one({
+            "project_id": project_id,
+            "owner_id": owner_id,
+            "status": VersionStatus.GENERATING.value,
+        }, {"_id": 1}):
+            return None
+        latest = await self.versions.find_one(
+            {"project_id": project_id, "owner_id": owner_id},
+            sort=[("version_number", DESCENDING)],
+        )
+        document = {
+            "_id": str(uuid.uuid4()),
+            "project_id": project_id,
+            "owner_id": owner_id,
+            "plan_id": plan_id,
+            "version_number": int(latest["version_number"]) + 1 if latest else 1,
+            "parent_version_id": parent_version_id,
+            "status": VersionStatus.GENERATING.value,
+            "manifest": None,
+            "created_at": _now(),
+            "completed_at": None,
+            "error": None,
+        }
+        try:
+            await self.versions.insert_one(document)
+        except DuplicateKeyError:
+            return None
+        return _public(document)
+
+    async def complete_version(
+        self, version_id: str, project_id: str, owner_id: str, manifest: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        result = await self.versions.update_one(
+            {
+                "_id": version_id,
+                "project_id": project_id,
+                "owner_id": owner_id,
+                "status": VersionStatus.GENERATING.value,
+            },
+            {"$set": {
+                "status": VersionStatus.READY.value,
+                "manifest": manifest,
+                "completed_at": _now(),
+                "error": None,
+            }},
+        )
+        return await self.get_version(project_id, version_id, owner_id) if result.matched_count else None
+
+    async def fail_version(
+        self, version_id: str, project_id: str, owner_id: str, error: str
+    ) -> dict[str, Any] | None:
+        await self.versions.update_one(
+            {
+                "_id": version_id,
+                "project_id": project_id,
+                "owner_id": owner_id,
+                "status": VersionStatus.GENERATING.value,
+            },
+            {"$set": {
+                "status": VersionStatus.FAILED.value,
+                "completed_at": _now(),
+                "error": error[:500],
+            }},
+        )
+        return await self.get_version(project_id, version_id, owner_id)
+
+    async def list_versions(self, project_id: str, owner_id: str) -> list[dict[str, Any]]:
+        documents = await self.versions.find({
+            "project_id": project_id, "owner_id": owner_id
+        }).sort("version_number", DESCENDING).limit(100).to_list(length=100)
+        return [_public(item) or {} for item in documents]
+
+    async def get_version(
+        self, project_id: str, version_id: str, owner_id: str
+    ) -> dict[str, Any] | None:
+        return _public(await self.versions.find_one({
+            "_id": version_id, "project_id": project_id, "owner_id": owner_id
+        }))
+
+    async def save_files(
+        self, project_id: str, version_id: str, owner_id: str, files: list[dict[str, Any]]
+    ) -> None:
+        if not files:
+            return
+        now = _now()
+        await self.files.insert_many([
+            {
+                "_id": str(uuid.uuid4()),
+                "owner_id": owner_id,
+                "project_id": project_id,
+                "version_id": version_id,
+                **file,
+                "created_at": now,
+            }
+            for file in files
+        ])
+
+    async def discard_version_files(self, version_id: str, owner_id: str) -> None:
+        await self.files.delete_many({"version_id": version_id, "owner_id": owner_id})
+
+    async def list_files(
+        self, project_id: str, version_id: str, owner_id: str, *, include_content: bool = False
+    ) -> list[dict[str, Any]]:
+        projection = None if include_content else {"content": 0}
+        documents = await self.files.find(
+            {"project_id": project_id, "version_id": version_id, "owner_id": owner_id},
+            projection,
+        ).sort("normalized_path", ASCENDING).to_list(length=200)
+        return [_public(item) or {} for item in documents]
+
+    async def get_file(
+        self, project_id: str, version_id: str, owner_id: str, normalized_path: str
+    ) -> dict[str, Any] | None:
+        return _public(await self.files.find_one({
+            "project_id": project_id,
+            "version_id": version_id,
+            "owner_id": owner_id,
+            "normalized_path": normalized_path,
+        }))
