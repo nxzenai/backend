@@ -133,6 +133,50 @@ class OpenAICompatibleProvider:
         except (httpx.HTTPError, TimeoutError) as exc:
             raise ProviderConnectionError("The selected inference service is unavailable or timed out.") from exc
 
+    async def complete(
+        self,
+        config: ProviderConfig,
+        messages: list[dict[str, str]],
+        reasoning: ReasoningLevel,
+        *,
+        response_format: dict[str, str] | None = None,
+    ) -> str:
+        """Return one complete response without changing chat streaming semantics."""
+        if not config.configured:
+            raise LlamaModelNotAvailableError(
+                f"The {config.tier.value.title()} model tier is unavailable."
+            )
+        url = f"{str(config.base_url).rstrip('/')}/chat/completions"
+        payload: dict[str, object] = {
+            "model": config.model,
+            "messages": messages,
+            "stream": False,
+            "temperature": self._temperature(reasoning),
+            "max_tokens": config.max_output_tokens,
+        }
+        if response_format:
+            payload["response_format"] = response_format
+        timeout = httpx.Timeout(settings.genai_inference_timeout_seconds, connect=10.0)
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                response = await client.post(
+                    url, headers=self._headers(config), json=payload
+                )
+                response.raise_for_status()
+                body = response.json()
+            content = body.get("choices", [{}])[0].get("message", {}).get("content")
+            if not isinstance(content, str) or not content.strip():
+                raise ProviderConnectionError(
+                    "The inference service returned an empty response."
+                )
+            return content
+        except ProviderConnectionError:
+            raise
+        except (httpx.HTTPError, TimeoutError, ValueError, KeyError, IndexError, TypeError) as exc:
+            raise ProviderConnectionError(
+                "The selected inference service is unavailable or returned an invalid response."
+            ) from exc
+
     async def health(self, config: ProviderConfig) -> tuple[bool, str | None]:
         if not config.configured:
             return False, "Not configured"
