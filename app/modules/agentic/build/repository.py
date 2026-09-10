@@ -124,6 +124,19 @@ class AgenticBuildRepository:
             "_id": build_id, "owner_id": owner_id, "project_id": project_id
         }))
 
+    async def latest_succeeded(
+        self, owner_id: str, project_id: str, version_id: str,
+    ) -> dict[str, Any] | None:
+        return _public(await self.builds.find_one(
+            {
+                "owner_id": owner_id,
+                "project_id": project_id,
+                "version_id": version_id,
+                "status": BuildStatus.SUCCEEDED.value,
+            },
+            sort=[("completed_at", DESCENDING)],
+        ))
+
     async def list_events(self, owner_id: str, build_id: str) -> list[dict[str, Any]]:
         documents = await self.events.find({
             "owner_id": owner_id, "build_id": build_id

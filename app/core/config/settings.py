@@ -435,6 +435,30 @@ class Settings(BaseSettings):
         default="nikolaik/python-nodejs:python3.12-nodejs22-bookworm",
         alias="AGENTIC_BUILD_IMAGE",
     )
+    agentic_max_concurrent_previews: int = Field(
+        default=1, alias="AGENTIC_MAX_CONCURRENT_PREVIEWS", ge=1, le=1,
+    )
+    agentic_preview_memory_mb: int = Field(
+        default=1536, alias="AGENTIC_PREVIEW_MEMORY_MB", ge=512, le=3072,
+    )
+    agentic_preview_cpu_limit: float = Field(
+        default=1.0, alias="AGENTIC_PREVIEW_CPU_LIMIT", ge=0.25, le=2,
+    )
+    agentic_preview_pids_limit: int = Field(
+        default=256, alias="AGENTIC_PREVIEW_PIDS_LIMIT", ge=64, le=512,
+    )
+    agentic_preview_start_timeout_seconds: int = Field(
+        default=180, alias="AGENTIC_PREVIEW_START_TIMEOUT_SECONDS", ge=30, le=600,
+    )
+    agentic_preview_ttl_minutes: int = Field(
+        default=30, alias="AGENTIC_PREVIEW_TTL_MINUTES", ge=1, le=240,
+    )
+    agentic_preview_log_max_bytes: int = Field(
+        default=300_000, alias="AGENTIC_PREVIEW_LOG_MAX_BYTES", ge=10_000, le=1_000_000,
+    )
+    agentic_preview_cleanup_poll_seconds: float = Field(
+        default=10.0, alias="AGENTIC_PREVIEW_CLEANUP_POLL_SECONDS", ge=1, le=60,
+    )
 
     # -------------------------------------------------
     # Email

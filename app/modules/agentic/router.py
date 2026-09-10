@@ -6,11 +6,14 @@ from fastapi.responses import StreamingResponse
 
 from app.modules.agentic.dependencies import (
     get_agentic_build_service,
+    get_agentic_preview_service,
     get_agentic_service,
     get_agentic_version_service,
 )
 from app.modules.agentic.build.schemas import BuildEventResponse, BuildResponse
 from app.modules.agentic.build.service import AgenticBuildService
+from app.modules.agentic.preview.schemas import PreviewResponse
+from app.modules.agentic.preview.service import AgenticPreviewService
 from app.modules.agentic.generation_schemas import (
     GeneratedFileContent,
     GeneratedFileMetadata,
@@ -315,5 +318,79 @@ async def cancel_build(
 ):
     try:
         return await service.cancel(_owner(current_user), project_id, build_id)
+    except AgenticError as exc:
+        raise _http_error(exc) from exc
+
+
+@router.post(
+    "/projects/{project_id}/versions/{version_id}/preview",
+    response_model=PreviewResponse,
+    status_code=202,
+)
+async def start_preview(
+    project_id: str,
+    version_id: str,
+    service: AgenticPreviewService = Depends(get_agentic_preview_service),
+    current_user: UserModel = Depends(get_current_user),
+):
+    try:
+        return await service.start(_owner(current_user), project_id, version_id)
+    except AgenticError as exc:
+        raise _http_error(exc) from exc
+
+
+@router.get("/projects/{project_id}/previews", response_model=list[PreviewResponse])
+async def list_previews(
+    project_id: str,
+    service: AgenticPreviewService = Depends(get_agentic_preview_service),
+    current_user: UserModel = Depends(get_current_user),
+):
+    try:
+        return await service.list(_owner(current_user), project_id)
+    except AgenticError as exc:
+        raise _http_error(exc) from exc
+
+
+@router.get("/projects/{project_id}/previews/{preview_id}", response_model=PreviewResponse)
+async def get_preview(
+    project_id: str,
+    preview_id: str,
+    service: AgenticPreviewService = Depends(get_agentic_preview_service),
+    current_user: UserModel = Depends(get_current_user),
+):
+    try:
+        return await service.get(_owner(current_user), project_id, preview_id)
+    except AgenticError as exc:
+        raise _http_error(exc) from exc
+
+
+@router.post(
+    "/projects/{project_id}/previews/{preview_id}/stop",
+    response_model=PreviewResponse,
+)
+async def stop_preview(
+    project_id: str,
+    preview_id: str,
+    service: AgenticPreviewService = Depends(get_agentic_preview_service),
+    current_user: UserModel = Depends(get_current_user),
+):
+    try:
+        return await service.stop(_owner(current_user), project_id, preview_id)
+    except AgenticError as exc:
+        raise _http_error(exc) from exc
+
+
+@router.post(
+    "/projects/{project_id}/previews/{preview_id}/restart",
+    response_model=PreviewResponse,
+)
+async def restart_preview(
+    project_id: str,
+    preview_id: str,
+    service: AgenticPreviewService = Depends(get_agentic_preview_service),
+    current_user: UserModel = Depends(get_current_user),
+):
+    try:
+        return await service.restart(_owner(current_user), project_id, preview_id)
     except AgenticError as exc:
         raise _http_error(exc) from exc
