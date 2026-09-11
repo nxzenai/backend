@@ -9,6 +9,8 @@ from app.core.config.settings import settings
 
 
 def _formatted_demo_date(value: str) -> str:
+    if not value:
+        return "To be arranged"
     selected_date = date.fromisoformat(value)
     return selected_date.strftime("%A, %B %d, %Y")
 
