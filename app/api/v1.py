@@ -7,6 +7,7 @@ from app.modules.notebooks.router import (
 )
 from app.modules.execution.router import router as execution_router
 from app.modules.crm.router import router as crm_router
+from routers.lead_intake import router as lead_intake_router
 from app.modules.eda.router import router as eda_router
 from app.modules.sql.router import (
     router as sql_router,
@@ -40,6 +41,7 @@ api_router.include_router(
     automl_router,
 )
 api_router.include_router(crm_router)
+api_router.include_router(lead_intake_router)
 
 # --- NEW: Register our AI Module Routers ---
 api_router.include_router(autonlp_router)
