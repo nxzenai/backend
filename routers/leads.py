@@ -10,8 +10,8 @@ from fastapi.responses import StreamingResponse
 from motor.motor_asyncio import AsyncIOMotorDatabase
 
 from app.core.database.mongodb import get_marketing_database
-from database.mongodb import db
 from models.lead import LeadCreate
+from app.modules.auth.permissions import require_admin
 from services.demo_email import (
     send_admin_demo_notification,
     send_customer_demo_confirmation,
@@ -46,6 +46,8 @@ async def create_lead(
             "follow_up_date": "",
             "created_at": datetime.utcnow(),
             "email_notification_status": "pending",
+            "verification_status": "pending",
+            "crm_status": "not_pushed",
         }
     )
 
@@ -153,8 +155,8 @@ async def _deliver_demo_booking_emails(
 # Get All Leads
 # ==========================================================
 
-@router.get("/")
-async def get_leads():
+@router.get("/", dependencies=[Depends(require_admin)])
+async def get_leads(db=Depends(get_marketing_database)):
 
     leads = []
 
@@ -169,8 +171,8 @@ async def get_leads():
 # Export CSV
 # ==========================================================
 
-@router.get("/export/csv")
-async def export_leads_csv():
+@router.get("/export/csv", dependencies=[Depends(require_admin)])
+async def export_leads_csv(db=Depends(get_marketing_database)):
 
     output = StringIO()
     writer = csv.writer(output)
@@ -220,10 +222,11 @@ async def export_leads_csv():
 # Update Lead Status
 # ==========================================================
 
-@router.patch("/{lead_id}")
+@router.patch("/{lead_id}", dependencies=[Depends(require_admin)])
 async def update_lead_status(
     lead_id: str,
     status: str,
+    db=Depends(get_marketing_database),
 ):
 
     try:
@@ -258,10 +261,11 @@ async def update_lead_status(
 # Update Notes
 # ==========================================================
 
-@router.patch("/{lead_id}/notes")
+@router.patch("/{lead_id}/notes", dependencies=[Depends(require_admin)])
 async def update_lead_notes(
     lead_id: str,
     notes: str,
+    db=Depends(get_marketing_database),
 ):
 
     try:
@@ -296,10 +300,11 @@ async def update_lead_notes(
 # Update Priority
 # ==========================================================
 
-@router.patch("/{lead_id}/priority")
+@router.patch("/{lead_id}/priority", dependencies=[Depends(require_admin)])
 async def update_priority(
     lead_id: str,
     priority: str,
+    db=Depends(get_marketing_database),
 ):
 
     try:

@@ -1,4 +1,6 @@
 from typing import Any
+from datetime import datetime
+from pymongo import ReturnDocument
 
 from bson import ObjectId
 from motor.motor_asyncio import AsyncIOMotorDatabase
@@ -10,6 +12,15 @@ from app.modules.crm.constants import (
 
 
 class CRMRepository:
+
+    async def promote_intake_lead(self, lead_id: str, actor: str):
+        return await self.collection.find_one_and_update(
+            {"_id": ObjectId(lead_id), "verification_status": "verified",
+             "crm_status": "not_pushed", "crm_lead_id": None},
+            {"$set": {"crm_status": "pushed", "crm_lead_id": lead_id,
+                      "pushed_to_crm_at": datetime.utcnow(), "pushed_to_crm_by": actor}},
+            return_document=ReturnDocument.AFTER,
+        )
 
     def __init__(
         self,
@@ -23,26 +34,26 @@ class CRMRepository:
 
     async def dashboard(self) -> dict:
 
-        total = await self.collection.count_documents({})
+        total = await self.collection.count_documents({"crm_status": {"$ne": "not_pushed"}})
 
         new = await self.collection.count_documents(
-            {"status": "new"}
+            {"status": "new", "crm_status": {"$ne": "not_pushed"}}
         )
 
         contacted = await self.collection.count_documents(
-            {"status": "contacted"}
+            {"status": "contacted", "crm_status": {"$ne": "not_pushed"}}
         )
 
         qualified = await self.collection.count_documents(
-            {"status": "qualified"}
+            {"status": "qualified", "crm_status": {"$ne": "not_pushed"}}
         )
 
         enrolled = await self.collection.count_documents(
-            {"status": "enrolled"}
+            {"status": "enrolled", "crm_status": {"$ne": "not_pushed"}}
         )
 
         lost = await self.collection.count_documents(
-            {"status": "lost"}
+            {"status": "lost", "crm_status": {"$ne": "not_pushed"}}
         )
 
         return {
@@ -75,7 +86,7 @@ class CRMRepository:
             MAX_PAGE_SIZE,
         )
 
-        query: dict[str, Any] = {}
+        query: dict[str, Any] = {"crm_status": {"$ne": "not_pushed"}}
 
         if status:
             query["status"] = status
@@ -144,6 +155,7 @@ class CRMRepository:
         lead = await self.collection.find_one(
             {
                 "_id": ObjectId(lead_id),
+                "crm_status": {"$ne": "not_pushed"},
             }
         )
 
@@ -169,6 +181,7 @@ class CRMRepository:
         await self.collection.update_one(
             {
                 "_id": ObjectId(lead_id),
+                "crm_status": {"$ne": "not_pushed"},
             },
             {
                 "$set": payload,
@@ -191,6 +204,7 @@ class CRMRepository:
         await self.collection.delete_one(
             {
                 "_id": ObjectId(lead_id),
+                "crm_status": {"$ne": "not_pushed"},
             }
         )
 
@@ -207,6 +221,7 @@ class CRMRepository:
         await self.collection.update_one(
             {
                 "_id": ObjectId(lead_id),
+                "crm_status": {"$ne": "not_pushed"},
             },
             {
                 "$set": {
@@ -231,6 +246,7 @@ class CRMRepository:
         await self.collection.update_one(
             {
                 "_id": ObjectId(lead_id),
+                "crm_status": {"$ne": "not_pushed"},
             },
             {
                 "$set": {
