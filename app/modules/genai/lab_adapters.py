@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from app.modules.genai.metrics import observe_tool
+
 import asyncio
 import json
 import re
@@ -679,6 +681,7 @@ class GenAILabAdapters:
         dataframe = await dataframe_from_upload(upload)
         return metadata, contents, dataframe
 
+    @observe_tool(resolution=True, fixed_name="native_training", fixed_action="inspect")
     async def inspect_training_intake(
         self, user: Any, attachment: dict[str, Any], rows: int = 5,
         target_column: str | None = None, timestamp_column: str | None = None,
@@ -791,6 +794,7 @@ class GenAILabAdapters:
             ),
         }
 
+    @observe_tool(resolution=True)
     async def resolve(
         self, tool: str, user: Any, arguments: dict[str, Any], query: str = "",
         selected_attachments: list[dict[str, Any]] | None = None,

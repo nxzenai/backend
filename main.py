@@ -17,15 +17,12 @@ app = FastAPI(
 # ports as well as the production domain enabled for compatibility.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=list(dict.fromkeys([
-        *(origin.rstrip("/") for origin in settings.cors_origins),
-        "https://www.nxzenai.com",
-        "https://nxzenai.com",
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-        "http://localhost:3001",
-        "http://127.0.0.1:3001",
-    ])),
+    allow_origins=[
+        #"https://www.nxzenai.com",
+        #"http://localhost:3000",
+        #"http://127.0.0.1:3000",
+        "http://localhost:3001"
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

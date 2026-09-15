@@ -263,10 +263,19 @@ class GenAIRepository:
         )
 
     async def start_generation(self, owner_id: str, conversation_id: str, generation_id: str, metadata: dict[str, Any]) -> None:
-        await self.generations.insert_one({
-            "_id": generation_id, "owner_id": owner_id, "conversation_id": conversation_id,
-            "status": "running", **metadata, "created_at": _now(), "updated_at": _now(),
-        })
+        await self.generations.update_one(
+            {"_id": generation_id},
+            {"$set": {"owner_id": owner_id, "conversation_id": conversation_id,
+                      "status": "running", **metadata, "updated_at": _now()},
+             "$setOnInsert": {"created_at": _now()}}, upsert=True,
+        )
+
+    async def record_request(self, request_id: str, owner_id: str | None, values: dict[str, Any]) -> None:
+        await self.generations.update_one(
+            {"_id": request_id},
+            {"$set": {**values, "owner_id": owner_id, "updated_at": _now()},
+             "$setOnInsert": {"created_at": _now()}}, upsert=True,
+        )
 
     async def finish_generation(self, generation_id: str, owner_id: str, status: str, metadata: dict[str, Any]) -> None:
         await self.generations.update_one(
@@ -392,6 +401,43 @@ class GenAIRepository:
     async def search_attachment_chunks(self, owner_id: str, attachment_ids: list[str], query: str, limit: int = 8) -> list[dict[str, Any]]:
         if not attachment_ids:
             return []
+        # Only whole-document requests bypass lexical relevance. Topic-specific
+        # summaries and factual questions continue through the existing search.
+        query_text = " ".join(query.casefold().split()).strip(" .?!")
+        target = r"(?:(?:this|these|the|my|selected|attached|uploaded)\s+)*(?:documents?|papers?|files?)"
+        summary_intent = re.fullmatch(
+            rf"(?:please\s+)?(?:summari[sz]e\s+{target}|"
+            rf"(?:give\s+me\s+|provide\s+)?(?:a\s+|an\s+|the\s+)?(?:summary|overview)\s+of\s+{target}|"
+            rf"what\s+(?:is|are)\s+{target}\s+about)(?:\s+please)?",
+            query_text,
+        )
+        if summary_intent:
+            selected_ids = list(dict.fromkeys(attachment_ids[:50]))
+            metadata = await self.attachments.find({
+                "owner_id": owner_id, "_id": {"$in": selected_ids},
+            }).to_list(length=50)
+            by_id = {str(item["_id"]): item for item in metadata}
+            if set(by_id) != set(selected_ids) or limit <= 0:
+                return []
+            selected = []
+            # Share the existing passage budget across files. Evenly spaced
+            # indices cover the beginning, middle and end whenever slots permit.
+            for position, attachment_id in enumerate(selected_ids[:limit]):
+                slots = limit // min(len(selected_ids), limit)
+                slots += position < limit % min(len(selected_ids), limit)
+                count = int(by_id[attachment_id].get("chunk_count", 0))
+                take = min(slots, count)
+                indices = ([0] if take == 1 else [
+                    round(index * (count - 1) / (take - 1)) for index in range(take)
+                ])
+                if not indices:
+                    continue
+                chunks = await self.attachment_chunks.find({
+                    "owner_id": owner_id, "attachment_id": attachment_id,
+                    "chunk_index": {"$in": indices},
+                }).sort("chunk_index", ASCENDING).limit(take).to_list(length=take)
+                selected.extend(item for item in chunks if str(item.get("content", "")).strip())
+            return [{key: value for key, value in item.items() if key not in {"_id", "owner_id"}} for item in selected]
         documents = await self.attachment_chunks.find({
             "owner_id": owner_id, "attachment_id": {"$in": attachment_ids[:50]},
         }).limit(2000).to_list(length=2000)

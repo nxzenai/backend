@@ -3,13 +3,15 @@ from __future__ import annotations
 import asyncio
 import json
 from dataclasses import dataclass
-from typing import AsyncIterator
+from typing import Any, AsyncIterator, Protocol
 
 import httpx
 
 from app.core.config.settings import settings
 from app.modules.genai.constants import ModelTier, ReasoningLevel
 from app.modules.genai.exceptions import LlamaModelNotAvailableError, ProviderConnectionError
+from app.modules.genai.metrics import current_request
+from time import perf_counter
 
 
 @dataclass(frozen=True)
@@ -23,7 +25,23 @@ class ProviderConfig:
 
     @property
     def configured(self) -> bool:
-        return bool(self.base_url and self.model)
+        return bool((self.base_url or "").strip() and self.model.strip())
+
+
+class GenAIProvider(Protocol):
+    """Provider-neutral contract; inputs are messages, never native lab objects."""
+
+    def stream(self, config: ProviderConfig, messages: list[dict[str, str]],
+               reasoning: ReasoningLevel, cancellation: asyncio.Event) -> AsyncIterator[str]: ...
+
+    async def chat(self, config: ProviderConfig, messages: list[dict[str, str]],
+                   reasoning: ReasoningLevel, cancellation: asyncio.Event) -> str: ...
+
+    async def health(self, config: ProviderConfig) -> tuple[bool, str | None]: ...
+
+    def model_metadata(self, config: ProviderConfig) -> dict[str, Any]: ...
+
+    def extract_usage(self, response: dict[str, Any]) -> dict[str, int]: ...
 
 
 def provider_config(tier: ModelTier) -> ProviderConfig:
@@ -87,8 +105,29 @@ class ModelRouter:
 
 class OpenAICompatibleProvider:
     @staticmethod
+    def model_metadata(config: ProviderConfig) -> dict[str, Any]:
+        return {"model_name": config.model, "context_limit": config.context_limit,
+                "max_output_tokens": config.max_output_tokens}
+
+    @staticmethod
+    def extract_usage(response: dict[str, Any]) -> dict[str, int]:
+        usage = response.get("usage")
+        if not isinstance(usage, dict):
+            return {}
+        return {key: value for key, value in usage.items()
+                if key in {"prompt_tokens", "completion_tokens", "total_tokens"}
+                and type(value) is int and value >= 0}
+
+    async def chat(self, config: ProviderConfig, messages: list[dict[str, str]],
+                   reasoning: ReasoningLevel, cancellation: asyncio.Event) -> str:
+        return "".join([part async for part in self.stream(config, messages, reasoning, cancellation)])
+
+    @staticmethod
     def _headers(config: ProviderConfig) -> dict[str, str]:
         headers = {"Content-Type": "application/json"}
+        trace = current_request.get()
+        if trace:
+            headers["X-Request-ID"] = trace.request_id
         if config.api_key:
             headers["Authorization"] = f"Bearer {config.api_key}"
         return headers
@@ -101,17 +140,38 @@ class OpenAICompatibleProvider:
         self, config: ProviderConfig, messages: list[dict[str, str]], reasoning: ReasoningLevel,
         cancellation: asyncio.Event,
     ) -> AsyncIterator[str]:
+        trace = current_request.get()
+        started = perf_counter()
+        if trace:
+            trace.context_chars = sum(len(message.get("content", "")) for message in messages)
+            trace.model_tier, trace.model_name = config.tier.value, config.model
+        try:
+            async for content in self._stream(config, messages, reasoning, cancellation):
+                yield content
+        finally:
+            if trace:
+                trace.model_latency_ms += (perf_counter() - started) * 1000
+
+    async def _stream(
+        self, config: ProviderConfig, messages: list[dict[str, str]], reasoning: ReasoningLevel,
+        cancellation: asyncio.Event,
+    ) -> AsyncIterator[str]:
         if not config.configured:
             raise LlamaModelNotAvailableError(f"The {config.tier.value.title()} model tier is unavailable.")
-        url = f"{str(config.base_url).rstrip('/')}/chat/completions"
+        url = f"{str(config.base_url).strip().rstrip('/')}/chat/completions"
         payload = {
             "model": config.model, "messages": messages, "stream": True,
             "temperature": self._temperature(reasoning), "max_tokens": config.max_output_tokens,
         }
         timeout = httpx.Timeout(settings.genai_inference_timeout_seconds, connect=10.0)
+        received_content = False
         try:
             async with httpx.AsyncClient(timeout=timeout) as client:
-                async with client.stream("POST", url, headers=self._headers(config), json=payload) as response:
+                headers = self._headers(config)
+                trace = current_request.get()
+                if trace:
+                    headers["X-Request-ID"] = trace.request_id
+                async with client.stream("POST", url, headers=headers, json=payload) as response:
                     response.raise_for_status()
                     async for line in response.aiter_lines():
                         if cancellation.is_set():
@@ -123,14 +183,23 @@ class OpenAICompatibleProvider:
                             continue
                         try:
                             event = json.loads(data)
+                            if not isinstance(event, dict):
+                                continue
+                            if event.get("error"):
+                                raise ProviderConnectionError("The selected inference service rejected the request.")
+                            if trace:
+                                trace.token_usage.update(self.extract_usage(event))
                             content = event.get("choices", [{}])[0].get("delta", {}).get("content")
-                        except (json.JSONDecodeError, IndexError, TypeError):
+                        except (json.JSONDecodeError, IndexError, TypeError, AttributeError):
                             continue
-                        if content:
-                            yield str(content)
+                        if isinstance(content, str) and content:
+                            received_content = True
+                            yield content
+            if not received_content and not cancellation.is_set():
+                raise ProviderConnectionError("The selected inference service returned no response text.")
         except LlamaModelNotAvailableError:
             raise
-        except (httpx.HTTPError, TimeoutError) as exc:
+        except (httpx.HTTPError, TimeoutError, ValueError) as exc:
             raise ProviderConnectionError("The selected inference service is unavailable or timed out.") from exc
 
     async def health(self, config: ProviderConfig) -> tuple[bool, str | None]:
@@ -139,8 +208,8 @@ class OpenAICompatibleProvider:
         try:
             timeout = httpx.Timeout(4.0, connect=2.0)
             async with httpx.AsyncClient(timeout=timeout) as client:
-                response = await client.get(f"{str(config.base_url).rstrip('/')}/models", headers=self._headers(config))
+                response = await client.get(f"{str(config.base_url).strip().rstrip('/')}/models", headers=self._headers(config))
                 response.raise_for_status()
             return True, None
-        except httpx.HTTPError:
+        except (httpx.HTTPError, ValueError):
             return False, "Configured endpoint is currently unreachable"
