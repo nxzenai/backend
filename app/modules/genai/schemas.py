@@ -67,6 +67,7 @@ class ChatRequest(BaseModel):
 
 
 class ChatResponse(BaseModel):
+    request_id: str | None = None
     conversation_id: str
     generation_id: str
     message: ChatMessage

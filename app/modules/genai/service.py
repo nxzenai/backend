@@ -14,11 +14,12 @@ from app.modules.genai.attachments import chunk_text, extract_text, validate_att
 from app.modules.genai.constants import DEFAULT_CONVERSATION_TITLE, ModelTier
 from app.modules.genai.context_engine import ContextEngine
 from app.modules.genai.exceptions import GenAIException, LlamaModelNotAvailableError, ProviderConnectionError
-from app.modules.genai.provider import ModelRouter, OpenAICompatibleProvider, provider_config
+from app.modules.genai.provider import GenAIProvider, ModelRouter, OpenAICompatibleProvider, provider_config
 from app.modules.genai.repository import GenAIRepository
 from app.modules.genai.schemas import ChatRequest
 from app.modules.genai.serialization import json_safe
 from app.modules.genai.tools import ToolExecutionContext, ToolRouter, tool_registry
+from app.modules.genai.metrics import current_request
 
 
 _CANCELLATIONS: dict[str, asyncio.Event] = {}
@@ -30,7 +31,7 @@ class GenAIService:
         self.context = ContextEngine(repository)
         self.router = ModelRouter()
         self.tool_router = ToolRouter()
-        self.provider = OpenAICompatibleProvider()
+        self.provider: GenAIProvider = OpenAICompatibleProvider()
         self.lab_adapters = lab_adapters
 
     @staticmethod
@@ -239,7 +240,11 @@ class GenAIService:
     async def create_conversation(self, owner_id: str, title: str | None, tier: str, reasoning: str, project_id: str | None = None) -> dict[str, Any]:
         if project_id and not await self.repository.get_project(project_id, owner_id):
             raise GenAIException("Project not found.")
-        return await self.repository.create_conversation(owner_id, title, tier, reasoning, project_id)
+        conversation = await self.repository.create_conversation(owner_id, title, tier, reasoning, project_id)
+        trace = current_request.get()
+        if trace:
+            trace.conversation_id = str(conversation["id"])
+        return conversation
 
     async def list_conversations(self, owner_id: str) -> list[dict[str, Any]]:
         return await self.repository.list_conversations(owner_id)
@@ -270,6 +275,9 @@ class GenAIService:
     async def set_active_attachments(
         self, conversation_id: str, owner_id: str, attachment_ids: list[str],
     ) -> dict[str, list[str]]:
+        trace = current_request.get()
+        if trace:
+            trace.attachment_ids = list(attachment_ids)
         conversation = await self.repository.get_conversation(conversation_id, owner_id)
         if not conversation:
             raise GenAIException("Conversation not found.")
@@ -366,11 +374,25 @@ class GenAIService:
         return "I saved that memory for relevant future conversations."
 
     async def stream_chat(self, request: ChatRequest, owner_id: str, current_user: Any = None) -> AsyncIterator[dict[str, Any]]:
+        trace = current_request.get()
+        if trace:
+            trace.owner_id = owner_id
+            trace.conversation_id = request.conversation_id
+            trace.attachment_ids = list(request.attachment_ids)
+            detected = self.tool_router.route(request.message, [], request.attachment_ids)
+            trace.intent = "+".join(name for name in detected if tool_registry.get(name) or name == "native_training") or "chat"
+        async for event in self._stream_chat(request, owner_id, current_user):
+            yield trace.event(event) if trace else event
+
+    async def _stream_chat(self, request: ChatRequest, owner_id: str, current_user: Any = None) -> AsyncIterator[dict[str, Any]]:
         query = request.message.strip()
         if not query:
             raise GenAIException("Message cannot be empty.")
         conversation = await self._resolve_conversation(request, owner_id)
         conversation_id = str(conversation["id"])
+        trace = current_request.get()
+        if trace:
+            trace.conversation_id = conversation_id
         pending_prediction = conversation.get("pending_prediction") if not request.regenerate else None
         native_training_intent = self.tool_router.is_training_intent(query)
         if (
@@ -440,6 +462,8 @@ class GenAIService:
             await self.repository.delete_latest_assistant(conversation_id, owner_id)
         acknowledgement = None if pending_prediction else await self._memory_intent(owner_id, query)
         if acknowledgement is not None:
+            if trace:
+                trace.intent = "memory"
             if not request.regenerate:
                 await self.repository.add_message(owner_id, conversation_id, "user", query)
             message = await self.repository.add_message(
@@ -457,7 +481,6 @@ class GenAIService:
             }
             yield {"type": "done", "status": "completed", "message": message, "duration_ms": 0}
             return
-        config, route_reason = self.router.route(request.tier, query, request.reasoning)
         pending_attachment_ids = list((pending_prediction or {}).get("attachment_ids") or [])
         confirmed_attachment_ids = list((confirmed_action or {}).get("attachment_ids") or [])
         active_attachment_ids = list(conversation.get("active_attachment_ids") or [])
@@ -498,6 +521,8 @@ class GenAIService:
             raise GenAIException("One or more selected attachments are unavailable or are not owned by this user.")
         # Only attachments explicitly selected for this message may reach a tool.
         attachment_ids = list(dict.fromkeys(effective_attachment_ids))[:50]
+        if trace:
+            trace.attachment_ids = list(attachment_ids)
         if request.attachment_ids and hasattr(self.repository, "set_active_attachment_ids"):
             await self.repository.set_active_attachment_ids(conversation_id, owner_id, attachment_ids)
         image_prediction = bool(
@@ -632,6 +657,8 @@ class GenAIService:
         selected_tools = ["autodl"] if image_prediction and not requested_tools else self.tool_router.route(
             query, requested_tools, attachment_ids,
         )
+        if trace:
+            trace.intent = "+".join(name for name in selected_tools if tool_registry.get(name) or name == "native_training") or "chat"
         if selected_tools == ["native_training"]:
             if not self.lab_adapters or not current_user:
                 yield {"type": "error", "code": "LAB_ADAPTER_UNAVAILABLE", "message": "Native dataset inspection is unavailable."}
@@ -705,6 +732,17 @@ class GenAIService:
         ):
             selected_tools = ["automl"]
             structured_automl = True
+        # Server-detected dependencies cannot be demoted by client tool choices.
+        required_tools = set(self.tool_router.route(query, [], attachment_ids))
+        native_tools = {"automl", "autonlp", "autodl"}
+        if native_tools.intersection(selected_tools):
+            if pending_tool or confirmed_tool or native_context_followup or image_prediction:
+                required_tools = set(selected_tools) & native_tools
+            else:
+                required_tools |= set(selected_tools) & native_tools
+        selected_tools = list(dict.fromkeys([*sorted(required_tools), *selected_tools]))
+        if trace:
+            trace.intent = "+".join(name for name in selected_tools if tool_registry.get(name)) or "chat"
         tool_results = []
         completed_native_action: tuple[Any, str] | None = None
         for tool_name in selected_tools:
@@ -920,6 +958,13 @@ class GenAIService:
                 arguments,
             )
             tool_results.append(result)
+            if not result.ok and tool_name in required_tools:
+                if tool_name in native_tools:
+                    await self.repository.clear_pending_prediction(conversation_id, owner_id)
+                yield {"type": "tool", "tool": result.tool, "status": "failed", "message": result.error_message}
+                yield {"type": "error", "code": result.error_code or "GENAI_TOOL_UNAVAILABLE",
+                       "message": result.error_message or "Required tool evidence is unavailable."}
+                return
             native_action = str(arguments.get("action") or "").casefold()
             native_payload = (result.data or {}).get("result") if isinstance(result.data, dict) else None
             native_run_id = str((native_payload or {}).get("run_id") or arguments.get("run_id") or "").strip()
@@ -953,7 +998,7 @@ class GenAIService:
                 await self.repository.clear_pending_prediction(conversation_id, owner_id)
                 if result.ok:
                     completed_native_action = (result, native_action)
-            elif tool_name == "autodl" and native_action in {"status", "result", "cancel"} and result.ok:
+            elif tool_name in native_tools and result.ok:
                 completed_native_action = (result, native_action)
             yield {
                 "type": "tool", "tool": result.tool, "status": "completed" if result.ok else "failed",
@@ -1041,6 +1086,7 @@ class GenAIService:
                 "message": "The native training request could not be resolved.",
             }
             return
+        config, route_reason = self.router.route(request.tier, query, request.reasoning)
         prompt_messages = await self.context.build_messages(
             owner_id, conversation_id, query, request.reasoning,
             max(1024, config.context_limit - config.max_output_tokens),
@@ -1059,7 +1105,7 @@ class GenAIService:
             conversation_id, owner_id, request.tier.value, request.reasoning.value,
         )
 
-        generation_id = str(uuid.uuid4())
+        generation_id = trace.request_id if trace else str(uuid.uuid4())
         cancellation = asyncio.Event()
         _CANCELLATIONS[generation_id] = cancellation
         started = time.perf_counter()
@@ -1192,6 +1238,9 @@ class GenAIService:
         self, owner_id: str, filename: str, content_type: str, content: bytes,
         conversation_id: str | None, project_id: str | None,
     ) -> dict[str, Any]:
+        trace = current_request.get()
+        if trace:
+            trace.owner_id, trace.conversation_id = owner_id, conversation_id
         if not content or len(content) > settings.genai_max_attachment_bytes:
             raise GenAIException(f"File must be between 1 byte and {settings.genai_max_attachment_bytes // (1024 * 1024)} MB.")
         safe_name = Path(filename).name[:240]
@@ -1205,9 +1254,12 @@ class GenAIService:
             chunks = await asyncio.to_thread(chunk_text, text)
         except (ImportError, ValueError, OSError) as exc:
             raise GenAIException(str(exc)) from exc
-        return await self.repository.save_attachment(
+        attachment = await self.repository.save_attachment(
             owner_id, conversation_id, project_id, safe_name, content_type, content, chunks, extraction,
         )
+        if trace:
+            trace.attachment_ids = [str(attachment["id"])]
+        return attachment
 
     async def attachments(self, owner_id: str, conversation_id: str | None, project_id: str | None) -> list[dict[str, Any]]:
         return await self.repository.list_attachments(owner_id, conversation_id, project_id)
@@ -1226,7 +1278,6 @@ class GenAIService:
             available, message = await self.provider.health(config)
             statuses.append({
                 "tier": tier.value, "configured": config.configured, "available": available,
-                "model_name": config.model, "context_limit": config.context_limit,
-                "max_output_tokens": config.max_output_tokens, "message": message,
+                **self.provider.model_metadata(config), "message": message,
             })
         return {"status": "healthy" if statuses[0]["available"] else "degraded", "tiers": statuses, "tools": tool_registry.available()}
