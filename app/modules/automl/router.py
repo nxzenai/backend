@@ -406,6 +406,8 @@ async def save_training_artifact(
             service.save_best_model_unique,
             result,
         )
+        from app.modules.automl.mongo_metadata import save_model
+        await asyncio.to_thread(save_model, owner_id, filepath.name, result.model_artifact)
     except ModelArtifactError as exc:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -950,6 +952,9 @@ async def delete_model(
     try:
         service.load_owned_artifact(filename, authenticated_owner(current_user))
         deleted = service.delete_model(filename)
+        if deleted:
+            from app.modules.automl.mongo_metadata import delete_model as delete_metadata
+            await asyncio.to_thread(delete_metadata, authenticated_owner(current_user), filename)
     except ModelNotFoundError as exc:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,

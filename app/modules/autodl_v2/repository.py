@@ -13,7 +13,7 @@ from app.core.config.settings import settings
 RUNS_COLLECTION = "autodl_v2_runs"
 MODELS_COLLECTION = "autodl_v2_models"
 PREDICTIONS_COLLECTION = "autodl_v2_predictions"
-AUDIT_COLLECTION = "autodl_v2_audit_events"
+AUDIT_COLLECTION = "activity_logs"
 
 
 class AutoDLV2Repository:
@@ -21,7 +21,7 @@ class AutoDLV2Repository:
         self.runs = database[RUNS_COLLECTION]
         self.models = database[MODELS_COLLECTION]
         self.predictions = database[PREDICTIONS_COLLECTION]
-        self.audit = database[AUDIT_COLLECTION]
+        self.audit = database.client[settings.audit_database_name][AUDIT_COLLECTION]
         self._ensure_indexes()
 
     def _ensure_indexes(self) -> None:
@@ -57,12 +57,7 @@ class AutoDLV2Repository:
             "created_at": now, "updated_at": now,
         }
         self.runs.insert_one(document)
-        self.audit.insert_one({
-            "_id": str(uuid.uuid4()), "owner_id": owner_id,
-            "run_id": document["_id"], "event_type": "dataset_inspected",
-            "details": {"dataset_kind": dataset_kind, "filename": filename},
-            "created_at": now,
-        })
+        self.add_audit(owner_id, document["_id"], "dataset_inspected", {})
         return document
 
     def get_run(self, run_id: str, owner_id: str) -> dict[str, Any]:
@@ -360,10 +355,8 @@ class AutoDLV2Repository:
         }
 
     def add_audit(self, owner_id: str, run_id: str, event_type: str, details: dict[str, Any]) -> None:
-        self.audit.insert_one({
-            "_id": str(uuid.uuid4()), "owner_id": owner_id, "run_id": run_id,
-            "event_type": event_type, "details": details, "created_at": datetime.utcnow(),
-        })
+        from app.core.audit import log_domain_event
+        log_domain_event(self.audit, "autodl", event_type, owner_id, run_id)
 
 
 __all__ = [

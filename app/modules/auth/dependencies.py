@@ -11,6 +11,7 @@ from app.core.security.jwt import decode_access_token
 from app.modules.auth.models import UserModel
 from app.modules.auth.repository import AuthRepository
 from app.modules.auth.service import AuthService
+from app.core.audit import actor
 
 # --------------------------------------------------
 # HTTP Bearer Security
@@ -88,4 +89,5 @@ async def get_current_user(
             error_code="ACCOUNT_DISABLED",
         )
 
+    actor.set((user.id, user.role))
     return user

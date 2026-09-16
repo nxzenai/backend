@@ -1,13 +1,14 @@
 from functools import lru_cache
+from pathlib import Path
 
-from pydantic import AliasChoices, Field
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
 
     model_config = SettingsConfigDict(
-        env_file=(".env", ".env.development"),
+        env_file=tuple(Path(__file__).resolve().parents[3] / name for name in (".env", ".env.development")),
         case_sensitive=True,
         extra="ignore",
     )
@@ -76,21 +77,20 @@ class Settings(BaseSettings):
 
     mongodb_uri: str = Field(
         default="mongodb://localhost:27017",
-        validation_alias=AliasChoices(
-            "MONGODB_URI",
-            "MONGODB_URL",
-        ),
+        alias="MONGODB_URI",
     )
 
     database_name: str = Field(
         default="ai_studio_db",
-        alias="DATABASE_NAME",
+        alias="STUDIO_DB",
     )
 
     marketing_database_name: str = Field(
-        default="nxzenai_marketing",
-        alias="MARKETING_DB",
+        default="nxzenai_leads",
+        alias="LEADS_DB",
     )
+
+    audit_database_name: str = Field(default="nxzenai_audit", alias="AUDIT_DB")
 
     # -------------------------------------------------
     # MinIO
@@ -266,10 +266,6 @@ class Settings(BaseSettings):
     autodl_database_url: str = Field(
         default="sqlite:///./autodl.db",
         alias="AUTODL_DATABASE_URL",
-    )
-    ai_registry_database_url: str = Field(
-        default="sqlite:///./ai_registry.db",
-        alias="AI_REGISTRY_DATABASE_URL",
     )
     ai_job_spool_root: str = Field(
         default="data/ai-job-queue",

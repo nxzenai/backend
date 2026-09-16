@@ -48,6 +48,9 @@ class GenAIRequestRoute(APIRoute):
         response_started = False
 
         async def persist():
+            if (scope.get("method") not in {"POST", "PUT", "PATCH", "DELETE"}
+                    and trace.status not in {"failed", "cancelled"}):
+                return
             try:
                 await GenAIRepository(get_database()).record_request(trace.request_id, trace.owner_id, trace.snapshot())
             except Exception:

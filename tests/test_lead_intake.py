@@ -67,8 +67,10 @@ class Collection:
         return next((deepcopy(row) for row in self.rows if matches(row, query)), None)
     def find(self, query=None, projection=None):
         return Cursor([row for row in self.rows if matches(row, query or {})])
-    async def update_one(self, query, update):
+    async def update_one(self, query, update, upsert=False):
         found = await self.find_one_and_update(query, update)
+        if found is None and upsert:
+            await self.insert_one({**query, **update.get("$setOnInsert", {}), **update.get("$set", {})})
         return SimpleNamespace(matched_count=int(found is not None))
     async def find_one_and_update(self, query, update, **kwargs):
         for row in self.rows:
@@ -85,10 +87,29 @@ class Collection:
 
 
 class Database:
-    def __init__(self): self.leads = Collection()
+    def __init__(self):
+        self.leads = Collection()
+        self.collections = {"leads": self.leads, "crm_deals": Collection(),
+                            "lead_activities": Collection(), "crm_notes": Collection()}
     def __getitem__(self, key):
-        assert key == "leads", "Lead intake must use the existing leads collection"
-        return self.leads
+        return self.collections[key]
+
+
+@pytest.mark.asyncio
+async def test_crm_conversion_notes_and_removal_keep_original_lead():
+    db = Database()
+    value = await seed(db, "verified")
+    crm = CRMRepository(db)
+    await crm.promote_intake_lead(value, "admin-1")
+    await crm.add_note(value, "Follow up tomorrow")
+    await crm.convert_lead(value)
+    assert db["crm_deals"].rows[0]["lead_id"] == value
+    assert db["crm_deals"].rows[0]["status"] == "enrolled"
+    assert db["crm_notes"].rows[0]["lead_id"] == value
+    await crm.delete_lead(value)
+    assert await crm.get_lead(value) is None
+    assert len(db.leads.rows) == 1
+    assert db["crm_deals"].rows[0]["is_deleted"] is True
 
 
 @pytest.fixture
@@ -207,6 +228,9 @@ async def test_push_atomic_idempotency_linkage_and_legacy_crm_preservation(db):
     assert lead["crm_lead_id"] == value
     assert lead["pushed_to_crm_by"] == "admin-1"
     assert lead["pushed_to_crm_at"]
+    assert len(db["crm_deals"].rows) == 1
+    assert db["crm_deals"].rows[0]["lead_id"] == value
+    assert len(db["lead_activities"].rows) == 1
     assert len(db.leads.rows) == 2
     assert db.leads.rows[0] == before
     assert (await crm.get_lead(value))["id"] == value

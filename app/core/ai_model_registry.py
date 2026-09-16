@@ -4,471 +4,289 @@ import hashlib
 import logging
 import uuid
 from datetime import datetime, timedelta
+from types import SimpleNamespace
 from typing import Any, Callable
 
-from sqlalchemy import Boolean, Column, DateTime, Float, Integer, JSON, String, UniqueConstraint, create_engine
-from sqlalchemy.orm import declarative_base, sessionmaker
+from pymongo import ReturnDocument
 
 from app.core.artifact_storage import get_artifact_storage
 from app.core.config.settings import settings
-
+from app.core.database.mongodb import get_sync_database, get_audit_database
 
 logger = logging.getLogger(__name__)
-Base = declarative_base()
 MODEL_STAGES = ("draft", "validated", "production", "archived")
-_metric_hooks: list[Callable[[dict[str, Any]], None]] = []
-_drift_hooks: list[Callable[[dict[str, Any]], dict[str, Any]]] = []
+RegisteredModel = SimpleNamespace
+ModelAuditEvent = SimpleNamespace
+PredictionObservation = SimpleNamespace
+_metric_hooks: list[Callable] = []
+_drift_hooks: list[Callable] = []
 
 
-class RegisteredModel(Base):
-    __tablename__ = "ai_model_registry"
-    __table_args__ = (UniqueConstraint("module", "winning_job_id", name="uq_ai_registry_job"),)
-
-    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
-    model_group_id = Column(String, nullable=False, index=True)
-    version = Column(Integer, nullable=False)
-    model_version_id = Column(String, nullable=False, index=True)
-    module = Column(String, nullable=False, index=True)
-    owner_id = Column(String, nullable=False, index=True)
-    task = Column(String, nullable=False)
-    model_type = Column(String, nullable=False)
-    winning_job_id = Column(String, nullable=False, index=True)
-    source_model_id = Column(String, nullable=True)
-    artifact_location = Column(String, nullable=False)
-    artifact_hash = Column(String, nullable=False)
-    dataset_hash = Column(String, nullable=False)
-    configuration = Column(JSON, nullable=False, default=dict)
-    lifecycle_stage = Column(String, nullable=False, default="draft", index=True)
-    artifact_available = Column(Boolean, nullable=False, default=True)
-    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
-    updated_at = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
-    archived_at = Column(DateTime, nullable=True)
+def _row(document):
+    if document is None:
+        return None
+    values = dict(document)
+    values["id"] = str(values.pop("_id"))
+    return SimpleNamespace(**values)
 
 
-class ModelAuditEvent(Base):
-    __tablename__ = "ai_model_audit_events"
-
-    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
-    model_id = Column(String, nullable=False, index=True)
-    actor_id = Column(String, nullable=False, index=True)
-    event_type = Column(String, nullable=False, index=True)
-    details = Column(JSON, nullable=False, default=dict)
-    created_at = Column(DateTime, nullable=False, default=datetime.utcnow, index=True)
+def _scope(owner_id, admin=False):
+    if not owner_id:
+        raise ValueError("An authenticated owner is required")
+    return {} if admin else {"owner_id": owner_id}
 
 
-class PredictionObservation(Base):
-    __tablename__ = "ai_prediction_observations"
-
-    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
-    model_id = Column(String, nullable=True, index=True)
-    module = Column(String, nullable=False, index=True)
-    job_id = Column(String, nullable=False, index=True)
-    owner_id = Column(String, nullable=False, index=True)
-    success = Column(Boolean, nullable=False)
-    latency_ms = Column(Float, nullable=False)
-    error_code = Column(String, nullable=True)
-    predicted_label = Column(String, nullable=True)
-    actual_label = Column(String, nullable=True)
-    confidence = Column(Float, nullable=True)
-    input_fingerprint = Column(String, nullable=True)
-    metadata_json = Column(JSON, nullable=False, default=dict)
-    created_at = Column(DateTime, nullable=False, default=datetime.utcnow, index=True)
-
-
-class OperationalMetric(Base):
-    __tablename__ = "ai_operational_metrics"
-
-    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
-    name = Column(String, nullable=False, index=True)
-    value = Column(Float, nullable=False)
-    tags = Column(JSON, nullable=False, default=dict)
-    created_at = Column(DateTime, nullable=False, default=datetime.utcnow, index=True)
-
-
-connect_args = (
-    {"check_same_thread": False, "timeout": 30}
-    if settings.ai_registry_database_url.startswith("sqlite") else {}
-)
-engine = create_engine(settings.ai_registry_database_url, connect_args=connect_args, pool_pre_ping=True)
-RegistrySessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-Base.metadata.create_all(bind=engine)
-
-
-def _event(session, model_id: str, actor_id: str, event_type: str, details: dict[str, Any] | None = None) -> None:
-    session.add(ModelAuditEvent(
-        model_id=model_id, actor_id=actor_id, event_type=event_type,
-        details=details or {},
-    ))
-
-
-def register_completed_model(
-    *, module: str, job_id: str, owner_id: str,
-    manifest: dict[str, Any], configuration: dict[str, Any],
-    source_model_id: str | None = None,
-) -> RegisteredModel:
-    session = RegistrySessionLocal()
+def _event(model, actor_id, event_type, details=None):
+    # Details come only from the fixed lifecycle fields below, never model config.
+    document = {"_id": str(uuid.uuid4()), "model_id": model.id,
+                "owner_id": model.owner_id, "actor_id": actor_id,
+                "event_type": event_type, "details": details or {},
+                "module": model.module, "created_at": datetime.utcnow()}
     try:
-        existing = session.query(RegisteredModel).filter(
-            RegisteredModel.module == module,
-            RegisteredModel.winning_job_id == job_id,
-        ).first()
-        new_hash = str(manifest.get("artifact_integrity_sha256") or "")
-        if existing:
-            if new_hash and existing.artifact_hash != new_hash:
-                old_hash = existing.artifact_hash
-                existing.artifact_hash = new_hash
-                existing.artifact_location = get_artifact_storage().artifact_location(module, job_id)
-                _event(session, existing.id, owner_id, "artifact_replaced", {
-                    "previous_hash": old_hash, "artifact_hash": new_hash,
-                })
-                session.commit()
-            session.expunge(existing)
-            return existing
-
-        source = session.get(RegisteredModel, source_model_id) if source_model_id else None
-        group_id = source.model_group_id if source else str(uuid.uuid4())
-        latest = session.query(RegisteredModel).filter(
-            RegisteredModel.model_group_id == group_id,
-        ).order_by(RegisteredModel.version.desc()).first()
-        model_config = manifest.get("model_configuration") or {}
-        model = RegisteredModel(
-            model_group_id=group_id,
-            version=(latest.version + 1) if latest else 1,
-            model_version_id=str(manifest.get("model_version_id") or uuid.uuid4()),
-            module=module,
-            owner_id=owner_id,
-            task=str(manifest.get("task") or "unknown"),
-            model_type=str(
-                model_config.get("architecture") or
-                model_config.get("model_name") or "unknown"
-            ),
-            winning_job_id=job_id,
-            source_model_id=source.id if source else None,
-            artifact_location=get_artifact_storage().artifact_location(module, job_id),
-            artifact_hash=new_hash,
-            dataset_hash=str(manifest.get("dataset_hash") or ""),
-            configuration=configuration,
-            lifecycle_stage="draft",
-        )
-        session.add(model)
-        session.flush()
-        _event(session, model.id, owner_id, "model_version_created", {
-            "version": model.version, "job_id": job_id,
-            "source_model_id": model.source_model_id,
-        })
-        session.commit()
-        session.refresh(model)
-        emit_metric("model.created", 1, {"module": module, "model_type": model.model_type})
-        session.expunge(model)
-        return model
+        audit = get_audit_database().delegate
+        audit.activity_logs.insert_one(document)
+        if actor_id != model.owner_id:
+            audit.admin_audit_logs.insert_one(dict(document))
     except Exception:
-        session.rollback()
-        raise
-    finally:
-        session.close()
+        logger.warning("Model audit event could not be persisted")
 
 
-def list_models(owner_id: str, *, module: str | None = None, include_archived: bool = False, admin: bool = False) -> list[RegisteredModel]:
-    session = RegistrySessionLocal()
+def register_completed_model(*, module: str, job_id: str, owner_id: str,
+                             manifest: dict[str, Any], configuration: dict[str, Any],
+                             source_model_id: str | None = None) -> RegisteredModel:
+    _scope(owner_id)
+    models = get_sync_database().ai_model_registry
+    key = {"module": module, "winning_job_id": job_id}
+    existing = _row(models.find_one(key))
+    new_hash = str(manifest.get("artifact_integrity_sha256") or "")
+    if existing:
+        if existing.owner_id != owner_id:
+            raise LookupError("Model not found.")
+        if new_hash and existing.artifact_hash != new_hash:
+            previous = existing.artifact_hash
+            existing = _row(models.find_one_and_update(
+                {"_id": existing.id, "owner_id": owner_id},
+                {"$set": {"artifact_hash": new_hash,
+                          "artifact_location": get_artifact_storage().artifact_location(module, job_id),
+                          "updated_at": datetime.utcnow()}}, return_document=ReturnDocument.AFTER))
+            _event(existing, owner_id, "artifact_replaced", {"previous_hash": previous, "artifact_hash": new_hash})
+        return existing
+    source = get_model(source_model_id, owner_id) if source_model_id else None
+    if source_model_id and (source is None or source.module != module):
+        raise LookupError("Source model not found.")
+    group_id = source.model_group_id if source else str(uuid.uuid4())
+    # Atomic counter avoids concurrent retraining assigning the same version.
+    counter = models.database.ai_model_versions.find_one_and_update(
+        {"_id": group_id, "owner_id": owner_id},
+        {"$inc": {"version": 1}, "$setOnInsert": {"owner_id": owner_id}},
+        upsert=True, return_document=ReturnDocument.AFTER)
+    config = manifest.get("model_configuration") or {}
+    now = datetime.utcnow()
+    document = {"_id": str(uuid.uuid4()), "model_group_id": group_id,
+                "version": counter["version"],
+                "model_version_id": str(manifest.get("model_version_id") or uuid.uuid4()),
+                "module": module, "owner_id": owner_id,
+                "task": str(manifest.get("task") or "unknown"),
+                "model_type": str(config.get("architecture") or config.get("model_name") or "unknown"),
+                "winning_job_id": job_id, "source_model_id": source.id if source else None,
+                "artifact_location": get_artifact_storage().artifact_location(module, job_id),
+                "artifact_hash": new_hash, "dataset_hash": str(manifest.get("dataset_hash") or ""),
+                "configuration": configuration, "lifecycle_stage": "draft", "artifact_available": True,
+                "created_at": now, "updated_at": now, "archived_at": None}
+    from pymongo.errors import DuplicateKeyError
     try:
-        query = session.query(RegisteredModel)
-        if not admin:
-            query = query.filter(RegisteredModel.owner_id == owner_id)
-        if module:
-            query = query.filter(RegisteredModel.module == module)
-        if not include_archived:
-            query = query.filter(RegisteredModel.lifecycle_stage != "archived")
-        models = query.order_by(RegisteredModel.created_at.desc()).all()
-        for model in models:
-            session.expunge(model)
-        return models
-    finally:
-        session.close()
+        models.insert_one(document)
+    except DuplicateKeyError:
+        existing = _row(models.find_one({**key, "owner_id": owner_id}))
+        if existing is None:
+            raise
+        return existing
+    model = _row(document)
+    _event(model, owner_id, "model_version_created",
+           {"version": model.version, "job_id": job_id, "source_model_id": model.source_model_id})
+    emit_metric("model.created", 1, {"module": module, "model_type": model.model_type})
+    return model
 
 
-def get_model(model_id: str, owner_id: str, *, admin: bool = False) -> RegisteredModel | None:
-    session = RegistrySessionLocal()
-    try:
-        query = session.query(RegisteredModel).filter(RegisteredModel.id == model_id)
-        if not admin:
-            query = query.filter(RegisteredModel.owner_id == owner_id)
-        model = query.first()
-        if model:
-            session.expunge(model)
-        return model
-    finally:
-        session.close()
+def list_models(owner_id: str, *, module=None, include_archived=False, admin=False):
+    query = _scope(owner_id, admin)
+    if module:
+        query["module"] = module
+    if not include_archived:
+        query["lifecycle_stage"] = {"$ne": "archived"}
+    return [_row(doc) for doc in get_sync_database().ai_model_registry.find(query).sort("created_at", -1)]
 
 
-def list_versions(model_id: str, owner_id: str, *, admin: bool = False) -> list[RegisteredModel]:
+def get_model(model_id: str, owner_id: str, *, admin=False):
+    return _row(get_sync_database().ai_model_registry.find_one({"_id": model_id, **_scope(owner_id, admin)}))
+
+
+def list_versions(model_id: str, owner_id: str, *, admin=False):
     model = get_model(model_id, owner_id, admin=admin)
     if not model:
         return []
-    session = RegistrySessionLocal()
-    try:
-        versions = session.query(RegisteredModel).filter(
-            RegisteredModel.model_group_id == model.model_group_id,
-        ).order_by(RegisteredModel.version.desc()).all()
-        for version in versions:
-            session.expunge(version)
-        return versions
-    finally:
-        session.close()
+    return [_row(doc) for doc in get_sync_database().ai_model_registry.find(
+        {"model_group_id": model.model_group_id, "owner_id": model.owner_id}).sort("version", -1)]
 
 
-def list_audit_events(model_id: str, owner_id: str, *, admin: bool = False) -> list[ModelAuditEvent]:
-    if not get_model(model_id, owner_id, admin=admin):
+def list_audit_events(model_id: str, owner_id: str, *, admin=False):
+    model = get_model(model_id, owner_id, admin=admin)
+    if not model:
         return []
-    session = RegistrySessionLocal()
-    try:
-        events = session.query(ModelAuditEvent).filter(
-            ModelAuditEvent.model_id == model_id,
-        ).order_by(ModelAuditEvent.created_at.desc()).all()
-        for event in events:
-            session.expunge(event)
-        return events
-    finally:
-        session.close()
+    return [_row(doc) for doc in get_audit_database().delegate.activity_logs.find(
+        {"model_id": model_id, "owner_id": model.owner_id}).sort("created_at", -1)]
 
 
-def change_stage(model_id: str, actor_id: str, stage: str, *, admin: bool = False) -> RegisteredModel:
+def change_stage(model_id: str, actor_id: str, stage: str, *, admin=False):
     if stage not in MODEL_STAGES:
         raise ValueError("Unsupported model lifecycle stage.")
-    session = RegistrySessionLocal()
+    model = get_model(model_id, actor_id, admin=admin)
+    if not model:
+        raise LookupError("Model not found.")
+    if stage == "production" and not admin:
+        raise PermissionError("Only an administrator can promote a model to production.")
+    if stage == "production" and model.module == "autonlp":
+        if (((model.configuration or {}).get("result") or {}).get("metrics") or {}).get("readiness") == "not_reliable":
+            raise ValueError("This AutoNLP model is not reliable enough for production promotion.")
+    previous = model.lifecycle_stage
+    if previous == "production" and stage != "production" and not admin:
+        raise PermissionError("Only an administrator can change a production model.")
+    updated = _row(get_sync_database().ai_model_registry.find_one_and_update(
+        {"_id": model_id, "owner_id": model.owner_id, "lifecycle_stage": previous},
+        {"$set": {"lifecycle_stage": stage, "updated_at": datetime.utcnow(),
+                  "archived_at": datetime.utcnow() if stage == "archived" else None}},
+        return_document=ReturnDocument.AFTER))
+    if updated is None:
+        raise ValueError("Model stage changed concurrently. Retry the operation.")
+    event = "model_archived" if stage == "archived" else "model_restored" if previous == "archived" else "stage_changed"
+    _event(updated, actor_id, event, {"from": previous, "to": stage})
+    return updated
+
+
+def record_retraining(model_id: str, actor_id: str, new_job_id: str):
+    # Caller has already authorized retraining, including administrative access.
+    model = get_model(model_id, actor_id, admin=True)
+    if not model:
+        raise LookupError("Model not found.")
+    _event(model, actor_id, "retraining_initiated", {"job_id": new_job_id})
+
+
+def record_prediction(*, module: str, job_id: str, owner_id: str, success: bool,
+                      latency_ms: float, error_code=None, predicted_label=None,
+                      confidence=None, input_fingerprint=None, metadata=None):
+    _scope(owner_id)
     try:
-        model = session.get(RegisteredModel, model_id)
-        if not model or (not admin and model.owner_id != actor_id):
-            raise LookupError("Model not found.")
-        if stage == "production" and not admin:
-            raise PermissionError("Only an administrator can promote a model to production.")
-        if stage == "production" and model.module == "autonlp":
-            result = ((model.configuration or {}).get("result") or {})
-            readiness = (result.get("metrics") or {}).get("readiness")
-            if readiness == "not_reliable":
-                raise ValueError("This AutoNLP model is not reliable enough for production promotion.")
-        previous = model.lifecycle_stage
-        if previous == "production" and stage != "production" and not admin:
-            raise PermissionError("Only an administrator can change a production model.")
-        model.lifecycle_stage = stage
-        model.archived_at = datetime.utcnow() if stage == "archived" else None
-        event_type = "model_archived" if stage == "archived" else (
-            "model_restored" if previous == "archived" else "stage_changed"
-        )
-        _event(session, model.id, actor_id, event_type, {"from": previous, "to": stage})
-        if admin and model.owner_id != actor_id:
-            _event(session, model.id, actor_id, "administrative_action", {"action": event_type})
-        session.commit()
-        session.refresh(model)
-        session.expunge(model)
-        return model
-    except Exception:
-        session.rollback()
-        raise
-    finally:
-        session.close()
-
-
-def record_retraining(model_id: str, actor_id: str, new_job_id: str) -> None:
-    session = RegistrySessionLocal()
-    try:
-        _event(session, model_id, actor_id, "retraining_initiated", {"job_id": new_job_id})
-        model = session.get(RegisteredModel, model_id)
-        if model and model.owner_id != actor_id:
-            _event(session, model_id, actor_id, "administrative_action", {
-                "action": "retraining_initiated", "job_id": new_job_id,
-            })
-        session.commit()
-    finally:
-        session.close()
-
-
-def record_prediction(
-    *, module: str, job_id: str, owner_id: str, success: bool,
-    latency_ms: float, error_code: str | None = None,
-    predicted_label: str | None = None, confidence: float | None = None,
-    input_fingerprint: str | None = None, metadata: dict[str, Any] | None = None,
-) -> None:
-    session = RegistrySessionLocal()
-    try:
-        model = session.query(RegisteredModel).filter(
-            RegisteredModel.module == module,
-            RegisteredModel.winning_job_id == job_id,
-        ).first()
-        session.add(PredictionObservation(
-            model_id=model.id if model else None, module=module, job_id=job_id,
-            owner_id=owner_id, success=success, latency_ms=max(0.0, latency_ms),
-            error_code=error_code, predicted_label=predicted_label,
-            confidence=confidence, input_fingerprint=input_fingerprint,
-            metadata_json=metadata or {},
-        ))
-        session.commit()
+        db = get_sync_database()
+        model = db.ai_model_registry.find_one({"module": module, "winning_job_id": job_id, "owner_id": owner_id})
+        db.ai_prediction_observations.insert_one({
+            "_id": str(uuid.uuid4()), "model_id": model["_id"] if model else None,
+            "module": module, "job_id": job_id, "owner_id": owner_id, "success": success,
+            "latency_ms": max(0.0, latency_ms), "error_code": error_code,
+            "predicted_label": predicted_label, "actual_label": None, "confidence": confidence,
+            "input_fingerprint": input_fingerprint, "metadata_json": metadata or {},
+            "created_at": datetime.utcnow()})
         emit_metric("prediction.count", 1, {"module": module, "success": str(success).lower()})
     except Exception:
-        session.rollback()
-        logger.warning("Unable to persist prediction monitoring metadata", exc_info=True)
-    finally:
-        session.close()
+        logger.warning("Unable to persist prediction monitoring metadata")
 
 
-def record_prediction_feedback(observation_id: str, owner_id: str, actual_label: str, *, admin: bool = False) -> PredictionObservation:
+def record_prediction_feedback(observation_id: str, owner_id: str, actual_label: str, *, admin=False):
     actual_label = actual_label.strip()
     if not actual_label or len(actual_label) > 500:
         raise ValueError("A valid actual label/value is required.")
-    session = RegistrySessionLocal()
-    try:
-        observation = session.get(PredictionObservation, observation_id)
-        if not observation or (not admin and observation.owner_id != owner_id):
-            raise LookupError("Prediction observation not found.")
-        observation.actual_label = actual_label
-        session.commit()
-        session.refresh(observation)
-        session.expunge(observation)
-        return observation
-    finally:
-        session.close()
+    row = get_sync_database().ai_prediction_observations.find_one_and_update(
+        {"_id": observation_id, **_scope(owner_id, admin)}, {"$set": {"actual_label": actual_label}},
+        return_document=ReturnDocument.AFTER)
+    if row is None:
+        raise LookupError("Prediction observation not found.")
+    return _row(row)
 
 
-def list_prediction_observations(owner_id: str, *, model_id: str | None = None, admin: bool = False, limit: int = 100) -> list[PredictionObservation]:
-    session = RegistrySessionLocal()
-    try:
-        query = session.query(PredictionObservation)
-        if not admin:
-            query = query.filter(PredictionObservation.owner_id == owner_id)
-        if model_id:
-            query = query.filter(PredictionObservation.model_id == model_id)
-        rows = query.order_by(PredictionObservation.created_at.desc()).limit(min(max(limit, 1), 500)).all()
-        for row in rows:
-            session.expunge(row)
-        return rows
-    finally:
-        session.close()
+def list_prediction_observations(owner_id: str, *, model_id=None, admin=False, limit=100):
+    query = _scope(owner_id, admin)
+    if model_id:
+        query["model_id"] = model_id
+    return [_row(doc) for doc in get_sync_database().ai_prediction_observations.find(query)
+            .sort("created_at", -1).limit(min(max(limit, 1), 500))]
 
 
-def emit_metric(name: str, value: float, tags: dict[str, Any] | None = None) -> None:
+def emit_metric(name: str, value: float, tags=None):
     event = {"name": name, "value": float(value), "tags": tags or {}, "timestamp": datetime.utcnow().isoformat()}
-    session = None
-    try:
-        session = RegistrySessionLocal()
-        session.add(OperationalMetric(name=name, value=float(value), tags=tags or {}))
-        session.commit()
-    except Exception:
-        if session is not None:
-            session.rollback()
-        logger.warning("Unable to persist operational metric %s", name, exc_info=True)
-    finally:
-        if session is not None:
-            session.close()
+    if name in {"model.created", "prediction.count", "job.queued", "job.started", "job.finished"}:
+        from app.core.audit import actor
+        module = (tags or {}).get("module")
+        if module in {"automl", "autodl", "autonlp"}:
+            try:
+                get_audit_database().delegate.module_usage.insert_one({
+                    "_id": str(uuid.uuid4()), "action": name, "value": float(value),
+                    "module": module, "owner_id": actor.get()[0], "created_at": datetime.utcnow()})
+            except Exception:
+                logger.warning("Operational metric could not be persisted")
     for hook in tuple(_metric_hooks):
         try:
             hook(event)
         except Exception:
-            logger.warning("External metrics hook failed", exc_info=True)
+            logger.warning("External metrics hook failed")
 
 
-def register_metrics_hook(hook: Callable[[dict[str, Any]], None]) -> None:
+def register_metrics_hook(hook):
     _metric_hooks.append(hook)
 
 
-def register_drift_hook(hook: Callable[[dict[str, Any]], dict[str, Any]]) -> None:
+def register_drift_hook(hook):
     _drift_hooks.append(hook)
 
 
-def evaluate_drift(model_id: str, owner_id: str, *, admin: bool = False) -> dict[str, Any]:
+def evaluate_drift(model_id: str, owner_id: str, *, admin=False):
     model = get_model(model_id, owner_id, admin=admin)
     if not model:
         raise LookupError("Model not found.")
-    context = {"model_id": model.id, "module": model.module, "dataset_hash": model.dataset_hash}
     if not _drift_hooks:
         return {"status": "unavailable", "message": "No drift evaluator is configured."}
-    return _drift_hooks[0](context)
+    return _drift_hooks[0]({"model_id": model.id, "module": model.module, "dataset_hash": model.dataset_hash})
 
 
-def monitoring_summary(owner_id: str, *, admin: bool = False) -> dict[str, Any]:
+def monitoring_summary(owner_id: str, *, admin=False):
     from app.core.ai_background_jobs import queue_metrics
-    session = RegistrySessionLocal()
-    try:
-        queue = queue_metrics()
-        if not admin:
-            queue.pop("workers", None)
-            queue.pop("active_jobs_by_worker", None)
-        predictions = session.query(PredictionObservation)
-        models = session.query(RegisteredModel)
-        if not admin:
-            predictions = predictions.filter(PredictionObservation.owner_id == owner_id)
-            models = models.filter(RegisteredModel.owner_id == owner_id)
-        prediction_rows = predictions.all()
-        usage: dict[str, int] = {}
-        for row in prediction_rows:
-            if row.model_id:
-                usage[row.model_id] = usage.get(row.model_id, 0) + 1
-        return {
-            "queue": queue,
-            "models": {
-                "total": models.count(),
-                "by_stage": {
-                    stage: models.filter(RegisteredModel.lifecycle_stage == stage).count()
-                    for stage in MODEL_STAGES
-                },
-            },
-            "predictions": {
-                "count": len(prediction_rows),
-                "errors": sum(1 for row in prediction_rows if not row.success),
-                "average_latency_ms": (
-                    sum(row.latency_ms for row in prediction_rows) / len(prediction_rows)
-                    if prediction_rows else 0.0
-                ),
-                "model_usage": usage,
-            },
-        }
-    finally:
-        session.close()
+    queue = queue_metrics()
+    if not admin:
+        queue.pop("workers", None)
+        queue.pop("active_jobs_by_worker", None)
+    db = get_sync_database()
+    scope = _scope(owner_id, admin)
+    rows = list(db.ai_prediction_observations.find(scope))
+    usage = {}
+    for row in rows:
+        if row.get("model_id"):
+            usage[row["model_id"]] = usage.get(row["model_id"], 0) + 1
+    return {"queue": queue,
+            "models": {"total": db.ai_model_registry.count_documents(scope),
+                       "by_stage": {stage: db.ai_model_registry.count_documents({**scope, "lifecycle_stage": stage}) for stage in MODEL_STAGES}},
+            "predictions": {"count": len(rows), "errors": sum(not row["success"] for row in rows),
+                            "average_latency_ms": sum(row["latency_ms"] for row in rows) / len(rows) if rows else 0.0,
+                            "model_usage": usage}}
 
 
-def run_retention_cleanup() -> dict[str, int]:
-    result = {
-        "prediction_metadata": 0, "archived_artifacts": 0,
-        "failed_jobs": 0, "staged_inputs": 0,
-    }
+def run_retention_cleanup():
+    result = {"prediction_metadata": 0, "archived_artifacts": 0, "failed_jobs": 0, "staged_inputs": 0}
     if not settings.ai_retention_enabled:
         return result
+    db = get_sync_database()
     now = datetime.utcnow()
-    session = RegistrySessionLocal()
-    try:
-        prediction_cutoff = now - timedelta(days=settings.ai_prediction_metadata_retention_days)
-        result["prediction_metadata"] = session.query(PredictionObservation).filter(
-            PredictionObservation.created_at < prediction_cutoff,
-        ).delete(synchronize_session=False)
-        artifact_cutoff = now - timedelta(days=settings.ai_archived_artifact_retention_days)
-        archived = session.query(RegisteredModel).filter(
-            RegisteredModel.lifecycle_stage == "archived",
-            RegisteredModel.artifact_available.is_(True),
-            RegisteredModel.archived_at < artifact_cutoff,
-        ).all()
-        for model in archived:
-            get_artifact_storage().delete_artifact(model.module, model.winning_job_id)
-            model.artifact_available = False
-            _event(session, model.id, "retention-worker", "archived_artifact_removed", {})
-            result["archived_artifacts"] += 1
-        session.commit()
-        from app.core.ai_background_jobs import cleanup_failed_queue_jobs, cleanup_staged_queue_inputs
-        result["staged_inputs"] = cleanup_staged_queue_inputs()
-        result["failed_jobs"] = cleanup_failed_queue_jobs()
-        return result
-    except Exception:
-        session.rollback()
-        raise
-    finally:
-        session.close()
+    result["prediction_metadata"] = db.ai_prediction_observations.delete_many(
+        {"created_at": {"$lt": now - timedelta(days=settings.ai_prediction_metadata_retention_days)}}).deleted_count
+    for document in db.ai_model_registry.find({"lifecycle_stage": "archived", "artifact_available": True,
+                                               "archived_at": {"$lt": now - timedelta(days=settings.ai_archived_artifact_retention_days)}}):
+        model = _row(document)
+        get_artifact_storage().delete_artifact(model.module, model.winning_job_id)
+        db.ai_model_registry.update_one({"_id": model.id, "owner_id": model.owner_id}, {"$set": {"artifact_available": False}})
+        _event(model, "retention-worker", "archived_artifact_removed")
+        result["archived_artifacts"] += 1
+    from app.core.ai_background_jobs import cleanup_failed_queue_jobs, cleanup_staged_queue_inputs
+    result["staged_inputs"] = cleanup_staged_queue_inputs()
+    result["failed_jobs"] = cleanup_failed_queue_jobs()
+    return result
 
 
 def fingerprint(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
-
-
-__all__ = [
-    "MODEL_STAGES", "RegisteredModel", "change_stage", "emit_metric", "evaluate_drift",
-    "fingerprint", "get_model", "list_audit_events", "list_models",
-    "list_prediction_observations", "list_versions", "monitoring_summary",
-    "record_prediction", "record_prediction_feedback", "record_retraining", "register_completed_model",
-    "register_drift_hook", "register_metrics_hook", "run_retention_cleanup",
-]
