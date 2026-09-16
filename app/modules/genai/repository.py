@@ -271,9 +271,18 @@ class GenAIRepository:
         )
 
     async def record_request(self, request_id: str, owner_id: str | None, values: dict[str, Any]) -> None:
-        await self.generations.update_one(
+        from app.core.database.mongodb import get_audit_database
+        # Request telemetry includes anonymous failures; it is not user-owned Studio data.
+        safe_values = {key: values[key] for key in (
+            "retrieved_chunk_count", "context_chars", "model_latency_ms",
+            "tool_latency_ms", "total_latency_ms",
+        ) if isinstance(values.get(key), (int, float))}
+        safe_values["status"] = values.get("status") if values.get("status") in {
+            "running", "completed", "failed", "cancelled", "confirmation_required",
+        } else "unknown"
+        await get_audit_database().module_usage.update_one(
             {"_id": request_id},
-            {"$set": {**values, "owner_id": owner_id, "updated_at": _now()},
+            {"$set": {**safe_values, "module": "genai", "owner_id": owner_id, "updated_at": _now()},
              "$setOnInsert": {"created_at": _now()}}, upsert=True,
         )
 

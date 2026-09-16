@@ -3,6 +3,7 @@ from fastapi import Depends
 from app.core.exceptions.custom import AIStudioException
 from app.modules.auth.dependencies import get_current_user
 from app.modules.auth.models import UserModel
+from app.core.audit import actor
 
 
 async def require_super_admin(
@@ -16,6 +17,7 @@ async def require_super_admin(
             error_code="INSUFFICIENT_PERMISSIONS",
         )
 
+    actor.set((current_user.id, current_user.role))
     return current_user
 
 
@@ -33,4 +35,5 @@ async def require_admin(
             error_code="INSUFFICIENT_PERMISSIONS",
         )
 
+    actor.set((current_user.id, current_user.role))
     return current_user

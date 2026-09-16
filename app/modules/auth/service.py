@@ -1,4 +1,6 @@
 from motor.motor_asyncio import AsyncIOMotorDatabase
+from pymongo.errors import DuplicateKeyError
+from app.core.audit import actor
 
 from app.core.exceptions.custom import AIStudioException
 from app.core.security.jwt import create_access_token
@@ -77,10 +79,13 @@ class AuthService:
             role=role,
         )
 
-        created_user = await self.repository.create_user(
-            user
-        )
+        try:
+            created_user = await self.repository.create_user(user)
+        except DuplicateKeyError as exc:
+            raise AIStudioException(message="Email already registered.", status_code=409,
+                                    error_code="EMAIL_ALREADY_EXISTS") from exc
 
+        actor.set((created_user.id, created_user.role))
         return created_user
 
     # --------------------------------------------------
@@ -123,6 +128,7 @@ class AuthService:
         await self.repository.update_last_login(
             user.id
         )
+        actor.set((user.id, user.role))
 
         access_token = create_access_token(
             {

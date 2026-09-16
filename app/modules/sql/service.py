@@ -17,6 +17,7 @@ Responsibilities
 from __future__ import annotations
 
 import time
+from app.modules.sql.history import record_execution, record_reset
 
 from app.modules.auth.models import UserModel
 
@@ -72,13 +73,11 @@ class SQLService:
 
         start = time.perf_counter()
 
-        result = self.repository.execute(
-
-            current_user=current_user,
-
-            query=query,
-
-        )
+        try:
+            result = self.repository.execute(current_user=current_user, query=query)
+        except Exception:
+            record_execution(current_user.id, query, time.perf_counter() - start, False)
+            raise
 
         execution_time = round(
 
@@ -89,6 +88,7 @@ class SQLService:
         )
 
         result["execution_time"] = execution_time
+        record_execution(current_user.id, query, execution_time, True)
 
         return result
 
@@ -175,6 +175,7 @@ class SQLService:
             current_user=current_user,
 
         )
+        record_reset(current_user.id)
 
     ##########################################################
     # Delete Database

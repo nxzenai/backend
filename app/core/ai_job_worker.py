@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
+import atexit
 import json
 import logging
 import multiprocessing
@@ -34,6 +36,13 @@ from app.modules.autodl.exceptions import AutoDLJobCancelledError
 
 
 logger = logging.getLogger(__name__)
+
+
+def _connect_mongo():
+    from app.core.database.mongodb import MongoDB
+    if MongoDB.client is None:
+        asyncio.run(MongoDB.connect())
+        atexit.register(MongoDB.client.close)
 
 
 def _set_memory_limit() -> None:
@@ -80,6 +89,7 @@ def _module_runtime(module: str):
 
 
 def _execute_claimed_job(queue_id: str, device: str) -> None:
+    _connect_mongo()
     logging.basicConfig(level=getattr(logging, settings.log_level.upper(), logging.INFO))
     _set_memory_limit()
     os.environ["NXZEN_EXECUTION_DEVICE"] = device
@@ -287,6 +297,7 @@ def _terminate_job(queue_job, process, code: str, message: str, cancelled: bool 
 
 
 def run_worker(device_policy: str | None = None) -> None:
+    _connect_mongo()
     device = selected_execution_device(device_policy)
     concurrency = (
         settings.ai_job_gpu_concurrency if device == "cuda"
