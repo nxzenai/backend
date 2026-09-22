@@ -1,6 +1,11 @@
 from motor.motor_asyncio import AsyncIOMotorDatabase
 from pymongo.errors import DuplicateKeyError
-from app.core.audit import actor
+from app.core.audit import actor, log_event
+from app.core.config.settings import settings
+from app.core.logging.logger import logger
+from app.modules.auth.access_control import ensure_account_active
+from services.access_email import send_access_request_admin
+import asyncio
 
 from app.core.exceptions.custom import AIStudioException
 from app.core.security.jwt import create_access_token
@@ -77,6 +82,9 @@ class AuthService:
                 request.password
             ),
             role=role,
+            account_status="active" if role == SUPER_ADMIN else "pending_approval",
+            is_active=role == SUPER_ADMIN,
+            is_verified=role == SUPER_ADMIN,
         )
 
         try:
@@ -86,6 +94,14 @@ class AuthService:
                                     error_code="EMAIL_ALREADY_EXISTS") from exc
 
         actor.set((created_user.id, created_user.role))
+        if role != SUPER_ADMIN:
+            try:
+                await asyncio.to_thread(
+                    send_access_request_admin, str(created_user.email), created_user.full_name,
+                    settings.smtp_admin_recipients,
+                )
+            except Exception:
+                logger.warning("Access request email could not be delivered")
         return created_user
 
     # --------------------------------------------------
@@ -118,17 +134,16 @@ class AuthService:
                 error_code="INVALID_CREDENTIALS",
             )
 
-        if not user.is_active:
-            raise AIStudioException(
-                message="User account is disabled.",
-                status_code=403,
-                error_code="ACCOUNT_DISABLED",
-            )
+        ensure_account_active(user)
 
         await self.repository.update_last_login(
             user.id
         )
         actor.set((user.id, user.role))
+        await log_event(
+            "auth_logs", "login", "auth", owner_id=user.id,
+            organization_id=user.organization_id, batch_id=user.batch_id,
+        )
 
         access_token = create_access_token(
             {

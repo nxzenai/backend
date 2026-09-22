@@ -21,6 +21,7 @@ from app.modules.autonlp.router import router as autonlp_router
 from app.modules.autodl_v2.router import router as autodl_v2_router
 from app.modules.genai.router import router as genai_router
 from app.modules.ai_registry.router import router as ai_registry_router
+from app.modules.users.router import router as user_management_router, usage_router
 
 api_router = APIRouter(
     prefix="/api/v1"
@@ -51,3 +52,5 @@ api_router.include_router(
 )
 api_router.include_router(ai_registry_router)
 api_router.include_router(genai_router)
+api_router.include_router(user_management_router)
+api_router.include_router(usage_router)

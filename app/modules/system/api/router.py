@@ -1,6 +1,6 @@
 from fastapi import Depends
 
-from app.core.dependencies.auth import get_current_user
+from app.modules.auth.dependencies import get_current_user
 from fastapi import APIRouter
 
 from app.core.database.mongodb import MongoDB
