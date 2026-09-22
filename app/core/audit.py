@@ -13,25 +13,30 @@ COLLECTIONS = {"activity_logs", "auth_logs", "admin_audit_logs", "module_usage"}
 
 def log_domain_event(collection, module, action, owner_id, resource_id):
     document = event_document(action, module, owner_id=owner_id)
-    document["resource_id"] = resource_id
+    document["resource_id"] = str(resource_id)
     try:
         collection.insert_one(document)
     except Exception:
-        logger.warning("Domain audit event could not be persisted")
+        logger.exception("Domain audit event could not be persisted")
 
 
-def event_document(action, module, *, owner_id=None, status_code=None):
-    return {"_id": str(uuid4()), "action": action, "module": module,
-            "owner_id": owner_id, "status_code": status_code,
-            "created_at": datetime.now(UTC)}
+def event_document(action, module, *, owner_id=None, status_code=None,
+                   organization_id=None, batch_id=None, metadata=None):
+    now = datetime.now(UTC)
+    return {"_id": str(uuid4()), "action": action, "event": action, "module": module,
+            "owner_id": owner_id, "user_id": owner_id, "organization_id": organization_id,
+            "batch_id": batch_id, "status_code": status_code, "metadata": metadata or {},
+            "created_at": now, "timestamp": now}
 
 
-async def log_event(collection, action, module, *, owner_id=None, status_code=None):
+async def log_event(collection, action, module, *, owner_id=None, status_code=None,
+                    organization_id=None, batch_id=None, metadata=None):
     if collection not in COLLECTIONS:
         raise ValueError("Unsupported audit collection")
     try:
         await get_audit_database()[collection].insert_one(
-            event_document(action, module, owner_id=owner_id, status_code=status_code))
+            event_document(action, module, owner_id=owner_id, status_code=status_code,
+                           organization_id=organization_id, batch_id=batch_id, metadata=metadata))
     except Exception:
         # Do not expose DB errors (which can contain URIs) or break completed work.
         logger.warning("Audit event could not be persisted")

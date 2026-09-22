@@ -36,6 +36,9 @@ class UserModel(BaseModel):
     role: Literal[
         "super_admin",
         "admin",
+        "trainer",
+        "trainee",
+        "guest",
         "user",
     ] = "user"
 
@@ -44,6 +47,12 @@ class UserModel(BaseModel):
     # --------------------------------------------------
 
     organization_id: str | None = None
+    course_id: str | None = None
+    batch_id: str | None = None
+
+    allowed_modules: list[str] = Field(default_factory=list)
+    denied_modules: list[str] = Field(default_factory=list)
+    effective_modules: list[str] = Field(default_factory=list)
 
     # --------------------------------------------------
     # Account Status
@@ -52,6 +61,13 @@ class UserModel(BaseModel):
     is_active: bool = True
 
     is_verified: bool = False
+
+    account_status: Literal[
+        "pending_approval", "active", "rejected", "suspended", "expired", "deleted"
+    ] = "active"
+    access_start_at: datetime | None = None
+    access_end_at: datetime | None = None
+    deleted_at: datetime | None = None
 
     # --------------------------------------------------
     # Audit Fields

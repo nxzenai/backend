@@ -1,4 +1,4 @@
-from fastapi import Depends
+from fastapi import Depends, Request
 from fastapi.security import (
     HTTPAuthorizationCredentials,
     HTTPBearer,
@@ -12,6 +12,7 @@ from app.modules.auth.models import UserModel
 from app.modules.auth.repository import AuthRepository
 from app.modules.auth.service import AuthService
 from app.core.audit import actor
+from app.modules.auth.access_control import authorize_user
 
 # --------------------------------------------------
 # HTTP Bearer Security
@@ -37,6 +38,7 @@ def get_auth_service(
 
 
 async def get_current_user(
+    request: Request,
     credentials: HTTPAuthorizationCredentials | None = Depends(security),
     db: AsyncIOMotorDatabase = Depends(get_database),
 ) -> UserModel:
@@ -82,12 +84,5 @@ async def get_current_user(
             error_code="USER_NOT_FOUND",
         )
 
-    if not user.is_active:
-        raise AIStudioException(
-            message="User account is disabled.",
-            status_code=403,
-            error_code="ACCOUNT_DISABLED",
-        )
-
     actor.set((user.id, user.role))
-    return user
+    return await authorize_user(user, db, request.url.path)
