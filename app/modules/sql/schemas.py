@@ -14,8 +14,12 @@ class SQLExecuteRequest(BaseModel):
 class SQLExecuteResponse(SQLResult):
 
     execution_time: float
+    message: str | None = None
+    database_changed: bool = False
 
 
 class SchemaResponse(BaseModel):
 
     tables: list[TableSchema]
+    active_database: str
+    databases: list[str]

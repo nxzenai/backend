@@ -35,6 +35,8 @@ class SQLValidator:
 
         "ALTER",
 
+        "DROP",
+
         "WITH",
 
     }
@@ -94,6 +96,9 @@ class SQLValidator:
             )
 
         upper = cleaned.upper()
+
+        if re.match(r"^DROP\b", upper) and not re.match(r"^DROP\s+TABLE\b", upper):
+            raise SQLValidationError("Only DROP TABLE or DROP DATABASE is allowed.")
 
         first = upper.split()[0]
 
