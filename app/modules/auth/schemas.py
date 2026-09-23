@@ -55,3 +55,5 @@ class TokenResponse(BaseModel):
     access_token: str
 
     token_type: str = "bearer"
+
+    is_first_login: bool = False

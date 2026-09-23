@@ -136,9 +136,6 @@ class AuthService:
 
         ensure_account_active(user)
 
-        await self.repository.update_last_login(
-            user.id
-        )
         actor.set((user.id, user.role))
         await log_event(
             "auth_logs", "login", "auth", owner_id=user.id,
@@ -153,7 +150,10 @@ class AuthService:
             }
         )
 
+        is_first_login = await self.repository.update_last_login(user.id)
+
         return TokenResponse(
             access_token=access_token,
             token_type="bearer",
+            is_first_login=is_first_login,
         )
