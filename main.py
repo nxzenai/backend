@@ -5,6 +5,7 @@ from app.api.v1 import api_router
 from app.core.config.settings import settings
 from app.core.exceptions.handlers import register_exception_handlers
 from app.lifespan import lifespan
+from app.core.audit import AuditMiddleware
 from routers.leads import router as lead_router
 
 app = FastAPI(
@@ -29,6 +30,7 @@ app.add_middleware(
 )
 
 # Global exception handlers for the AI Studio modules (auth, crm, datasets, etc.)
+app.add_middleware(AuditMiddleware)
 register_exception_handlers(app)
 
 # ---------------------------------------------------------

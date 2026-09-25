@@ -77,19 +77,21 @@ class AuthRepository:
     async def update_last_login(
         self,
         user_id: str,
-    ) -> None:
+    ) -> bool:
         """
-        Update the user's last login timestamp.
+        Record a successful login and atomically identify the first login.
         """
 
-        await self.collection.update_one(
+        previous = await self.collection.find_one_and_update(
             {"_id": ObjectId(user_id)},
             {
                 "$currentDate": {
                     "last_login": True
                 }
             },
+            projection={"last_login": 1},
         )
+        return previous is not None and previous.get("last_login") is None
 
     async def update_user(
         self,

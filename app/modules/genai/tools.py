@@ -5,7 +5,7 @@ import ipaddress
 import re
 import socket
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from html.parser import HTMLParser
 from typing import Any, Awaitable, Callable
@@ -15,6 +15,8 @@ import httpx
 from fastapi import HTTPException
 
 from app.core.config.settings import settings
+from app.modules.genai.freshness import explicit_freshness_requirement, freshness_requirement
+from app.modules.genai.metrics import current_request, observe_tool
 from app.modules.autonlp.exceptions import AutoNLPException
 
 
@@ -26,6 +28,7 @@ class ToolExecutionContext:
     attachment_ids: list[str] = field(default_factory=list)
     current_user: Any = None
     adapters: Any = None
+    request_id: str | None = field(default_factory=lambda: current_request.get().request_id if current_request.get() else None)
 
 
 @dataclass
@@ -97,6 +100,7 @@ class GenAIToolRegistry:
     def get(self, name: str) -> ToolDefinition | None:
         return self._tools.get(name)
 
+    @observe_tool()
     async def execute(self, name: str, context: ToolExecutionContext, arguments: dict[str, Any] | None = None) -> ToolResult:
         definition = self.get(name)
         if not definition:
@@ -129,9 +133,8 @@ class GenAIToolRegistry:
 
 
 class ToolRouter:
-    _latest = re.compile(r"\b(latest|current|today|news|recent|live|right now|search the web)\b", re.I)
     _weather = re.compile(r"\b(weather|forecast|temperature|rain|snow|humidity)\b", re.I)
-    _files = re.compile(r"\b(attached|attachment|uploaded|selected file|this file|these files)\b", re.I)
+    _files = re.compile(r"\b(attached|attachment|uploaded|(?:selected|this|these) (?:files?|documents?|papers?))\b", re.I)
     _python = re.compile(r"\b(python lab|inspect (?:my )?notebook|notebook cells?|run (?:this )?(?:python|cell)|execute (?:this )?(?:python|cell))\b", re.I)
     _sql = re.compile(r"\b(sql lab|database schema|run (?:this )?(?:sql|query)|execute (?:this )?(?:sql|query)|query (?:my|the) database)\b", re.I)
     _module = re.compile(r"\b(automl|autodl|autonlp|eda|python lab|sql lab|nxzenai workflow)\b", re.I)
@@ -205,6 +208,12 @@ class ToolRouter:
             # native intake path even when the client omitted the current
             # attachment id. The service resolves conversation attachments.
             return ["native_training"]
+        if attachment_ids and self._files.search(query):
+            return list(dict.fromkeys(["files", *requested]))
+        if self._weather.search(query):
+            return list(dict.fromkeys(["weather", *requested]))
+        if freshness_requirement(query)[0]:
+            return list(dict.fromkeys(["web", *requested]))
         if requested:
             return list(dict.fromkeys(requested))
         attachment_intent = re.search(r"\b(summari[sz]e|review|analy[sz]e|explain|what.+(?:say|contain))\b", query, re.I)
@@ -212,7 +221,7 @@ class ToolRouter:
             return ["files"]
         if self._weather.search(query):
             return ["weather"]
-        if self._latest.search(query) or re.search(r"https?://", query):
+        if re.search(r"https?://", query):
             return ["web"]
         # Generic structured prediction requests use persisted AutoML models;
         # explicit text/image/lab and live-data intents have already routed above.
@@ -247,7 +256,11 @@ class _TextHTMLParser(HTMLParser):
 
 
 def _web_available() -> tuple[bool, str | None]:
-    return True, None if str(settings.genai_web_search_url or "").strip() else "Public URL retrieval is available; configure GENAI_WEB_SEARCH_URL for search."
+    url_ready = bool(str(settings.genai_web_search_url or "").strip())
+    key_ready = bool(str(settings.genai_web_search_api_key or "").strip())
+    provider = settings.genai_web_search_provider.strip().casefold()
+    search_ready = url_ready and (provider not in {"tavily", "google"} or key_ready)
+    return True, None if search_ready else "Public URL retrieval is available; configure the web search URL and API key for search."
 
 
 def _weather_available() -> tuple[bool, str | None]:
@@ -296,14 +309,7 @@ async def _fetch_public_text(url: str) -> tuple[str, str, str]:
     raise ValueError("The URL redirected too many times.")
 
 
-def _freshness(query: str) -> tuple[str | None, datetime | None]:
-    if re.search(r"\b(today|latest|current|now|right now)\b", query, re.I):
-        return "day", datetime.now(UTC) - timedelta(days=1)
-    if re.search(r"\b(this week|recent)\b", query, re.I):
-        return "week", datetime.now(UTC) - timedelta(days=7)
-    if re.search(r"\b(this month)\b", query, re.I):
-        return "month", datetime.now(UTC) - timedelta(days=31)
-    return None, None
+_freshness = freshness_requirement
 
 
 def _result_date(item: dict[str, Any]) -> tuple[str | None, datetime | None]:
@@ -317,7 +323,7 @@ def _result_date(item: dict[str, Any]) -> tuple[str | None, datetime | None]:
         try:
             parsed = parsedate_to_datetime(value)
         except (TypeError, ValueError):
-            return value[:80], None
+            return None, None
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=UTC)
     return value[:80], parsed.astimezone(UTC)
@@ -325,7 +331,7 @@ def _result_date(item: dict[str, Any]) -> tuple[str | None, datetime | None]:
 
 async def _web_handler(context: ToolExecutionContext, arguments: dict[str, Any]) -> ToolResult:
     url_match = re.search(r"https?://[^\s<>]+", context.query)
-    if url_match:
+    if url_match and not freshness_requirement(context.query)[0]:
         url = url_match.group(0).rstrip(".,)")
         try:
             response_text, content_type, final_url = await _fetch_public_text(url)
@@ -341,15 +347,18 @@ async def _web_handler(context: ToolExecutionContext, arguments: dict[str, Any])
     provider = settings.genai_web_search_provider.strip().casefold()
     search_url = str(settings.genai_web_search_url).strip()
     api_key = (settings.genai_web_search_api_key or "").strip()
+    if provider in {"tavily", "google"} and not api_key:
+        return ToolResult("web", False, error_code="WEB_SEARCH_UNCONFIGURED", error_message="Live web search requires an API key.")
     headers = {"Content-Type": "application/json"}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
-    search_query = str(arguments.get("query") or context.query)
-    time_range, freshness_cutoff = _freshness(search_query)
+    required_range, _ = freshness_requirement(context.query)
+    search_query = context.query if required_range else str(arguments.get("query") or context.query)
+    time_range, freshness_cutoff = explicit_freshness_requirement(search_query)
     payload: dict[str, Any] = {"query": search_query, "max_results": settings.genai_web_max_results}
     if time_range:
         payload["time_range"] = time_range
-        if re.search(r"\b(news|developments?|announcements?|updates?)\b", search_query, re.I):
+        if re.search(r"\b(news|developments?|announcements?|updates?|what happened)\b", search_query, re.I):
             payload["topic"] = "news"
     try:
         async with httpx.AsyncClient(timeout=settings.genai_tool_timeout_seconds) as client:
@@ -379,8 +388,7 @@ async def _web_handler(context: ToolExecutionContext, arguments: dict[str, Any])
         return ToolResult("web", False, error_code="WEB_PROVIDER_UNAVAILABLE", error_message="The web search provider could not be reached.")
     body = response.json()
     raw_results = body.get("results") or body.get("items") or body.get("data") or []
-    citations: list[dict[str, str]] = []
-    excerpts: list[str] = []
+    ranked_results: list[tuple[datetime | None, dict[str, str], str]] = []
     for item in raw_results[:settings.genai_web_max_results]:
         if not isinstance(item, dict):
             continue
@@ -388,22 +396,25 @@ async def _web_handler(context: ToolExecutionContext, arguments: dict[str, Any])
         title = str(item.get("title") or url)
         excerpt = str(item.get("content") or item.get("snippet") or item.get("description") or "")
         date_label, published_at = _result_date(item)
-        if freshness_cutoff and (not published_at or published_at < freshness_cutoff):
+        if freshness_cutoff and published_at and published_at < freshness_cutoff:
             continue
         if url:
             citation = {"title": title[:200], "url": url}
             if date_label:
                 citation["date"] = date_label
-            citations.append(citation)
-            excerpts.append(f"{title}{f' ({date_label})' if date_label else ''}: {excerpt[:1200]}")
-    if not excerpts:
+            ranked_results.append((published_at, citation, f"{title}{f' ({date_label})' if date_label else ''}: {excerpt[:1200]}"))
+    if required_range:
+        ranked_results.sort(key=lambda item: item[0] or datetime.min.replace(tzinfo=UTC), reverse=True)
+    if not ranked_results:
         message = "No sufficiently fresh web results were returned." if time_range else "No reliable web results were returned."
         return ToolResult("web", False, error_code="WEB_NO_RESULTS", error_message=message)
     freshness_note = (
-        f"Only sources with provider publication dates inside the requested {time_range} window are included.\n"
+        f"Dated sources older than the requested {time_range} window were excluded. "
+        "Undated sources have unverified publication times.\n"
         if time_range else ""
     )
-    return ToolResult("web", True, freshness_note + "\n".join(excerpts), citations=citations, data={"freshness": time_range})
+    return ToolResult("web", True, freshness_note + "\n".join(item[2] for item in ranked_results),
+                      citations=[item[1] for item in ranked_results], data={"freshness": time_range})
 
 
 def _location_from_query(query: str) -> str:
@@ -473,6 +484,9 @@ async def _files_handler(context: ToolExecutionContext, arguments: dict[str, Any
     chunks = await context.repository.search_attachment_chunks(
         context.owner_id, context.attachment_ids, arguments.get("query") or context.query, limit=8,
     )
+    trace = current_request.get()
+    if trace:
+        trace.retrieved_chunk_count += len(chunks)
     if not chunks:
         return ToolResult("files", False, error_code="FILE_EVIDENCE_INSUFFICIENT", error_message="The selected files do not contain enough relevant evidence to answer this request.")
     citations: list[dict[str, str]] = []

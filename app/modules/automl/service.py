@@ -1103,8 +1103,9 @@ class AutoMLService:
         return artifact
 
     def list_models_for_owner(self, owner_id: str) -> list[str]:
+        from app.modules.automl.mongo_metadata import list_models
         owned: list[str] = []
-        for filename in self.list_models():
+        for filename in list_models(owner_id):
             try:
                 self.load_owned_artifact(filename, owner_id)
                 owned.append(filename)

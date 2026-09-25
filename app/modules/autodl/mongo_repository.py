@@ -7,6 +7,7 @@ from typing import Any
 
 from pymongo import ASCENDING, DESCENDING
 from pymongo.database import Database
+from app.core.config.settings import settings
 
 from app.modules.autodl.constants import DLArchitecture, JobStatus, Modality
 from app.modules.autodl.exceptions import AutoDLJobCancelledError, AutoDLJobNotFoundError
@@ -15,7 +16,7 @@ from app.modules.autodl.exceptions import AutoDLJobCancelledError, AutoDLJobNotF
 JOBS_COLLECTION = "autodl_jobs"
 MODELS_COLLECTION = "autodl_models"
 PREDICTIONS_COLLECTION = "autodl_predictions"
-AUDIT_COLLECTION = "autodl_audit_events"
+AUDIT_COLLECTION = "activity_logs"
 
 
 def _enum_value(value: Any) -> Any:
@@ -65,7 +66,7 @@ class MongoAutoDLRepository:
         self.jobs = database[JOBS_COLLECTION]
         self.models = database[MODELS_COLLECTION]
         self.predictions = database[PREDICTIONS_COLLECTION]
-        self.audit = database[AUDIT_COLLECTION]
+        self.audit = database.client[settings.audit_database_name][AUDIT_COLLECTION]
         self._ensure_indexes()
 
     def _ensure_indexes(self) -> None:
@@ -241,9 +242,13 @@ class MongoAutoDLRepository:
         })
 
     def _audit(self, model_id: str, actor_id: str, event_type: str, details: dict | None = None) -> None:
+        model = self.models.find_one({"_id": model_id})
+        if model is None:
+            return
         self.audit.insert_one({
             "_id": str(uuid.uuid4()), "model_id": model_id, "actor_id": actor_id,
-            "event_type": event_type, "details": details or {}, "created_at": datetime.utcnow(),
+            "owner_id": model["owner_id"], "module": "autodl_legacy",
+            "event_type": event_type, "details": {}, "created_at": datetime.utcnow(),
         })
 
     @staticmethod
@@ -299,7 +304,7 @@ class MongoAutoDLRepository:
 
     def list_audit_events(self, model_id: str, owner_id: str, admin: bool = False) -> list[dict]:
         self.get_model(model_id, owner_id, admin=admin)
-        return [self._model(item) for item in self.audit.find({"model_id": model_id}).sort("created_at", DESCENDING)]
+        return [self._model(item) for item in self.audit.find({"model_id": model_id, "module": "autodl_legacy"}).sort("created_at", DESCENDING)]
 
     def record_retraining_event(self, model_id: str, actor_id: str, job_id: str, owner_id: str) -> None:
         self._audit(model_id, actor_id, "retraining_initiated", {"job_id": job_id})

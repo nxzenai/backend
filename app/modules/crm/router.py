@@ -11,6 +11,7 @@ from app.core.database.mongodb import (
 )
 
 from app.modules.crm.service import CRMService
+from app.modules.auth.permissions import require_admin
 
 from app.modules.crm.schemas import (
     LeadListQuery,
@@ -21,6 +22,7 @@ from app.modules.crm.schemas import (
 router = APIRouter(
     prefix="/crm",
     tags=["CRM"],
+    dependencies=[Depends(require_admin)],
 )
 
 

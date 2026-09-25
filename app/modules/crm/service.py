@@ -18,6 +18,9 @@ from app.modules.crm.schemas import (
 
 class CRMService:
 
+    async def promote_intake_lead(self, lead_id: str, actor: str):
+        return await self.repository.promote_intake_lead(lead_id, actor)
+
     def __init__(
         self,
         db: AsyncIOMotorDatabase,

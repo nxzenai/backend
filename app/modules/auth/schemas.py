@@ -35,9 +35,25 @@ class UserResponse(BaseModel):
 
     is_verified: bool
 
+    account_status: str = "active"
+
+    organization_id: str | None = None
+
+    course_id: str | None = None
+
+    batch_id: str | None = None
+
+    access_start_at: str | None = None
+
+    access_end_at: str | None = None
+
+    effective_modules: list[str] = Field(default_factory=list)
+
 
 class TokenResponse(BaseModel):
 
     access_token: str
 
     token_type: str = "bearer"
+
+    is_first_login: bool = False

@@ -14,6 +14,7 @@ from app.modules.auth.dependencies import (
     get_auth_service,
     get_current_user,
 )
+from app.core.audit import log_event
 
 router = APIRouter(
     prefix="/auth",
@@ -35,7 +36,8 @@ async def register_user(
 
     return APIResponse(
         success=True,
-        message="User registered successfully.",
+        message=("User registered successfully." if user.role == "super_admin" else
+                 "Registration received. Your account is pending administrator approval."),
         data=UserResponse(
             id=user.id,
             email=user.email,
@@ -44,6 +46,7 @@ async def register_user(
             role=user.role,
             is_active=user.is_active,
             is_verified=user.is_verified,
+            account_status=user.account_status,
         ).model_dump(),
     )
 @router.post(
@@ -83,5 +86,21 @@ async def me(
             role=current_user.role,
             is_active=current_user.is_active,
             is_verified=current_user.is_verified,
+            account_status=current_user.account_status,
+            organization_id=current_user.organization_id,
+            course_id=current_user.course_id,
+            batch_id=current_user.batch_id,
+            access_start_at=current_user.access_start_at.isoformat() if current_user.access_start_at else None,
+            access_end_at=current_user.access_end_at.isoformat() if current_user.access_end_at else None,
+            effective_modules=current_user.effective_modules,
         ),
     )
+
+
+@router.post("/logout", response_model=APIResponse)
+async def logout(current_user: UserModel = Depends(get_current_user)):
+    await log_event(
+        "auth_logs", "logout", "auth", owner_id=current_user.id,
+        organization_id=current_user.organization_id, batch_id=current_user.batch_id,
+    )
+    return APIResponse(success=True, message="Logged out.", data=None)

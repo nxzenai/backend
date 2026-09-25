@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, Response, UploadFile, status
 from fastapi.responses import StreamingResponse
+from fastapi.routing import APIRoute
+import asyncio
 
 from app.modules.auth.dependencies import get_current_user
 from app.modules.auth.models import UserModel
@@ -16,13 +18,96 @@ from app.modules.genai.schemas import (
 )
 from app.modules.genai.service import GenAIService
 from app.modules.genai.serialization import json_safe, json_safe_dumps
+from app.modules.genai.metrics import GenAIRequestMetrics, current_request, safe_code
+from app.modules.genai.repository import GenAIRepository
+from app.core.database import get_database
 
 
-router = APIRouter(prefix="/genai", tags=["GenAI"])
+class GenAIRequestRoute(APIRoute):
+    def get_route_handler(self):
+        handler = super().get_route_handler()
+
+        async def observed(request):
+            try:
+                return await handler(request)
+            except Exception as exc:
+                trace = current_request.get()
+                if trace:
+                    detail = getattr(exc, "detail", None)
+                    code = detail.get("code") if isinstance(detail, dict) else None
+                    trace.status = "failed"
+                    trace.error_code = safe_code(code or getattr(exc, "error_code", None) or type(exc).__name__)
+                raise
+        return observed
+
+    async def handle(self, scope, receive, send):
+        trace = GenAIRequestMetrics(intent=self.name)
+        trace.conversation_id = (scope.get("path_params") or {}).get("conversation_id")
+        scope.setdefault("state", {})["request_id"] = trace.request_id
+        token = current_request.set(trace)
+        response_started = False
+
+        async def persist():
+            if (scope.get("method") not in {"POST", "PUT", "PATCH", "DELETE"}
+                    and trace.status not in {"failed", "cancelled"}):
+                return
+            try:
+                await GenAIRepository(get_database()).record_request(trace.request_id, trace.owner_id, trace.snapshot())
+            except Exception:
+                # Observability must not change request success/failure semantics.
+                pass
+
+        async def observed_send(message):
+            nonlocal response_started
+            if message["type"] == "http.response.start":
+                response_started = True
+                headers = [(key, value) for key, value in message.get("headers", []) if key.lower() != b"x-request-id"]
+                message = {**message, "headers": [*headers, (b"x-request-id", trace.request_id.encode())]}
+                if message["status"] >= 400:
+                    trace.status = "failed"
+                    trace.error_code = trace.error_code or f"HTTP_{message['status']}"
+            await send(message)
+
+        try:
+            await persist()
+            await super().handle(scope, receive, observed_send)
+            if trace.status == "running":
+                trace.status = "completed"
+        except asyncio.CancelledError:
+            trace.status, trace.error_code = "cancelled", "REQUEST_CANCELLED"
+            raise
+        except Exception as exc:
+            trace.status = "failed"
+            trace.error_code = trace.error_code or safe_code(type(exc).__name__)
+            # Use the application's existing error response, adding only the ID.
+            # Re-raise so the outer server-error boundary retains its semantics.
+            app = scope.get("app")
+            handler = getattr(app, "exception_handlers", {}).get(Exception)
+            if not response_started and handler and not getattr(app, "debug", False):
+                response = await handler(Request(scope), exc)
+                await response(scope, receive, observed_send)
+            raise
+        finally:
+            try:
+                await persist()
+            finally:
+                current_request.reset(token)
+
+
+router = APIRouter(prefix="/genai", tags=["GenAI"], route_class=GenAIRequestRoute)
 
 
 def _owner(user: UserModel) -> str:
-    return user.id or str(user.email)
+    owner = user.id or str(user.email)
+    trace = current_request.get()
+    if trace:
+        trace.owner_id = owner
+    return owner
+
+
+def _sse(event: dict) -> str:
+    trace = current_request.get()
+    return f"data: {json_safe_dumps(trace.event(event) if trace else event)}\n\n"
 
 
 def _http_error(exc: Exception) -> HTTPException:
@@ -133,6 +218,7 @@ async def chat(
     if not metadata or not completed or not completed.get("message"):
         raise HTTPException(status_code=503, detail={"code": "GENAI_EMPTY_RESPONSE", "message": "The inference service returned no response."})
     return ChatResponse(
+        request_id=metadata.get("request_id"),
         conversation_id=metadata["conversation_id"], generation_id=metadata["generation_id"],
         message=json_safe(completed["message"]), requested_tier=metadata["requested_tier"],
         model_tier=metadata["model_tier"], model_name=metadata["model_name"],
@@ -154,16 +240,19 @@ async def stream_chat(
                 if event.get("generation_id"):
                     generation_id = event["generation_id"]
                 if await request.is_disconnected():
+                    trace = current_request.get()
+                    if trace:
+                        trace.status, trace.error_code = "cancelled", "CLIENT_DISCONNECTED"
                     if generation_id:
                         await service.cancel(generation_id, owner_id)
                     break
-                yield f"data: {json_safe_dumps(event)}\n\n"
+                yield _sse(event)
         except LlamaModelNotAvailableError as exc:
-            yield f"data: {json_safe_dumps({'type': 'error', 'code': 'GENAI_TIER_UNAVAILABLE', 'message': str(exc)})}\n\n"
+            yield _sse({'type': 'error', 'code': 'GENAI_TIER_UNAVAILABLE', 'message': str(exc)})
         except GenAIException as exc:
-            yield f"data: {json_safe_dumps({'type': 'error', 'code': 'GENAI_REQUEST_INVALID', 'message': str(exc)})}\n\n"
+            yield _sse({'type': 'error', 'code': 'GENAI_REQUEST_INVALID', 'message': str(exc)})
         except Exception:
-            yield f"data: {json_safe_dumps({'type': 'error', 'code': 'GENAI_STREAM_FAILED', 'message': 'The response stream could not be started.'})}\n\n"
+            yield _sse({'type': 'error', 'code': 'GENAI_STREAM_FAILED', 'message': 'The response stream could not be started.'})
 
     return StreamingResponse(events(), media_type="text/event-stream", headers={
         "Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no",
@@ -294,11 +383,11 @@ async def delete_attachment(
 
 @router.get("/tools", response_model=list[ToolStatus])
 async def tool_statuses(service: GenAIService = Depends(get_genai_service), current_user: UserModel = Depends(get_current_user)):
-    del current_user
+    _owner(current_user)
     return service.tool_statuses()
 
 
 @router.get("/health", response_model=HealthResponse)
 async def health(service: GenAIService = Depends(get_genai_service), current_user: UserModel = Depends(get_current_user)):
-    del current_user
+    _owner(current_user)
     return await service.health()

@@ -15,12 +15,11 @@ Responsibilities
 from __future__ import annotations
 
 import sqlite3
-from pathlib import Path
 
 from app.modules.auth.models import UserModel
+from app.modules.sql.lifecycle import owned_database, owned_path, execute_database_command, fail, registry
 
 from app.modules.sql.database import (
-    database_path,
     get_connection,
 )
 
@@ -39,6 +38,13 @@ class SQLRepository:
         self,
         current_user: UserModel,
     ) -> sqlite3.Connection:
+
+        owned = owned_database(current_user)
+        if owned:
+            connection = sqlite3.connect(owned_path(owned).resolve().as_uri() + "?mode=rw", uri=True,
+                                         check_same_thread=False)
+            connection.row_factory = sqlite3.Row
+            return connection
 
         connection = get_connection(
             str(current_user.id),
@@ -350,6 +356,11 @@ class SQLRepository:
 
         try:
 
+            # Enforce file isolation even when SQL uses comments or alternate spacing.
+            connection.set_authorizer(lambda action, *args: sqlite3.SQLITE_DENY
+                                      if action in {sqlite3.SQLITE_ATTACH, sqlite3.SQLITE_DETACH,
+                                                    sqlite3.SQLITE_PRAGMA}
+                                      else sqlite3.SQLITE_OK)
             cursor.execute(sql)
 
             ##################################################
@@ -406,7 +417,12 @@ class SQLRepository:
 
             raise ValueError(
 
-                str(exc)
+                "Database storage is unavailable or busy. Retry shortly."
+                if getattr(exc, "sqlite_errorcode", 0) & 255 in {
+                    sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED, sqlite3.SQLITE_CANTOPEN,
+                    sqlite3.SQLITE_IOERR, sqlite3.SQLITE_FULL, sqlite3.SQLITE_READONLY,
+                    sqlite3.SQLITE_CORRUPT, sqlite3.SQLITE_NOTADB,
+                } else str(exc)
 
             ) from exc
 
@@ -463,7 +479,7 @@ class SQLRepository:
 
             cursor.execute(
 
-                f"PRAGMA table_info({table_name})"
+                'PRAGMA table_info("' + table_name.replace('"', '""') + '")'
 
             )
 
@@ -580,19 +596,18 @@ class SQLRepository:
         current_user: UserModel,
     ) -> None:
 
-        db_path = database_path(
-            str(current_user.id),
-        )
-
-        if db_path.exists():
-
-            db_path.unlink()
-
-        connection = self._connection(
-            current_user,
-        )
-
-        connection.close()
+        with registry() as catalog:
+            owned = catalog.execute("SELECT * FROM databases WHERE owner_user_id = ?",
+                                    (str(current_user.id),)).fetchone()
+            if not owned:
+                fail("The default or untracked legacy database cannot be deleted or reset.", 403)
+            db_path = owned_path(owned)
+            db_path.unlink(missing_ok=True)
+            connection = sqlite3.connect(db_path)
+            try:
+                self._initialize_database(connection)
+            finally:
+                connection.close()
 
     ##########################################################
     # Delete User Database
@@ -603,13 +618,10 @@ class SQLRepository:
         current_user: UserModel,
     ) -> None:
 
-        db_path = database_path(
-            str(current_user.id),
-        )
-
-        if db_path.exists():
-
-            db_path.unlink()
+        owned = owned_database(current_user)
+        if not owned:
+            fail("The default or untracked legacy database cannot be deleted.", 403)
+        execute_database_command(current_user, "DROP", owned["name"])
 
     ##########################################################
     # Database Statistics
@@ -662,7 +674,7 @@ class SQLRepository:
 
         return {
 
-            "database": f"{current_user.id}.db",
+            "database": (owned_database(current_user) or {}).get("name", f"{current_user.id}.db"),
 
             "tables": len(tables),
 

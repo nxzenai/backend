@@ -74,7 +74,7 @@ async def execute_query(
 
         success=True,
 
-        message="Query executed successfully.",
+        message=result.get("message", "Query executed successfully."),
 
         data=SQLExecuteResponse(
             **result

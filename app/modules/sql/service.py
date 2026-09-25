@@ -17,6 +17,11 @@ Responsibilities
 from __future__ import annotations
 
 import time
+import logging
+import sqlite3
+from app.core.exceptions.custom import AIStudioException
+from app.modules.sql.lifecycle import parse_database_command, execute_database_command, database_state
+from app.modules.sql.history import record_execution, record_reset
 
 from app.modules.auth.models import UserModel
 
@@ -24,6 +29,7 @@ from app.modules.sql.repository import SQLRepository
 
 from app.modules.sql.validator import (
     SQLValidator,
+    SQLValidationError,
 )
 
 
@@ -54,7 +60,7 @@ class SQLService:
 
         if not query:
 
-            raise ValueError(
+            raise AIStudioException(
                 "Query cannot be empty."
             )
 
@@ -62,9 +68,12 @@ class SQLService:
         # SQL Validation
         ######################################################
 
-        SQLValidator.validate(
-            query,
-        )
+        command = parse_database_command(query)
+        if not command:
+            try:
+                SQLValidator.validate(query)
+            except SQLValidationError as exc:
+                raise AIStudioException(str(exc), error_code="INVALID_SQL") from exc
 
         ######################################################
         # Execute Query
@@ -72,13 +81,16 @@ class SQLService:
 
         start = time.perf_counter()
 
-        result = self.repository.execute(
-
-            current_user=current_user,
-
-            query=query,
-
-        )
+        try:
+            result = (execute_database_command(current_user, *command) if command else
+                      self.repository.execute(current_user=current_user, query=query))
+        except (ValueError, sqlite3.Error, OSError) as exc:
+            self._record_execution(current_user.id, query, time.perf_counter() - start, False)
+            message = str(exc) if isinstance(exc, ValueError) else "Database storage is unavailable or busy. Retry shortly; contact an administrator if it persists."
+            raise AIStudioException(message, error_code="SQL_EXECUTION_FAILED") from exc
+        except Exception:
+            self._record_execution(current_user.id, query, time.perf_counter() - start, False)
+            raise
 
         execution_time = round(
 
@@ -89,8 +101,17 @@ class SQLService:
         )
 
         result["execution_time"] = execution_time
+        self._record_execution(current_user.id, query, execution_time, True)
 
         return result
+
+    @staticmethod
+    def _record_execution(*args):
+        try:
+            record_execution(*args)
+        except Exception:
+            # History outages must not mask a committed lifecycle result or its error.
+            logging.getLogger(__name__).warning("SQL execution history could not be recorded")
 
     ##########################################################
     # Database Schema
@@ -110,6 +131,7 @@ class SQLService:
         return {
 
             "tables": tables,
+            **database_state(current_user),
 
         }
 
@@ -175,6 +197,7 @@ class SQLService:
             current_user=current_user,
 
         )
+        record_reset(current_user.id)
 
     ##########################################################
     # Delete Database

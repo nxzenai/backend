@@ -800,7 +800,7 @@ async def test_native_failure_never_falls_back_to_llm_generation():
 
 def test_frontend_deduplicates_and_preserves_attachment_state_until_explicit_removal():
     hook = (Path(__file__).parents[2] / "frontend-main/src/hooks/useGenAIChat.ts").read_text(encoding="utf-8")
-    assert "addComposerAttachment(selectedAttachmentIds, attachment.id)" in hook
+    assert "setSelectedAttachmentIds(current => addComposerAttachment(current, attachment.id))" in hook
     assert "removeComposerAttachment(selectedAttachmentIds, id)" in hook
     assert "attachmentIdsForMessage(" in hook
     assert "preserveComposerAttachmentIds(current)" in hook
