@@ -25,7 +25,9 @@ class ProviderConfig:
 
     @property
     def configured(self) -> bool:
-        return bool((self.base_url or "").strip() and self.model.strip())
+        base_url = (self.base_url or "").strip()
+        return bool(base_url and self.model.strip() and
+                    ("openrouter.ai" not in base_url.casefold() or (self.api_key or "").strip()))
 
 
 class GenAIProvider(Protocol):
@@ -95,7 +97,11 @@ class ModelRouter:
         preferred_config = provider_config(preferred)
         if preferred_config.configured:
             return preferred_config, reason
-        fallback_tiers = [ModelTier.BALANCED, ModelTier.FAST] if preferred == ModelTier.DEEP else [ModelTier.FAST]
+        fallback_tiers = {
+            ModelTier.FAST: [ModelTier.BALANCED, ModelTier.DEEP],
+            ModelTier.BALANCED: [ModelTier.FAST, ModelTier.DEEP],
+            ModelTier.DEEP: [ModelTier.BALANCED, ModelTier.FAST],
+        }[preferred]
         for fallback_tier in fallback_tiers:
             fallback = provider_config(fallback_tier)
             if fallback.configured:

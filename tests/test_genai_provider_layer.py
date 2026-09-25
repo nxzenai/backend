@@ -85,6 +85,31 @@ def test_logical_tiers_resolve_all_five_config_values(monkeypatch, tier):
         "https://endpoint.example/v1", "PRIVATE_KEY", f"configured-{tier.value}", 8192, 768)
 
 
+@pytest.mark.parametrize("query,reasoning,expected", [
+    ("Hi", ReasoningLevel.STANDARD, ModelTier.FAST),
+    ("Explain random forest", ReasoningLevel.STANDARD, ModelTier.BALANCED),
+    ("Analyze and compare these designs", ReasoningLevel.DEEP, ModelTier.DEEP),
+])
+def test_auto_uses_only_the_three_configured_models(monkeypatch, query, reasoning, expected):
+    for tier in (ModelTier.FAST, ModelTier.BALANCED, ModelTier.DEEP):
+        monkeypatch.setattr(settings, f"genai_{tier.value}_base_url", "https://openrouter.ai/api/v1")
+        monkeypatch.setattr(settings, f"genai_{tier.value}_api_key", "PRIVATE_KEY")
+        monkeypatch.setattr(settings, f"genai_{tier.value}_model", f"configured-{tier.value}")
+    config, _ = ModelRouter().route(ModelTier.AUTO, query, reasoning)
+    assert config.tier == expected
+    assert config.model == f"configured-{expected.value}"
+
+
+def test_auto_falls_back_to_another_configured_tier(monkeypatch):
+    for tier in ("fast", "balanced", "deep"):
+        monkeypatch.setattr(settings, f"genai_{tier}_base_url", "https://openrouter.ai/api/v1")
+        monkeypatch.setattr(settings, f"genai_{tier}_api_key", "")
+    monkeypatch.setattr(settings, "genai_balanced_api_key", "PRIVATE_KEY")
+    config, _ = ModelRouter().route(ModelTier.AUTO, "Hi", ReasoningLevel.STANDARD)
+    assert config.tier == ModelTier.BALANCED
+    assert not provider_config(ModelTier.FAST).configured
+
+
 def test_native_action_with_all_providers_disabled(setup, monkeypatch):
     client, repo, _, _ = setup
     for tier in ("fast", "balanced", "deep"):

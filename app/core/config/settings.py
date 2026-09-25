@@ -8,7 +8,9 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
 
     model_config = SettingsConfigDict(
-        env_file=tuple(Path(__file__).resolve().parents[3] / name for name in (".env", ".env.development")),
+        # Explicit .env values override local development defaults; process
+        # environment variables retain the highest Pydantic settings priority.
+        env_file=tuple(Path(__file__).resolve().parents[3] / name for name in (".env.development", ".env")),
         case_sensitive=True,
         extra="ignore",
     )

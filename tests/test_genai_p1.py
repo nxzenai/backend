@@ -1,3 +1,6 @@
+from datetime import UTC, datetime
+
+import httpx
 import pytest
 
 from app.modules.genai.freshness import freshness_requirement
@@ -26,6 +29,18 @@ def test_static_questions_do_not_require_web(query):
 def test_document_factual_questions_keep_file_retrieval():
     assert ToolRouter().route("Who is the president mentioned in this document?", [], ["file-1"]) == ["files"]
     assert ToolRouter().route("Summarize this document", [], ["file-1"]) == ["files"]
+
+
+@pytest.mark.parametrize("query,attachments,tools", [
+    ("Hi", [], []),
+    ("Explain random forest", [], []),
+    ("What happened in AI today?", [], ["web"]),
+    ("Create/train using this dataset", ["file-1"], ["native_training"]),
+    ("Run this SQL", [], ["sql_lab"]),
+    ("What does the uploaded file say?", ["file-1"], ["files"]),
+])
+def test_requested_chat_routes(query, attachments, tools):
+    assert ToolRouter().route(query, [], attachments) == tools
 
 
 @pytest.mark.asyncio
@@ -101,7 +116,45 @@ async def test_current_url_cannot_bypass_unconfigured_search(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_undated_search_evidence_is_rejected_and_query_override_cannot_remove_freshness(monkeypatch):
+async def test_tavily_today_search_prefers_dated_evidence(monkeypatch):
+    monkeypatch.setattr(settings, "genai_web_search_provider", "tavily")
+    monkeypatch.setattr(settings, "genai_web_search_url", "https://api.tavily.com/search")
+    monkeypatch.setattr(settings, "genai_web_search_api_key", "PRIVATE_KEY")
+    client_type = httpx.AsyncClient
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        return httpx.Response(200, json={"results": [
+            {"url": "https://example.com/ai-news", "title": "AI news", "content": "A dated AI update",
+             "published_date": datetime.now(UTC).isoformat()},
+            {"url": "https://example.com/undated", "title": "Old claim", "content": "Undated update"},
+        ]})
+
+    monkeypatch.setattr("app.modules.genai.tools.httpx.AsyncClient",
+                        lambda **kwargs: client_type(transport=httpx.MockTransport(handler), **kwargs))
+    result = await _web_handler(ToolExecutionContext(OWNER, "What happened in AI today?", None), {})
+    assert result.ok and result.data["freshness"] == "day"
+    assert len(result.citations) == 2
+    assert result.citations[0]["url"] == "https://example.com/ai-news"
+    assert "A dated AI update" in result.content
+    assert "Undated update" in result.content
+    assert calls[0].url == "https://api.tavily.com/search"
+    assert calls[0].headers["authorization"] == "Bearer PRIVATE_KEY"
+    assert '"topic":"news"' in calls[0].content.decode()
+
+
+@pytest.mark.asyncio
+async def test_tavily_requires_key_before_request(monkeypatch):
+    monkeypatch.setattr(settings, "genai_web_search_provider", "tavily")
+    monkeypatch.setattr(settings, "genai_web_search_url", "https://api.tavily.com/search")
+    monkeypatch.setattr(settings, "genai_web_search_api_key", "")
+    result = await _web_handler(ToolExecutionContext(OWNER, "What happened in AI today?", None), {})
+    assert result.error_code == "WEB_SEARCH_UNCONFIGURED"
+
+
+@pytest.mark.asyncio
+async def test_undated_factual_evidence_is_accepted_and_query_override_cannot_replace_query(monkeypatch):
     monkeypatch.setattr(settings, "genai_web_search_url", "https://search.example")
     monkeypatch.setattr(settings, "genai_web_search_provider", "generic")
     class Response:
@@ -121,5 +174,6 @@ async def test_undated_search_evidence_is_rejected_and_query_override_cannot_rem
             return Response()
     monkeypatch.setattr("app.modules.genai.tools.httpx.AsyncClient", Client)
     result = await _web_handler(ToolExecutionContext(OWNER, "Who is the president of France?", None), {"query": "history"})
-    assert not result.ok
-    assert result.error_code == "WEB_NO_RESULTS"
+    assert result.ok
+    assert result.data["freshness"] is None
+    assert result.citations[0]["url"] == "https://example.com"
