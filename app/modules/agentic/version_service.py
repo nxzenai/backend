@@ -272,8 +272,8 @@ class AgenticVersionService:
             message = str(exc)
         except TimeoutError:
             message = "Application generation timed out."
-        except Exception:
-            message = "Application generation failed. No source version was completed."
+        except Exception as exc:
+            message = f"Application generation failed: {type(exc).__name__}: {exc}"
         await self.repository.discard_version_files(version_id, owner_id)
         await self.repository.fail_version(version_id, project_id, owner_id, message)
         await self.repository.update_project(

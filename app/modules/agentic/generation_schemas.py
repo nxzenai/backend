@@ -74,6 +74,26 @@ class GeneratedApplicationBundle(StrictModel):
     manifest: GenerationManifest
 
 
+class GeneratedApiEndpoint(StrictModel):
+    method: Literal["GET", "POST", "PUT", "PATCH", "DELETE"]
+    path: str = Field(min_length=1)
+    purpose: str = Field(min_length=1)
+    request_schema: dict[str, str]
+    response_schema: dict[str, str]
+
+
+class GenerationScaffold(StrictModel):
+    application: GeneratedApplication
+    manifest: GenerationManifest
+    api_endpoints: list[GeneratedApiEndpoint] = Field(min_length=1)
+    files: list[GeneratedSourceFile] = Field(min_length=2, max_length=12)
+
+
+class GeneratedStageFiles(StrictModel):
+    files: list[GeneratedSourceFile] = Field(min_length=1, max_length=MAX_GENERATED_FILES)
+    api_endpoints: list[GeneratedApiEndpoint] | None = None
+
+
 class VersionResponse(StrictModel):
     id: str
     project_id: str

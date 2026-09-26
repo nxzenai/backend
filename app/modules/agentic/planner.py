@@ -4,9 +4,10 @@ import json
 
 from pydantic import ValidationError
 
+from app.modules.agentic.model_router import AgenticModelRouter, complete_agentic
 from app.modules.agentic.schemas import ArchitecturePlan
-from app.modules.genai.constants import ModelTier, ReasoningLevel
-from app.modules.genai.provider import ModelRouter, OpenAICompatibleProvider
+from app.modules.genai.constants import ReasoningLevel
+from app.modules.genai.provider import OpenAICompatibleProvider
 
 
 SYSTEM_PROMPT = """
@@ -99,10 +100,10 @@ class ArchitecturePlanner:
     def __init__(
         self,
         provider: OpenAICompatibleProvider | None = None,
-        model_router: ModelRouter | None = None,
+        model_router: AgenticModelRouter | None = None,
     ):
         self.provider = provider or OpenAICompatibleProvider()
-        self.model_router = model_router or ModelRouter()
+        self.model_router = model_router or AgenticModelRouter()
 
     async def generate(
         self,
@@ -131,14 +132,10 @@ class ArchitecturePlanner:
             "required_json_schema": schema,
         }
 
-        config, _ = self.model_router.route(
-            ModelTier.AUTO,
-            f"Design AI architecture for {name}: {problem_statement}",
-            ReasoningLevel.STANDARD,
-        )
-
-        raw = await self.provider.complete(
-            config,
+        raw = await complete_agentic(
+            self.provider,
+            self.model_router,
+            "planner",
             [
                 {
                     "role": "system",
@@ -153,7 +150,6 @@ class ArchitecturePlanner:
                 },
             ],
             ReasoningLevel.STANDARD,
-            response_format={"type": "json_object"},
         )
 
         # First attempt
@@ -185,8 +181,10 @@ class ArchitecturePlanner:
             "previous_response": raw,
         }
 
-        repaired_raw = await self.provider.complete(
-            config,
+        repaired_raw = await complete_agentic(
+            self.provider,
+            self.model_router,
+            "planner",
             [
                 {
                     "role": "system",
@@ -201,7 +199,6 @@ class ArchitecturePlanner:
                 },
             ],
             ReasoningLevel.STANDARD,
-            response_format={"type": "json_object"},
         )
 
         try:

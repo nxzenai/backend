@@ -401,6 +401,15 @@ class Settings(BaseSettings):
     genai_weather_units: str = Field(default="metric", alias="GENAI_WEATHER_UNITS")
     genai_max_attachment_bytes: int = Field(default=10_485_760, alias="GENAI_MAX_ATTACHMENT_BYTES", ge=1024)
 
+    # Agentic inference is configured independently from GenAI model tiers.
+    agentic_provider: str = Field(default="openrouter", alias="AGENTIC_PROVIDER")
+    openrouter_api_key: str | None = Field(default=None, alias="OPENROUTER_API_KEY")
+    agentic_planner_model: str = Field(default="", alias="AGENTIC_PLANNER_MODEL")
+    agentic_coder_model: str = Field(default="", alias="AGENTIC_CODER_MODEL")
+    agentic_fallback_model: str = Field(default="", alias="AGENTIC_FALLBACK_MODEL")
+    agentic_last_resort_model: str = Field(default="openrouter/free", alias="AGENTIC_LAST_RESORT_MODEL")
+    agentic_allow_paid_models: bool = Field(default=False, alias="AGENTIC_ALLOW_PAID_MODELS")
+
     # -------------------------------------------------
     # Agentic local Docker build worker
     # -------------------------------------------------
