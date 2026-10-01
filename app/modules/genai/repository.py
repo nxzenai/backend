@@ -45,6 +45,8 @@ class GenAIRepository:
         self.attachments = database["genai_attachment_metadata"]
         self.attachment_chunks = database["genai_attachment_chunks"]
         self.filesystem = gridfs.GridFS(database.delegate, collection="genai_attachments")
+        self.prediction_exports = database["genai_prediction_exports"]
+        self.export_filesystem = gridfs.GridFS(database.delegate, collection="genai_prediction_export_files")
 
     async def ensure_indexes(self) -> None:
         global _INDEXES_READY
@@ -59,6 +61,7 @@ class GenAIRepository:
         await self.projects.create_index([("owner_id", ASCENDING), ("updated_at", DESCENDING)])
         await self.attachments.create_index([("owner_id", ASCENDING), ("conversation_id", ASCENDING), ("created_at", DESCENDING)])
         await self.attachment_chunks.create_index([("owner_id", ASCENDING), ("attachment_id", ASCENDING), ("chunk_index", ASCENDING)], unique=True)
+        await self.prediction_exports.create_index([("owner_id", ASCENDING), ("conversation_id", ASCENDING), ("created_at", DESCENDING)])
         _INDEXES_READY = True
 
     async def create_conversation(self, owner_id: str, title: str | None, tier: str, reasoning: str, project_id: str | None = None) -> dict[str, Any]:
@@ -406,6 +409,24 @@ class GenAIRepository:
         grid_file = await asyncio.to_thread(self.filesystem.get, attachment_id)
         content = await asyncio.to_thread(grid_file.read)
         return _public(document) or {}, content
+
+    async def save_prediction_export(self, owner_id: str, conversation_id: str, filename: str, content_type: str, content: bytes) -> dict[str, Any]:
+        export_id = str(uuid.uuid4())
+        await asyncio.to_thread(self.export_filesystem.put, content, _id=export_id, filename=filename)
+        document = {"_id": export_id, "owner_id": owner_id, "conversation_id": conversation_id,
+                    "filename": filename, "content_type": content_type, "created_at": _now()}
+        await self.prediction_exports.insert_one(document)
+        return _public(document) or {}
+
+    async def read_prediction_export(self, export_id: str, owner_id: str) -> tuple[dict[str, Any], bytes]:
+        document = await self.prediction_exports.find_one({"_id": export_id, "owner_id": owner_id})
+        if not document:
+            raise LookupError("Prediction export was not found.")
+        try:
+            grid_file = await asyncio.to_thread(self.export_filesystem.get, export_id)
+        except NoFile as exc:
+            raise LookupError("Prediction export was not found.") from exc
+        return _public(document) or {}, await asyncio.to_thread(grid_file.read)
 
     async def search_attachment_chunks(self, owner_id: str, attachment_ids: list[str], query: str, limit: int = 8) -> list[dict[str, Any]]:
         if not attachment_ids:

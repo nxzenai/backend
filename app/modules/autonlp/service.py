@@ -474,7 +474,8 @@ class AutoNLPService:
                 rows.append(AutoNLPBatchPredictionRow(
                     row_index=int(row_index), predicted_label=prediction.predicted_label,
                     technical_label=prediction.technical_label,
-                    model_score=prediction.model_score, vocabulary_coverage=prediction.vocabulary_coverage,
+                    model_score=prediction.model_score, probabilities=prediction.probabilities,
+                    vocabulary_coverage=prediction.vocabulary_coverage,
                 ))
             except Exception:
                 rows.append(AutoNLPBatchPredictionRow(row_index=int(row_index), error="This row could not be predicted."))

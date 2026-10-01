@@ -114,7 +114,12 @@ class GenAIToolRegistry:
                 return await definition.handler(context, arguments or {})
             return await asyncio.wait_for(
                 definition.handler(context, arguments or {}),
-                timeout=settings.genai_tool_timeout_seconds,
+                timeout=(settings.genai_autodl_batch_prediction_timeout_seconds
+                         if name == "autodl" and str((arguments or {}).get("action") or "").casefold() == "predict"
+                         and (arguments or {}).get("prediction_mode") == "image_batch"
+                         else settings.genai_prediction_timeout_seconds
+                         if name in {"automl", "autonlp", "autodl"} and str((arguments or {}).get("action") or "").casefold() == "predict"
+                         else settings.genai_tool_timeout_seconds),
             )
         except TimeoutError:
             return ToolResult(name, False, error_code="TOOL_TIMEOUT", error_message="The tool timed out safely.")

@@ -90,9 +90,8 @@ class AutoDLV2PredictionService:
                 row_count = len(dataframe)
                 input_metadata = self._dataframe_metadata(dataframe, model_document)
                 if input_mode == "csv":
-                    sequence_output = {**result["prediction"], "row": len(dataframe)}
                     result["_export_bytes"] = self._build_batch_export(
-                        dataframe, {"predictions": [sequence_output], "errors": []},
+                        dataframe, {"predictions": [], "errors": []}, forecast=result["prediction"],
                     )
         except Exception as exc:
             latency_ms = round((time.perf_counter() - started) * 1000, 2)
@@ -336,7 +335,9 @@ class AutoDLV2PredictionService:
             "mean_absolute_error": round(sum(errors) / len(errors), 6) if errors else None,
         }
 
-    def _build_batch_export(self, dataframe: pd.DataFrame, result: dict[str, Any]) -> bytes:
+    def _build_batch_export(
+        self, dataframe: pd.DataFrame, result: dict[str, Any], *, forecast: dict[str, Any] | None = None,
+    ) -> bytes:
         predictions = {int(item["row"]): item for item in result.get("predictions") or []}
         errors = {int(item["row"]): item["message"] for item in result.get("errors") or []}
         buffer = io.StringIO(newline="")
@@ -344,6 +345,8 @@ class AutoDLV2PredictionService:
         fieldnames = source_columns + [
             "nxzen_prediction", "nxzen_confidence", "nxzen_prediction_error",
         ]
+        if forecast is not None:
+            fieldnames.append("nxzen_row_type")
         writer = csv.writer(buffer)
         writer.writerow([self._safe_csv_value(value) for value in fieldnames])
         for position, (_, source) in enumerate(dataframe.iterrows(), start=1):
@@ -356,7 +359,16 @@ class AutoDLV2PredictionService:
                 output.get("confidence", ""),
                 self._safe_csv_value(errors.get(position, "")),
             ])
+            if forecast is not None:
+                row.append("historical")
             writer.writerow(row)
+        if forecast is not None:
+            writer.writerow([""] * len(source_columns) + [
+                self._safe_csv_value(forecast.get("predicted_category", forecast.get("predicted_value", ""))),
+                forecast.get("confidence", ""),
+                self._safe_csv_value(forecast.get("prediction_error", "")),
+                "forecast",
+            ])
         return buffer.getvalue().encode("utf-8-sig")
 
     @staticmethod

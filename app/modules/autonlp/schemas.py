@@ -195,6 +195,7 @@ class AutoNLPBatchPredictionRow(BaseModel):
     predicted_label: str | None = None
     technical_label: str | None = None
     model_score: float | None = None
+    probabilities: list[AutoNLPClassProbability] = Field(default_factory=list)
     vocabulary_coverage: float | None = None
     error: str | None = None
 

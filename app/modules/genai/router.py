@@ -4,6 +4,8 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Reques
 from fastapi.responses import StreamingResponse
 from fastapi.routing import APIRoute
 import asyncio
+import logging
+import uuid
 
 from app.modules.auth.dependencies import get_current_user
 from app.modules.auth.models import UserModel
@@ -21,6 +23,9 @@ from app.modules.genai.serialization import json_safe, json_safe_dumps
 from app.modules.genai.metrics import GenAIRequestMetrics, current_request, safe_code
 from app.modules.genai.repository import GenAIRepository
 from app.core.database import get_database
+
+
+logger = logging.getLogger(__name__)
 
 
 class GenAIRequestRoute(APIRoute):
@@ -251,8 +256,27 @@ async def stream_chat(
             yield _sse({'type': 'error', 'code': 'GENAI_TIER_UNAVAILABLE', 'message': str(exc)})
         except GenAIException as exc:
             yield _sse({'type': 'error', 'code': 'GENAI_REQUEST_INVALID', 'message': str(exc)})
-        except Exception:
-            yield _sse({'type': 'error', 'code': 'GENAI_STREAM_FAILED', 'message': 'The response stream could not be started.'})
+        except Exception as exc:
+            trace = current_request.get()
+            request_id = trace.request_id if trace else getattr(request.state, "request_id", str(uuid.uuid4()))
+            pending = {}
+            try:
+                conversation = await service.repository.get_conversation(payload.conversation_id, owner_id) if payload.conversation_id else None
+                pending = (conversation or {}).get("pending_prediction") or (conversation or {}).get("pending_confirmation") or {}
+            except Exception:
+                pass  # Diagnostics must not replace the original failure.
+            routed_module = trace.intent if trace and trace.intent != "request" else service.tool_router.training_lab(payload.message)
+            logger.exception(
+                "GenAI stream failed request_id=%s exception_type=%s conversation_id=%s user_id=%s "
+                "pending_tool=%s pending_action=%s pending_status=%s attachment_ids=%s routed_module=%s",
+                request_id, type(exc).__name__, payload.conversation_id or (trace.conversation_id if trace else None),
+                owner_id, pending.get("tool"), pending.get("action"), pending.get("status"),
+                list(dict.fromkeys([*(trace.attachment_ids if trace else []), *payload.attachment_ids,
+                                        *(pending.get("attachment_ids") or [])])),
+                routed_module,
+            )
+            yield _sse({'type': 'error', 'code': 'GENAI_STREAM_FAILED',
+                        'message': f'GenAI request failed. Reference ID: {request_id}'})
 
     return StreamingResponse(events(), media_type="text/event-stream", headers={
         "Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no",
@@ -379,6 +403,20 @@ async def delete_attachment(
         return Response(status_code=status.HTTP_204_NO_CONTENT)
     except GenAIException as exc:
         raise _http_error(exc) from exc
+
+
+@router.get("/prediction-exports/{export_id}")
+async def download_prediction_export(
+    export_id: str, service: GenAIService = Depends(get_genai_service),
+    current_user: UserModel = Depends(get_current_user),
+):
+    try:
+        metadata, contents = await service.repository.read_prediction_export(export_id, _owner(current_user))
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    filename = str(metadata.get("filename") or "predictions.csv").replace('"', "").replace("/", "").replace("\\", "")
+    return Response(content=contents, media_type=str(metadata.get("content_type") or "application/octet-stream"),
+                    headers={"Content-Disposition": f'attachment; filename="{filename}"'})
 
 
 @router.get("/tools", response_model=list[ToolStatus])

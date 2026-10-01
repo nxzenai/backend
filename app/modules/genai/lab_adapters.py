@@ -4,6 +4,7 @@ from app.modules.genai.metrics import observe_tool
 
 import asyncio
 import json
+import math
 import re
 from functools import cached_property
 from typing import Any
@@ -24,6 +25,44 @@ class LabPredictionInputRequired(ValueError):
         super().__init__(message)
         self.missing_fields = missing_fields
         self.resolved_arguments = resolved_arguments
+
+
+def _target_options(dataframe: Any, task: str) -> list[str]:
+    import pandas as pd
+    options = []
+    for column in dataframe.columns:
+        series = dataframe[column].dropna()
+        unique = int(series.nunique())
+        if not unique:
+            continue
+        if task in {"classification", "text_classification", "sentiment_analysis", "intent_classification", "spam_classification", "tabular_classification"}:
+            if 2 <= unique <= min(50, max(2, len(dataframe) // 2)):
+                options.append(str(column))
+        elif task in {"regression", "tabular_regression", "time_series_regression"}:
+            if pd.api.types.is_numeric_dtype(series) and unique > 2:
+                options.append(str(column))
+    return options
+
+
+def _rank_targets(columns: list[str], problem: str) -> list[tuple[str, int]]:
+    stop = {"predict", "prediction", "classify", "classification", "estimate", "whether", "model", "using", "dataset", "data", "customer", "candidate", "patient", "will", "have", "with", "from", "their", "based", "what", "trying", "solve", "the", "and", "for", "this", "that", "into"}
+    words = set(re.findall(r"[a-z0-9]+", problem.casefold())) - stop
+    ranked = []
+    for column in columns:
+        tokens = set(re.findall(r"[a-z0-9]+", re.sub(r"(?<=[a-z])(?=[A-Z])", " ", column).casefold()))
+        matches = len(tokens & words)
+        score = matches * 4 + (3 if column.casefold() in problem.casefold() else 0)
+        if tokens & {"target", "label", "outcome"}:
+            score += 1
+        ranked.append((column, score))
+    return sorted(ranked, key=lambda item: (-item[1], item[0].casefold()))
+
+
+def _mapping_from_text(text: str, classes: list[str]) -> dict[str, str]:
+    found = dict((key.strip(), value.strip()) for key, value in re.findall(
+        r"(?:^|[,;\n])\s*([A-Za-z0-9_.-]+)\s*(?:=|:|→)\s*([^,;\n]+)", text,
+    ))
+    return found if set(found) == set(classes) and all(found.values()) else {}
 
 
 def _words(value: str) -> str:
@@ -171,7 +210,32 @@ def _followup_values(row: dict[str, Any], query: str, schema: dict[str, Any]) ->
                     row[field] = coerced
 
 
+def _clustering_manual_values(row: dict[str, Any], query: str, schema: dict[str, Any]) -> None:
+    """Match line assignments to native clustering fields without renaming them."""
+    required = [str(field) for field in schema.get("required_fields") or schema.get("expected_features") or []]
+    columns = schema.get("columns") or {}
+    for line in query.splitlines():
+        match = re.fullmatch(r"\s*(.+?)\s*[:=]\s*(.+?)\s*", line)
+        if not match:
+            continue
+        key = _slot_key(match.group(1))
+        exact = [field for field in required if _slot_key(field) == key]
+        candidates = exact or [
+            field for field in required
+            if _slot_key(re.sub(r"\([^)]*\)|\[[^]]*\]", "", field)) == key
+        ]
+        if len(candidates) != 1:
+            continue
+        field = candidates[0]
+        coerced = _coerce_schema_value(match.group(2), columns.get(field) or {})
+        if coerced is not None:
+            row[field] = coerced
+
+
 def _prediction_text(query: str) -> str:
+    specified = re.search(r"\b(?:predict|classify|analy[sz]e)\s+(?:this\s+)?text\s*[:\-]\s*(.+)$", query, re.I | re.S)
+    if specified:
+        return specified.group(1).strip(" \t\r\n'\"")
     quoted = re.search(r"(?:sentiment|intent|spam|classif(?:y|ication)|predict(?:ion)?)\s+(?:of|for)?\s*[:\-]\s*['\"]?(.+?)['\"]?\s*$", query, re.I)
     if quoted:
         return quoted.group(1).strip(" \t\r\n'\"")
@@ -266,6 +330,15 @@ def _safe_value(value: Any) -> Any:
 
 
 def _display(value: Any) -> str:
+    def rounded(item: Any) -> Any:
+        if isinstance(item, float) and math.isfinite(item):
+            return f"{item:.2f}"
+        if isinstance(item, list):
+            return [rounded(entry) for entry in item[:20]]
+        if isinstance(item, dict):
+            return {key: rounded(entry) for key, entry in list(item.items())[:20]}
+        return item
+    value = rounded(value)
     text = " ".join(str(value).split())[:300]
     return re.sub(r"([\\*_`\[\]])", r"\\\1", text)
 
@@ -275,183 +348,351 @@ def _percentage(value: Any) -> str | None:
         number = float(value)
     except (TypeError, ValueError):
         return None
-    if 0 <= number <= 1:
-        number *= 100
-    return f"{number:.1f}%"
+    return f"{number * 100:.2f}%" if math.isfinite(number) and 0 <= number <= 1 else None
+
+
+def _distribution(values: list[Any]) -> str:
+    counts: dict[str, int] = {}
+    for value in values:
+        counts[str(value)] = counts.get(str(value), 0) + 1
+    total = len(values)
+    return ", ".join(
+        f"{_display(name)}: {count} ({count / total * 100:.2f}%)"
+        for name, count in sorted(counts.items())
+    )
+
+
+def _native_label(value: Any, mapping: Any = None) -> tuple[str, bool]:
+    mapped = mapping.get(str(value)) if isinstance(mapping, dict) else None
+    if mapped is not None and str(mapped).strip():
+        return _readable_label(mapped), str(mapped) != str(value) or not _numeric_label(value)
+    if value is None:
+        return "Unavailable", False
+    numeric = _numeric_label(value)
+    return (f"Class {value}" if numeric else _readable_label(value)), not numeric
+
+
+def _numeric_label(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) or bool(
+        isinstance(value, str) and re.fullmatch(r"[-+]?\d+(?:\.\d+)?", value.strip())
+    )
+
+
+def _readable_label(value: Any) -> str:
+    label = str(value).strip()
+    return label.replace("_", " ").title() if label and label == label.upper() and re.search(r"[A-Z]", label) else label
+
+
+def _readable_name(value: Any, original_features: list[str] | None = None) -> str:
+    """Change presentation only; match one-hot suffixes to native input columns."""
+    raw = str(value)
+    cleaned = re.sub(r"^(?:numeric|categorical|num|cat)__", "", raw, flags=re.I)
+    category = None
+    if cleaned != raw and raw.casefold().startswith(("categorical__", "cat__")):
+        matches = [str(item) for item in original_features or [] if cleaned.startswith(str(item) + "_")]
+        if matches:
+            feature = max(matches, key=len)
+            category = cleaned[len(feature) + 1:]
+            cleaned = feature
+    words = ["Average" if item.casefold() == "avg" else "BMI" if item.casefold() == "bmi" else item.capitalize() for item in re.split(r"[_\s]+", cleaned) if item]
+    name = " ".join(words) or raw
+    return f"{name}: {_readable_label(category)}" if category else name
+
+
+def _autodl_label(value: Any, class_labels: list[Any]) -> tuple[str, bool]:
+    if value is not None and str(value) not in {str(item) for item in class_labels} and _numeric_label(value):
+        index = int(float(value))
+        if str(index) == str(value) and 0 <= index < len(class_labels):
+            return _native_label(class_labels[index])
+    return _native_label(value)
+
+
+def _nlp_label(predicted: Any, technical: Any, mapping: dict[str, Any]) -> tuple[str, bool]:
+    if technical is not None and str(technical) in mapping:
+        return _native_label(technical, mapping)
+    return _native_label(predicted)
 
 
 def _prediction_result(tool: str, value: Any, *, label: str | None = None) -> ToolResult:
-    """Format only the visible result; retain the complete native payload internally."""
+    """Present native outputs without inferring model behavior or local causes."""
     raw = _safe_value(value)
-    lines: list[str] = []
+    lines: list[str] = ["### Result"]
+    technical: list[str] = []
+    meaning: list[str] = []
+    explanation: list[str] = []
+
     if tool == "automl":
         task = str(raw.get("task") or "")
         predictions = raw.get("predictions") or []
-        if raw.get("input_mode") == "csv" or len(predictions) > 1:
-            lines.append(f"**Batch prediction:** {len(predictions)} of {raw.get('rows', len(predictions))} rows completed")
-            counts: dict[str, int] = {}
-            display_predictions = raw.get("segment_labels") or raw.get("prediction_labels") or predictions
-            for item in display_predictions:
-                counts[str(item)] = counts.get(str(item), 0) + 1
-            if task in {"classification", "clustering"} and counts:
-                lines.append("**Result counts:** " + ", ".join(
-                    f"{_display(key)}: {count}" for key, count in sorted(counts.items())
-                ))
-            scores = raw.get("prediction_confidences") or []
-            for index, item in enumerate(display_predictions[:5]):
-                score = _percentage(scores[index]) if index < len(scores) else None
-                lines.append(f"- Row {index + 1}: {_display(item)}" + (f" (model score {score})" if score else ""))
-            if raw.get("model_name"):
-                lines.append(f"**Model:** {_display(raw['model_name'])}")
-            return ToolResult(tool, True, content="\n\n".join(lines), data={"result": raw})
-        prediction = predictions[0] if predictions else None
-        meanings = raw.get("prediction_meanings") or []
-        encoded_fallback = False
+        target = raw.get("target_metadata") or {}
+        mapping = next((target[key] for key in ("class_meanings", "label_mapping", "value_meanings", "display_mapping") if isinstance(target.get(key), dict)), None)
+        labels = raw.get("segment_labels") or raw.get("prediction_labels") or [
+            _native_label(item, mapping)[0] for item in predictions
+        ]
         if task == "clustering":
-            labels = raw.get("segment_labels") or raw.get("prediction_labels") or []
-            prediction = labels[0] if labels else prediction
-        elif task == "classification" and (
-            isinstance(prediction, (int, float)) and not isinstance(prediction, bool)
-            or isinstance(prediction, str) and re.fullmatch(r"[-+]?\d+(?:\.\d+)?", prediction.strip())
-        ):
-            encoded = raw.get("encoded_predictions") or []
-            prediction = f"Class {encoded[0] if encoded else prediction}"
-            encoded_fallback = True
-        target = (raw.get("target_metadata") or {}).get("name")
-        if prediction is not None:
-            meaning = meanings[0] if meanings else None
-            target_metadata = raw.get("target_metadata") or {}
-            for key in ("class_meanings", "label_mapping", "value_meanings", "display_mapping"):
-                mapping = target_metadata.get(key)
-                if isinstance(mapping, dict) and str(predictions[0]) in mapping:
-                    meaning = mapping[str(predictions[0])]
-                    encoded_fallback = False
-                    break
-            if meaning and not encoded_fallback:
-                visible = _display(str(meaning).replace(" = ", ": "))
+            labels = [label if label else f"Cluster {cluster_id}" for label, cluster_id in zip(labels, predictions)]
+        batch = raw.get("input_mode") == "csv" or len(predictions) > 1
+        if batch:
+            lines.append(f"**Rows processed:** {len(predictions)} of {raw.get('rows', len(predictions))}")
+            failed_indices = {item.get("row_index") for item in raw.get("row_results") or [] if item.get("error")}
+            lines.append(f"**Successful:** {len(predictions) - len(failed_indices)} · **Failed:** {len(failed_indices)}")
+            successful_labels = [item for index, item in enumerate(labels) if index not in failed_indices]
+            if task in {"classification", "clustering"} and successful_labels:
+                lines.append("**Results:** " + _distribution(successful_labels))
+            meaning.append("These counts describe the predictions for the uploaded rows.")
+            if task == "classification" and any(not _native_label(item, mapping)[1] for item in predictions):
+                meaning.append("Human-readable label mapping is not available for this model.")
+            technical.append("**Sample rows (raw outputs):** " + ", ".join(f"{index + 1}: {_display(item)}" for index, item in enumerate(predictions[:5])))
+            if raw.get("prediction_confidences"):
+                available = [float(item) for item in raw["prediction_confidences"] if _percentage(item)]
+                if available:
+                    lines.append(f"**Average predicted-class probability:** {_percentage(sum(available) / len(available))}")
+                technical.append("**Sample raw probabilities:** " + ", ".join(_display(item) for item in raw["prediction_confidences"][:5]))
+        elif predictions:
+            original = predictions[0]
+            if task == "clustering":
+                visible = (raw.get("cluster_name_mapping") or {}).get(str(original))
+                lines.append(f"**Cluster ID:** {_display(original)}")
+                if visible:
+                    lines.append(f"**Segment:** {_display(visible)}")
+                profiles = raw.get("prediction_profiles") or []
+                if profiles and profiles[0]:
+                    meaning.append(_display(profiles[0]))
+                technical.append(f"**Native cluster ID:** {_display(original)}")
+            elif task == "regression":
+                unit = target.get("unit")
+                lines.append(f"**Predicted {_display(_readable_name(target.get('name') or 'value'))}:** {_display(original)}" + (f" {_display(unit)}" if unit else ""))
+                meaning.append(f"This is the model's estimated {_display(_readable_name(target.get('name') or 'value'))} for the supplied row.")
+                if not unit:
+                    meaning.append("A unit was not supplied in the model metadata.")
+                if target.get("name"):
+                    technical.append(f"**Raw target name:** {_display(target['name'])}")
             else:
-                visible = f"{_display(target)}: {_display(prediction)}" if target and task != "clustering" else _display(prediction)
-            lines.append(f"**Prediction:** {visible}")
-        confidence = next(iter(raw.get("prediction_confidences") or []), None)
-        calibrated = bool(raw.get("score_is_calibrated"))
-        if confidence is not None:
-            lines.append(f"**{'Confidence' if calibrated else 'Model score'}:** {_percentage(confidence)}")
+                visible, mapped = _native_label(original, mapping)
+                lines.append(f"**Prediction:** {_display(visible)}")
+                meaning.append(f"The model assigned this row to {_display(visible)}.")
+                if not mapped:
+                    meaning.append("Human-readable label mapping is not available for this model.")
+            technical.append(f"**Raw output:** {_display(original)}")
+            probability = next(iter(raw.get("prediction_confidences") or []), None)
+            if probability is not None and _percentage(probability):
+                lines.append(f"**Predicted-class probability:** {_percentage(probability)}")
+                technical.append(f"**Raw probability:** {_display(probability)}")
+            elif task == "classification":
+                meaning.append("Confidence was not returned by the native model.")
+        else:
+            lines.append("No prediction was returned by the native model.")
+        if task == "clustering":
+            if not meaning or batch:
+                explanation.append("Detailed feature explanation is not available for this model.")
+            else:
+                explanation.append("The segment description comes from the native training cluster profile; it does not explain this individual assignment.")
+        else:
+            importance = [item for item in raw.get("feature_importance") or [] if isinstance(item, dict) and item.get("feature") and item.get("importance") is not None]
+            if importance:
+                original_features = list(raw.get("input_features") or [])
+                explanation.append("**Model-wide important features:** " + ", ".join(_display(_readable_name(item["feature"], original_features)) for item in importance[:5]))
+                explanation.append("**Importance values:** " + ", ".join(
+                    f"{_display(_readable_name(item['feature'], original_features))}: "
+                    + (f"{float(item['importance']) * 100:.2f}%" if item.get("source") == "feature_importances_" and 0 <= float(item["importance"]) <= 1 else _display(float(item["importance"])))
+                    for item in importance[:5]
+                ))
+                explanation.append("These are model-wide importances, not per-row explanations or directions of effect.")
+                technical.append("**Raw feature importances:** " + ", ".join(
+                    f"{_display(item['feature'])}: {_display(item['importance'])}" for item in importance[:5]
+                ))
+                technical.append("**Importance source:** " + _display(importance[0].get("source") or "native estimator"))
+            else:
+                explanation.append("Detailed feature explanation is not available for this model.")
         if raw.get("model_name"):
-            lines.append(f"**Model:** {_display(raw['model_name'])}")
-        if task == "clustering" and (raw.get("technical_clusters") or []):
-            lines.append(f"**Technical cluster:** {_display(raw['technical_clusters'][0])}")
+            technical.append(f"**Model:** {_display(raw['model_name'])}")
+        if mapping:
+            technical.append("**Label mapping source:** saved target metadata")
+        if raw.get("model_filename"):
+            technical.append(f"**Model artifact:** {_display(raw['model_filename'])}")
 
     elif tool == "autonlp":
-        if isinstance(raw.get("rows"), list):
-            lines.append(f"**Batch prediction:** {raw.get('valid_rows', 0)} of {raw.get('total_rows', 0)} rows completed")
+        rows = raw.get("rows")
+        label_mapping = raw.get("label_display_mapping") or {}
+        if isinstance(rows, list):
+            valid = [item for item in rows if isinstance(item, dict) and item.get("predicted_label") is not None and not item.get("error")]
+            lines.append(f"**Rows processed:** {raw.get('valid_rows', len(valid))} of {raw.get('total_rows', len(rows))}")
+            lines.append(f"**Successful:** {len(valid)} · **Failed:** {raw.get('failed_rows', len(rows) - len(valid))}")
+            if valid:
+                lines.append("**Results:** " + _distribution([_nlp_label(item["predicted_label"], item.get("technical_label"), label_mapping)[0] for item in valid]))
+                if any(not _nlp_label(item["predicted_label"], item.get("technical_label"), label_mapping)[1] for item in valid):
+                    meaning.append("Human-readable label mapping is not available for this model.")
             if raw.get("failed_rows"):
-                lines.append(f"**Warning:** {raw['failed_rows']} row(s) could not be predicted.")
-            class_counts: dict[str, int] = {}
-            for item in raw["rows"]:
-                predicted = item.get("predicted_label")
-                if predicted is not None and not item.get("error"):
-                    label_text = str(predicted)
-                    class_counts[label_text] = class_counts.get(label_text, 0) + 1
-            if class_counts:
-                lines.append("**Class counts:** " + ", ".join(
-                    f"{_display(key)}: {value}" for key, value in sorted(class_counts.items())
+                lines.append(f"**Skipped or failed:** {raw['failed_rows']}")
+            meaning.append("These labels are the native model's predictions for the processed text rows.")
+            technical.append("**Sample rows (raw labels):** " + ", ".join(f"{item.get('row_index')}: {_display(item.get('technical_label') or item['predicted_label'])}" for item in valid[:5]))
+            if any(item.get("model_score") is not None for item in valid[:5]):
+                scores = [float(item["model_score"]) for item in valid if _percentage(item.get("model_score"))]
+                if scores:
+                    lines.append(f"**Average predicted-class probability:** {_percentage(sum(scores) / len(scores))}")
+                technical.append("**Sample raw scores:** " + ", ".join(
+                    f"{item.get('row_index')}: {_display(item['model_score'])}"
+                    for item in valid[:5] if item.get("model_score") is not None
                 ))
-            for item in raw["rows"][:5]:
-                if item.get("predicted_label") is not None:
-                    score = _percentage(item.get("model_score"))
-                    lines.append(
-                        f"- Row {item.get('row_index')}: {_display(item['predicted_label'])}"
-                        + (f" (model score {score})" if score else "")
-                    )
-            return ToolResult(tool, True, content="\n\n".join(lines), data={"result": raw})
-        task_label = label or "Prediction"
-        lines.append(f"**{task_label}:** {_display(raw.get('predicted_label') or 'Unavailable')}")
-        score = raw.get("model_score")
-        if score is not None:
-            score_name = "Confidence" if raw.get("score_is_calibrated") else "Model score"
-            lines.append(f"**{score_name}:** {_percentage(score)}")
-        if raw.get("model_name"):
-            lines.append(f"**Model:** {_display(raw['model_name'])}")
-        probabilities = sorted(
-            [item for item in raw.get("probabilities") or [] if item.get("probability") is not None],
-            key=lambda item: float(item["probability"]), reverse=True,
-        )
-        warning = None
-        if probabilities:
-            top = float(probabilities[0]["probability"])
-            second = float(probabilities[1]["probability"]) if len(probabilities) > 1 else None
-            if top < 0.55 or (second is not None and top - second < 0.10):
-                warning = "Low confidence" if raw.get("score_is_calibrated") else "Low model score"
-                if second is not None:
-                    warning += (
-                        f"; {_display(probabilities[1].get('label') or 'another class')} "
-                        f"is nearly equally likely ({_percentage(second)})"
-                    )
-                warning += "."
-        for item in (warning, raw.get("readiness_message"), raw.get("vocabulary_warning")):
-            if item:
-                if not raw.get("score_is_calibrated"):
-                    item = re.sub(r"\bconfidence\b", "model score", str(item), flags=re.I)
-                lines.append(f"**Warning:** {_display(item)}")
+            technical.append("Per-row results and errors are retained in the native result payload.")
+        else:
+            native_label = raw.get("predicted_label")
+            visible, mapped = _nlp_label(native_label, raw.get("technical_label"), label_mapping)
+            lines.append(f"**{_display(label or 'Prediction')}:** {_display(visible)}")
+            if visible:
+                meaning.append(f"The model assigned this text the trained label {_display(visible)}.")
+            if raw.get("technical_label") is not None:
+                technical.append(f"**Raw label:** {_display(raw['technical_label'])}")
+            if native_label is not None and not mapped:
+                meaning.append("Human-readable label mapping is not available for this model.")
+            score = _percentage(raw.get("model_score"))
+            if score:
+                lines.append(f"**{'Confidence' if raw.get('score_is_calibrated') else 'Model score'}:** {score}")
+                technical.append(f"**Raw score:** {_display(raw['model_score'])}")
+            else:
+                meaning.append("Confidence was not returned by the native model.")
+            if raw.get("readiness_message"):
+                meaning.append(_display(raw["readiness_message"]))
+            if raw.get("vocabulary_warning"):
+                meaning.append(_display(raw["vocabulary_warning"]))
+            if raw.get("model_name"):
+                technical.append(f"**Model:** {_display(raw['model_name'])}")
+            if raw.get("probabilities"):
+                technical.append("**Class scores:** " + ", ".join(
+                    f"{_display(item.get('label'))}: {_percentage(item.get('probability'))}"
+                    for item in raw["probabilities"] if _percentage(item.get("probability"))
+                ))
+        explanation.append("Detailed text-level explanation is not available for this model.")
+        if label_mapping:
+            technical.append("**Label mapping source:** saved training label display mapping")
+        if raw.get("model_id"):
+            technical.append(f"**Model ID:** {_display(raw['model_id'])}")
+        if raw.get("explanation_status") and not isinstance(rows, list):
+            technical.append(f"**Native explanation status:** {_display(raw['explanation_status'])}")
 
     elif tool == "autodl":
-        if isinstance(raw.get("predictions"), list):
-            predictions = raw["predictions"]
-            errors = raw.get("errors") or []
-            valid = int(raw.get("valid_rows") if raw.get("valid_rows") is not None else len(predictions))
-            total = valid + len(errors)
-            lines.append(f"**Batch prediction:** {valid} of {total} rows completed")
-            if errors:
-                lines.append(f"**Warning:** {len(errors)} row(s) could not be predicted.")
-            counts: dict[str, int] = {}
-            for item in predictions:
-                result_value = item.get("predicted_class", item.get("predicted_category", item.get("predicted_value"))) if isinstance(item, dict) else item
-                if result_value is not None:
-                    counts[str(result_value)] = counts.get(str(result_value), 0) + 1
-            if counts and str((raw.get("problem") or {}).get("task") or "").endswith("classification"):
-                lines.append("**Result counts:** " + ", ".join(f"{_display(key)}: {count}" for key, count in sorted(counts.items())))
-            for index, item in enumerate(predictions[:5]):
-                value = item.get("predicted_class", item.get("predicted_category", item.get("predicted_value"))) if isinstance(item, dict) else item
-                score_value = item.get("confidence", item.get("model_score")) if isinstance(item, dict) else None
-                score = _percentage(score_value)
-                lines.append(f"- Row {index + 1}: {_display(value)}" + (f" (model score {score})" if score else ""))
-            model = raw.get("model") or {}
-            if model.get("name"):
-                lines.append(f"**Model:** {_display(model['name'])}")
-            return ToolResult(tool, True, content="\n\n".join(lines), data={"result": raw})
-        prediction = raw.get("prediction") or {}
-        category = prediction.get("predicted_class", prediction.get("predicted_category"))
-        if category is not None:
-            numeric_category = (
-                isinstance(category, (int, float)) and not isinstance(category, bool)
-                or isinstance(category, str) and re.fullmatch(r"[-+]?\d+(?:\.\d+)?", category.strip())
-            )
-            category = f"Class {category}" if numeric_category else category
-            lines.append(f"**Prediction:** {_display(category)}")
-        elif prediction.get("predicted_value") is not None:
+        predictions = raw.get("predictions")
+        problem = raw.get("problem") or {}
+        class_labels = raw.get("class_labels") or []
+        if str(problem.get("task") or "").startswith("time_series_") and raw.get("prediction"):
+            prediction = raw["prediction"]
+            sequence = raw.get("sequence") or {}
             target = prediction.get("target_name")
-            value_label = f"{target}: {prediction['predicted_value']}" if target else prediction["predicted_value"]
-            lines.append(f"**Prediction:** {_display(value_label)}")
-        confidence = prediction.get("confidence", prediction.get("model_score"))
-        if confidence is not None:
-            score_name = "Confidence" if prediction.get("score_is_calibrated") else "Model score"
-            lines.append(f"**{score_name}:** {_percentage(confidence)}")
+            rows_used = sequence.get("rows_used")
+            lines = ["### Next-step forecast"]
+            if prediction.get("predicted_value") is not None:
+                lines.append(f"**Predicted {_display(_readable_name(target or 'value'))}:** {_display(prediction['predicted_value'])}")
+            if rows_used is not None:
+                lines.append(f"Based on the latest {_display(rows_used)} rows from your uploaded CSV.")
+            lines.append("This model produces one next-step forecast from the latest sequence window, not one prediction per uploaded row.")
+            if raw.get("export_available"):
+                lines.append("The downloaded CSV contains the historical input rows followed by one forecast row.")
+            details = [f"**Task:** {_display(problem['task'])}"]
+            if (raw.get("model") or {}).get("name"):
+                details.append(f"**Model:** {_display(raw['model']['name'])}")
+            if target:
+                details.append(f"**Target:** {_display(target)}")
+            if rows_used is not None:
+                details.append(f"**Rows used:** {_display(rows_used)}")
+            if sequence.get("window_size") is not None:
+                details.append(f"**Window size:** {_display(sequence['window_size'])}")
+            if sequence.get("timestamp_column"):
+                details.append(f"**Timestamp column:** {_display(sequence['timestamp_column'])}")
+            lines.extend(["### Technical details", *details])
+            return ToolResult(tool, True, content="\n\n".join(lines), data={"result": raw})
+        if isinstance(predictions, list) and (predictions or raw.get("errors")):
+            valid = int(raw.get("valid_rows") if raw.get("valid_rows") is not None else len(predictions))
+            errors = raw.get("errors") or []
+            lines.append(f"**Rows processed:** {valid} of {valid + len(errors)}")
+            lines.append(f"**Successful:** {valid} · **Failed:** {len(errors)}")
+            if errors:
+                lines.append(f"**Skipped or failed:** {len(errors)}")
+            categories = [item.get("predicted_class", item.get("predicted_category")) for item in predictions if isinstance(item, dict)]
+            categories = [_autodl_label(item, class_labels)[0] for item in categories if item is not None]
+            if categories:
+                lines.append("**Results:** " + _distribution(categories))
+                if any(_numeric_label(item.get("predicted_class", item.get("predicted_category"))) and not _autodl_label(item.get("predicted_class", item.get("predicted_category")), class_labels)[1] for item in predictions if isinstance(item, dict)):
+                    meaning.append("Human-readable label mapping is not available for this model.")
+            meaning.append("These are the native model's outputs for the processed rows.")
+            technical.append("**Sample rows:** " + ", ".join(
+                f"{_display(item.get('image_name') or item.get('row', index + 1))}: {_display(item.get('predicted_class', item.get('predicted_category', item.get('predicted_value'))))}"
+                for index, item in enumerate(predictions[:5]) if isinstance(item, dict)
+            ))
+            if any(isinstance(item, dict) and item.get("confidence", item.get("model_score")) is not None for item in predictions[:5]):
+                scores = [float(item.get("confidence")) for item in predictions if isinstance(item, dict) and _percentage(item.get("confidence"))]
+                if scores:
+                    lines.append(f"**Average native class score:** {_percentage(sum(scores) / len(scores))}")
+                technical.append("**Sample raw scores:** " + ", ".join(
+                    f"{item.get('row', index + 1)}: {_display(item.get('confidence', item.get('model_score')))}"
+                    for index, item in enumerate(predictions[:5]) if isinstance(item, dict) and item.get("confidence", item.get("model_score")) is not None
+                ))
+            technical.append("Per-row results and errors are retained in the native result payload.")
+        else:
+            prediction = raw.get("prediction") or {}
+            category = prediction.get("predicted_class", prediction.get("predicted_category"))
+            if category is not None:
+                visible, mapped = _autodl_label(category, class_labels)
+                lines.append(f"**Prediction:** {_display(visible)}")
+                meaning.append(f"The model assigned this input to {_display(visible)}.")
+                if not mapped:
+                    meaning.append("Human-readable label mapping is not available for this model.")
+                technical.append(f"**Raw class:** {_display(category)}")
+            elif prediction.get("predicted_value") is not None:
+                target = prediction.get("target_name") or "value"
+                lines.append(f"**Predicted {_display(_readable_name(target))}:** {_display(prediction['predicted_value'])}" + (f" {_display(prediction['unit'])}" if prediction.get("unit") else ""))
+                meaning.append(f"This is the model's estimate for {_display(_readable_name(target))}.")
+                if not prediction.get("unit"):
+                    meaning.append("A unit was not supplied in the native result.")
+                technical.append(f"**Raw value:** {_display(prediction.get('raw_predicted_value', prediction['predicted_value']))}")
+                if prediction.get("target_name"):
+                    technical.append(f"**Raw target name:** {_display(target)}")
+            else:
+                lines.append("No prediction was returned by the native model.")
+            score = _percentage(prediction.get("confidence", prediction.get("model_score")))
+            if score:
+                lines.append(f"**{'Confidence' if prediction.get('score_is_calibrated') else 'Model score'}:** {score}")
+                technical.append(f"**Raw score:** {_display(prediction.get('confidence', prediction.get('model_score')))}")
+            elif category is not None:
+                meaning.append("Confidence was not returned by the native model.")
+            top = prediction.get("top_probabilities") or prediction.get("top_alternatives") or []
+            if len(top) > 1:
+                meaning.append("**Top alternatives:** " + ", ".join(
+                    f"{_display(_autodl_label(item.get('label'), class_labels)[0])}: {_percentage(item.get('probability'))}"
+                    for item in top[1:] if _percentage(item.get("probability"))
+                ))
+                technical.append("**Native top-class scores:** " + ", ".join(f"{_display(item.get('label'))}: {_display(item.get('probability'))}" for item in top))
+            if prediction.get("confidence_guidance"):
+                meaning.append(_display(re.sub(r"\bconfidence\b", "model score", str(prediction["confidence_guidance"]), flags=re.I)))
+        explainability = raw.get("explainability") or {}
+        if explainability.get("status") == "available" and explainability.get("method"):
+            explanation.append(f"The native model generated {_display(explainability['method'])} visualization data for this image.")
+            if isinstance(explainability.get("image"), str) and len(explainability["image"]) > 8_000_000:
+                explanation.append("The native visualization is too large to display in this chat.")
+            technical.append("**Native heatmap data:** present" if explainability.get("image") else "**Native heatmap data:** unavailable")
+        elif explainability.get("status") == "available_on_request":
+            explanation.append("Native Grad-CAM is available if you request an explanation for this image.")
+        else:
+            explanation.append("Detailed image explanation is not available for this model." if problem.get("task") == "image_classification" else "Detailed model explanation is not available for this AutoDL model.")
+        if explainability.get("status"):
+            technical.append(f"**Explainability status:** {_display(explainability['status'])}")
         model = raw.get("model") or {}
+        if class_labels:
+            technical.append("**Trained class names:** " + ", ".join(_display(item) for item in class_labels[:10]))
         if model.get("name"):
-            lines.append(f"**Model:** {_display(model['name'])}")
-        explanation = raw.get("human_explanation") or prediction.get("explanation")
-        if explanation:
-            if not prediction.get("score_is_calibrated"):
-                explanation = re.sub(r"\bconfidence\b", "model score", str(explanation), flags=re.I)
-            lines.append(f"**Explanation:** {_display(explanation)}")
-        if prediction.get("confidence_guidance"):
-            guidance = str(prediction["confidence_guidance"])
-            if not prediction.get("score_is_calibrated"):
-                guidance = re.sub(r"\bconfidence\b", "model score", guidance, flags=re.I)
-            lines.append(f"**Warning:** {_display(guidance)}")
+            technical.append(f"**Model:** {_display(model['name'])}")
+        if problem.get("task"):
+            technical.append(f"**Task:** {_display(problem['task'])}")
+        if raw.get("run_id"):
+            technical.append(f"**Run ID:** {_display(raw['run_id'])}")
+        if model.get("model_id"):
+            technical.append(f"**Model ID:** {_display(model['model_id'])}")
 
-    if not lines:
-        lines.append("Prediction completed, but no displayable prediction field was returned.")
+    if raw.get("business_problem"):
+        meaning.insert(0, f"For your stated goal, {_display(raw['business_problem'])}, this is the native model's output.")
+    lines.extend(["### What this means", *meaning] if meaning else ["### What this means", "The native model returned the result shown above."])
+    lines.extend(["### Why the model predicted this", *explanation])
+    if technical:
+        lines.extend(["### Technical details", *technical])
     return ToolResult(tool, True, content="\n\n".join(lines), data={"result": raw})
 
 
@@ -524,7 +765,7 @@ def _autodl_status_result(status_value: Any, result_value: Any | None = None) ->
         if status.get("stage"):
             lines.append(f"**Stage:** {_display(status['stage']).replace('_', ' ').title()}")
         if status.get("percentage") is not None:
-            lines.append(f"**Progress:** {float(status['percentage']):.1f}%")
+            lines.append(f"**Progress:** {float(status['percentage']):.2f}%")
         if status.get("current_epoch") is not None:
             epoch = status["current_epoch"]
             total = status.get("total_epochs")
@@ -562,6 +803,73 @@ def _autodl_status_result(status_value: Any, result_value: Any | None = None) ->
             lines.append(f"**Model readiness:** {'Ready for prediction' if result['prediction_ready'] else 'Not ready for prediction'}")
     payload = {**status, **({"result": result} if result is not None else {})}
     return ToolResult("autodl", True, content="\n\n".join(lines), data={"result": payload})
+
+
+def _autodl_readiness_explanation(result: dict[str, Any], model: dict[str, Any]) -> ToolResult:
+    """Describe saved native verification evidence without rerunning readiness gates."""
+    ready = result.get("prediction_ready") is True
+    lines = [f"**Model readiness:** {'Ready for prediction' if ready else 'Not ready for prediction'}"]
+    if ready:
+        lines.append("No failed readiness checks were recorded for this run.")
+        return ToolResult("autodl", True, content="\n\n".join(lines), data={"result": result})
+
+    performance = result.get("performance") or {}
+    preprocessing = model.get("preprocessing") or {}
+    verification = model.get("production_verification") or {}
+    failure = model.get("validation_failure") or {}
+    reason = failure.get("message") or performance.get("reliability_reason") or preprocessing.get("reliability_reason")
+    if reason:
+        lines.append(f"**Why:** {_display(reason)}")
+    if performance.get("production_readiness") or model.get("production_readiness"):
+        lines.append(f"**Native production readiness:** {_display(performance.get('production_readiness') or model.get('production_readiness'))}")
+
+    failed: list[str] = []
+    passed: list[str] = []
+    improvements: list[str] = []
+    if failure:
+        failed.append(f"Saved-model verification — Actual: {_display(str(failure.get('message') or failure.get('code') or 'failed')[:500])}; Required: verification passed.")
+        improvements.append("Resolve the recorded saved-model verification failure before retrying prediction.")
+    elif model.get("verification_status") == "failed_validation":
+        failed.append("Saved-model verification — Actual: failed validation; Required: verification passed.")
+    if verification.get("independent_evaluation_passed") is False:
+        test_count = performance.get("test_sample_count")
+        per_class = preprocessing.get("test_images_per_class") or {}
+        test_metrics = performance.get("test_metrics") or {}
+        observed = [f"test images: {_display(test_count)}" if test_count is not None else None,
+                    f"per-class images: {_display(per_class)}" if per_class else None,
+                    f"test accuracy: {_percentage(test_metrics.get('accuracy'))}" if test_metrics.get("accuracy") is not None else None,
+                    f"test weighted F1: {_percentage(test_metrics.get('f1'))}" if test_metrics.get("f1") is not None else None]
+        failed.append("Independent test evaluation — Actual: " + ", ".join(item for item in observed if item) + "; Required: native independent-evaluation gate passed.")
+        improvements.append("Add representative independent test images per class." if test_count == 0 else
+                            "Improve independent test coverage or performance; the saved gate does not identify which subcheck failed.")
+    elif verification.get("independent_evaluation_passed") is True:
+        passed.append("Independent test evaluation")
+    if preprocessing.get("robustness_warning"):
+        actual = performance.get("robustness_accuracy")
+        failed.append("Image-variation robustness — Actual: " + (_percentage(actual) or "not recorded")
+                      + "; Required: native robustness gate passed.")
+        improvements.append("Add varied images and rerun the native robustness check.")
+    for key, label, required in (
+        ("probability_sanity_passed", "Saved probability checks", True),
+        ("matches_held_out_evaluation", "Saved-model replay", True),
+        ("prediction_collapse_detected", "Prediction collapse", False),
+    ):
+        if verification.get(key) is required:
+            passed.append(label)
+        elif verification.get(key) is not None:
+            failed.append(f"{label} — Actual: {_display(verification[key])}; Required: {_display(required)}.")
+    if failed:
+        lines.append("**Failed / unmet checks:**\n" + "\n".join(f"- {item}" for item in failed))
+    else:
+        lines.append("The saved run does not expose a specific failed-check record.")
+    if passed:
+        lines.append("**Passed checks:**\n" + "\n".join(f"- {item}: Passed" for item in passed))
+    if improvements:
+        lines.append("**What to improve:**\n" + "\n".join(f"- {item}" for item in dict.fromkeys(improvements)))
+    validation = performance.get("validation_metrics") or {}
+    if validation.get("accuracy") is not None or validation.get("f1") is not None:
+        lines.append("Validation scores are separate from the saved production-readiness checks.")
+    return ToolResult("autodl", True, content="\n\n".join(lines), data={"result": result})
 
 
 class GenAILabAdapters:
@@ -794,6 +1102,146 @@ class GenAILabAdapters:
             ),
         }
 
+    async def resolve_training_context(self, tool: str, user: Any, values: dict[str, Any], query: str) -> dict[str, Any]:
+        """Collect user-confirmed business metadata before native training validation."""
+        values = dict(values)
+        task = str(values.get("task") or values.get("confirmed_task") or "").casefold()
+        if tool not in {"automl", "autonlp", "autodl"} or values.get("action") != "train" or not task:
+            return values
+        requested = [str(item).casefold() for item in values.get("_requested_fields") or []]
+        if not values.get("business_problem") and "business problem" in requested:
+            values["business_problem"] = query.strip()
+        if not values.get("business_problem"):
+            match = re.search(r"\b(?:to\s+predict|to\s+classify|to\s+estimate|business\s+problem\s*[:=])\s+(.+)", query, re.I)
+            if match:
+                values["business_problem"] = match.group(1).strip(" .")
+        if not values.get("business_problem"):
+            raise LabPredictionInputRequired("What business problem are you trying to solve?", ["business problem"], values)
+        if task == "clustering" or task == "image_classification":
+            values["target_column"] = None
+            if task == "clustering":
+                if values.get("prediction_required") is None:
+                    if "prediction required" in requested:
+                        answer = query.strip().casefold()
+                        if re.match(r"^(?:yes|y)(?:\b|[.!])", answer):
+                            values["prediction_required"] = True
+                        elif re.match(r"^(?:no|n)(?:\b|[.!])", answer):
+                            values["prediction_required"] = False
+                    if values.get("prediction_required") is None:
+                        raise LabPredictionInputRequired(
+                            "Will you need to assign new/unseen records to these clusters later?",
+                            ["prediction required"], values,
+                        )
+                if not values.get("cluster_count_source"):
+                    answer = query.strip().casefold() if "cluster count" in requested else ""
+                    if answer in {"auto", "auto detect", "automatic", "auto detect."}:
+                        values.update(cluster_count=None, cluster_count_source="auto_detect",
+                                      cluster_count_mode="automatic", number_of_clusters=None)
+                    else:
+                        match = re.fullmatch(r"(?:custom\s*[:=]?\s*)?(\d+)(?:\s+clusters?)?[.!]?", answer)
+                        if match:
+                            count = int(match.group(1))
+                            if not 2 <= count <= 10:
+                                raise LabPredictionInputRequired(
+                                    "Choose a cluster count from 2 to 10, or Auto Detect.",
+                                    ["cluster count"], values,
+                                )
+                            values.update(cluster_count=count, cluster_count_source="custom" if answer.startswith("custom") else "selected",
+                                          cluster_count_mode="custom", number_of_clusters=count)
+                    if not values.get("cluster_count_source"):
+                        raise LabPredictionInputRequired(
+                            "How many clusters would you like? Choose Auto Detect, 2, 3, 4, 5, or Custom (2-10).",
+                            ["cluster count"], values,
+                        )
+                values["require_prediction_support"] = bool(values["prediction_required"])
+                intake = values.get("_intake") or {}
+                columns = [str(item) for item in intake.get("column_names") or []]
+                ranked = _rank_targets(columns, str(values["business_problem"]))
+                suggested = [name for name, score in ranked if score >= 3]
+                if not suggested:
+                    suggested = [name for name in columns if any(token in str((intake.get("dtypes") or {}).get(name, "")).casefold() for token in ("int", "float", "decimal"))]
+                values["clustering_feature_candidates"] = suggested[:8]
+            if task == "image_classification":
+                classes = list(((values.get("_intake") or {}).get("image") or {}).get("classes") or [])
+                values["target_classes"] = [str(item) for item in classes]
+                values["target_label_mapping"] = {str(item): str(item) for item in classes}
+            return values
+        attachment_id = str(values.get("attachment_id") or "")
+        if not attachment_id:
+            return values
+        _, _, dataframe = await self._load_tabular_attachment(_owner(user), attachment_id)
+        options = _target_options(dataframe, task)
+        if not options:
+            raise ValueError("No target column appears compatible with this task. Choose another task or dataset.")
+        explicit = re.search(r"\b(?:target(?:\s+column)?\s+(?:is|=|:)|use\s+)\s*[`'\"]?([A-Za-z_][A-Za-z0-9_. -]{0,99}?)\s*[`'\"]?\s*(?:as\s+(?:the\s+)?target)?(?:[.!]|$)", query, re.I)
+        if explicit:
+            named = next((name for name in dataframe.columns if str(name).casefold() == explicit.group(1).strip().casefold()), None)
+            if named is not None and str(named) != str(values.get("target_column")):
+                values.update(target_column=str(named), target_confirmed_by_user=False,
+                              target_detection_source="user_selected", target_detection_confidence="high")
+        if re.search(r"\b(?:choose|select|change)\s+(?:another\s+)?target\b", query, re.I):
+            values.pop("target_column", None)
+            values["target_confirmed_by_user"] = False
+            raise LabResourceSelectionRequired(
+                "Choose a target column: " + ", ".join(options[:20]),
+                [{"target_column": name, "name": name, "target_confirmed_by_user": True,
+                  "target_detection_source": "user_selected", "target_detection_confidence": "high"} for name in options], values,
+            )
+        selected = str(values.get("target_column") or "")
+        if selected and selected not in dataframe.columns:
+            raise ValueError(f"Target column '{selected}' is not in the selected dataset.")
+        if selected and selected not in options:
+            raise ValueError(f"Target column '{selected}' is not compatible with {task} according to the observed values.")
+        if not selected:
+            ranked = _rank_targets(options, str(values["business_problem"]))
+            best_score = ranked[0][1]
+            tied = [name for name, score in ranked if score == best_score]
+            if best_score < 3 or len(tied) > 1:
+                values["target_detection_confidence"] = "low"
+                values["target_detection_source"] = "business_problem_and_dataset_metadata"
+                raise LabResourceSelectionRequired(
+                    "Several target columns are possible (confidence: Low). Choose the target column: " + ", ".join(options[:20]),
+                    [{"target_column": name, "name": name, "target_confirmed_by_user": True,
+                      "target_detection_source": "user_selected", "target_detection_confidence": "high"} for name in options], values,
+                )
+            selected = ranked[0][0]
+            values["target_column"] = selected
+            values["target_detection_source"] = "business_problem_and_dataset_metadata"
+            values["target_detection_confidence"] = "high" if best_score >= 7 else "medium"
+        else:
+            values.setdefault("target_detection_source", "user_selected")
+            values.setdefault("target_detection_confidence", "high")
+        if values.get("target_label_mapping_target") and values["target_label_mapping_target"] != selected:
+            values.pop("target_label_mapping", None)
+            values.pop("label_display_mapping", None)
+        observed_values = [str(item) for item in dataframe[selected].dropna().unique()[:10]]
+        if not values.get("target_confirmed_by_user"):
+            if re.search(r"\bconfirm\s+target\b|\buse\s+this\s+target\b", query, re.I):
+                values["target_confirmed_by_user"] = True
+            else:
+                raise LabPredictionInputRequired(
+                    f"Detected target: `{selected}`. Task: {task.replace('_', ' ')}. Observed values: {', '.join(observed_values)}. Confidence: {values['target_detection_confidence'].title()}. Use `{selected}` as the target?",
+                    ["target confirmation"], values,
+                )
+        series = dataframe[selected].dropna()
+        classes = [str(item) for item in series.unique()]
+        if task not in {"regression", "tabular_regression", "time_series_regression"}:
+            values["target_classes"] = classes
+            numeric_classes = bool(classes) and all(re.fullmatch(r"[-+]?\d+(?:\.\d+)?", item) for item in classes)
+            mapping = values.get("target_label_mapping") or values.get("label_display_mapping") or {}
+            if numeric_classes and not mapping:
+                mapping = _mapping_from_text(query, classes)
+            if numeric_classes and (set(mapping) != set(classes) or any(not str(item).strip() for item in mapping.values())):
+                raise LabPredictionInputRequired(
+                    f"The target `{selected}` contains values {', '.join(classes[:20])}. How should they be interpreted? Reply with every mapping, for example `0=Label, 1=Label`.",
+                    ["target label mapping"], values,
+                )
+            values["target_label_mapping"] = mapping if numeric_classes else {item: item for item in classes}
+            values["target_label_mapping_target"] = selected
+            if tool == "autonlp":
+                values["label_display_mapping"] = values["target_label_mapping"]
+        return values
+
     @observe_tool(resolution=True)
     async def resolve(
         self, tool: str, user: Any, arguments: dict[str, Any], query: str = "",
@@ -808,7 +1256,7 @@ class GenAILabAdapters:
             else "\n".join(filter(None, [str(values.get("original_query") or "").strip(), query.strip()]))
         )
         selected_attachments = selected_attachments or []
-        if values.get("attachment_id"):
+        if values.get("attachment_id") and not (tool == "autodl" and action == "predict" and values.get("prediction_mode") == "image_batch"):
             selected_attachments = [
                 item for item in selected_attachments if str(item.get("id")) == str(values["attachment_id"])
             ]
@@ -917,15 +1365,19 @@ class GenAILabAdapters:
                 values["model_filename"] = selected["model_filename"]
 
         if tool == "automl" and action == "predict" and values.get("model_filename"):
-            if values.get("_prediction_csv_requested") and not selected_attachments:
+            csv_requested = values.get("prediction_mode") == "csv" or values.get("_prediction_csv_requested")
+            if csv_requested:
+                training_id = str(values.get("dataset_attachment_id") or values.get("training_attachment_id") or "")
+                selected_attachments = [item for item in selected_attachments if str(item.get("id")) != training_id]
+            if csv_requested and not any(_is_csv_attachment(item) for item in selected_attachments):
                 raise LabPredictionInputRequired(
-                    "Please attach the CSV to use for prediction.", ["prediction CSV"], values,
+                    "Please attach a CSV file for prediction.", ["prediction CSV"], values,
                 )
             artifact = await asyncio.to_thread(self.automl.load_owned_artifact, str(values["model_filename"]), owner_id)
             schema = (artifact.metadata or {}).get("prediction_schema") or {}
             csv_attachment = (
                 selected_attachments[0]
-                if len(selected_attachments) == 1 and _is_csv_attachment(selected_attachments[0])
+                if values.get("prediction_mode") != "manual" and len(selected_attachments) == 1 and _is_csv_attachment(selected_attachments[0])
                 else None
             )
             if csv_attachment:
@@ -941,11 +1393,19 @@ class GenAILabAdapters:
                 values["original_query"] = source_query
                 values.pop("rows", None)
                 return values
+            if csv_requested:
+                raise LabPredictionInputRequired(
+                    "Please select one test CSV for prediction.", ["prediction CSV"], values,
+                )
+            if values.get("prediction_mode") not in {None, "manual"}:
+                raise ValueError("Select manual values or a test CSV for AutoML prediction.")
             existing = values.get("rows")
             row = dict(existing[0]) if isinstance(existing, list) and existing and isinstance(existing[0], dict) else {}
             extracted, _ = _schema_values(source_query, schema)
             row.update(extracted)
             _followup_values(row, source_query, schema)
+            if artifact.task == "clustering":
+                _clustering_manual_values(row, query, schema)
             required = schema.get("required_fields") or schema.get("expected_features") or artifact.original_feature_names
             missing = [str(field) for field in required if field not in row]
             values["rows"] = [row]
@@ -976,10 +1436,10 @@ class GenAILabAdapters:
             values["model_id"] = selected["model_id"]
 
         if tool == "autonlp" and action == "predict":
-            has_csv = len(selected_attachments) == 1 and _is_csv_attachment(selected_attachments[0])
-            if values.get("_prediction_csv_requested") and not has_csv:
+            has_csv = values.get("prediction_mode") != "manual" and len(selected_attachments) == 1 and _is_csv_attachment(selected_attachments[0])
+            if (values.get("prediction_mode") == "csv" or values.get("_prediction_csv_requested")) and not has_csv:
                 raise LabPredictionInputRequired(
-                    "Please attach the CSV to use for prediction.", ["prediction CSV"], values,
+                    "Please attach a CSV file for prediction.", ["prediction CSV"], values,
                 )
             if has_csv and len(selected_attachments) == 1:
                 values["attachment_id"] = selected_attachments[0]["id"]
@@ -1018,9 +1478,9 @@ class GenAILabAdapters:
             model = await asyncio.to_thread(self.autodl_training.repository.get_model, str(values["model_id"]), owner_id)
             values["run_id"] = str(model.get("run_id"))
 
-        if tool == "autodl" and action == "predict" and values.get("_prediction_csv_requested") and not selected_attachments:
+        if tool == "autodl" and action == "predict" and (values.get("prediction_mode") == "csv" or values.get("_prediction_csv_requested")) and not any(_is_csv_attachment(item) for item in selected_attachments):
             raise LabPredictionInputRequired(
-                "Please attach the CSV to use for prediction.", ["prediction CSV"], values,
+                "Please attach a CSV file for prediction.", ["prediction CSV"], values,
             )
 
         elif (
@@ -1110,7 +1570,7 @@ class GenAILabAdapters:
                 values["model_id"] = selected["model_id"]
         if tool == "eda" and action == "transform" and not values.get("transformation"):
             raise ValueError("EDA transformation requires a structured transformation operation payload.")
-        if tool == "autonlp" and action == "train" and not values.get("_native_validated"):
+        if tool == "autonlp" and action == "train":
             if values.get("task") in {"classification", "binary", "multiclass"}:
                 values["task"] = "text_classification"
             if not values.get("task"):
@@ -1122,15 +1582,30 @@ class GenAILabAdapters:
                 raise LabPredictionInputRequired(
                     "Which column should be used as the target?", ["target column"], values,
                 )
-            if not values.get("text_column"):
-                raise LabPredictionInputRequired(
-                    "Which column contains the training text?", ["text column"], values,
-                )
+            if values.get("_native_validated") and values.get("text_column") and values["text_column"] != values["target_column"]:
+                return values
             metadata, _, dataframe = await self._load_tabular_attachment(
                 owner_id, str(values["attachment_id"]),
             )
-            from app.modules.autonlp.constants import NLPTask
             from app.modules.autonlp.dataset_loader import inspect_nlp_dataframe
+            target_column = str(values["target_column"])
+            text_column = str(values.get("text_column") or "")
+            if text_column == target_column or text_column not in dataframe.columns:
+                values.pop("text_column", None)
+                values.pop("_native_validated", None)
+                candidates = [str(name) for name in (values.get("_intake") or {}).get("text_candidates") or []
+                              if str(name) in dataframe.columns and str(name) != target_column]
+                if not candidates:
+                    candidates = [str(name) for name in inspect_nlp_dataframe(
+                        dataframe, str(metadata.get("filename") or "dataset.csv"),
+                    ).get("text_candidates") or [] if str(name) != target_column]
+                if len(candidates) == 1:
+                    values["text_column"] = candidates[0]
+                else:
+                    raise LabPredictionInputRequired(
+                        "Which column contains the text to analyze?", ["text column"], values,
+                    )
+            from app.modules.autonlp.constants import NLPTask
             task = NLPTask(str(values["task"]))
             inspection = inspect_nlp_dataframe(
                 dataframe, str(metadata.get("filename") or "dataset.csv"),
@@ -1228,16 +1703,36 @@ class GenAILabAdapters:
                 task = str(winner.get("task") or run.get("task") or "")
                 image_input = bool(selected_attachments and str(selected_attachments[0].get("content_type") or "").startswith("image/"))
                 if task == "image_classification":
-                    if not image_input or len(selected_attachments) != 1:
+                    from app.modules.autodl_v2.inspector import IMAGE_EXTENSIONS
+                    images = [item for item in selected_attachments if str(item.get("filename") or "").casefold().endswith(tuple(IMAGE_EXTENSIONS))
+                              and str(item.get("id")) != str(values.get("dataset_attachment_id") or "")]
+                    batch = values.get("prediction_mode") == "image_batch"
+                    if (len(images) < 2 if batch else len(images) != len(selected_attachments) or len(images) != 1):
                         raise LabPredictionInputRequired(
-                            "Select exactly one image for this image-classification model.", ["one image"], values,
+                            "Upload at least two supported test images." if batch else "Select exactly one supported test image.",
+                            ["prediction images"] if batch else ["one image"], values,
                         )
-                    values["attachment_id"] = selected_attachments[0]["id"]
+                    if len(images) > 20:
+                        raise ValueError("Image batch prediction is limited to 20 images.")
+                    from io import BytesIO
+                    from PIL import Image, UnidentifiedImageError
+                    for item in images:
+                        _metadata, image_bytes = await self.genai_repository.read_attachment(str(item["id"]), owner_id)
+                        try:
+                            with Image.open(BytesIO(image_bytes)) as image:
+                                image.verify()
+                        except (UnidentifiedImageError, OSError, ValueError) as exc:
+                            raise ValueError(f"{item.get('filename') or 'The selected file'} is not a readable image.") from exc
+                    if batch:
+                        values["prediction_attachment_ids"] = [str(item["id"]) for item in images]
+                        values.pop("attachment_id", None)
+                    else:
+                        values["attachment_id"] = images[0]["id"]
                 elif task.startswith("tabular_"):
                     schema = _autodl_schema(winner.get("preprocessing") or {})
                     csv_attachment = (
                         selected_attachments[0]
-                        if len(selected_attachments) == 1 and _is_csv_attachment(selected_attachments[0])
+                        if values.get("prediction_mode") != "manual" and len(selected_attachments) == 1 and _is_csv_attachment(selected_attachments[0])
                         else None
                     )
                     if csv_attachment:
@@ -1429,6 +1924,16 @@ class GenAILabAdapters:
             return _result("autodl", inspected)
         if not run_id:
             raise ValueError("AutoDL action requires an owner-scoped run_id.")
+        if action == "readiness_explanation":
+            status_value = await asyncio.to_thread(self.autodl_training.get_status, run_id, owner_id)
+            if str(status_value.get("status") or "").casefold() != "completed":
+                return _autodl_status_result(status_value)
+            result_value = await asyncio.to_thread(self.autodl_training.get_result, run_id, owner_id)
+            if (result_value.get("problem") or {}).get("task") != "image_classification":
+                return _autodl_status_result(status_value, result_value)
+            model_id = str((result_value.get("best_model") or {}).get("model_id") or "")
+            model = await asyncio.to_thread(self.autodl_training.repository.get_model, model_id, owner_id)
+            return _autodl_readiness_explanation(result_value, model)
         if action in {"status", "result"}:
             status_value = await asyncio.to_thread(self.autodl_training.get_status, run_id, owner_id)
             if str(status_value.get("status") or "").casefold() in {"queued", "running"}:
@@ -1490,17 +1995,61 @@ class GenAILabAdapters:
                 "selected_models": submission["configuration"]["models"],
             })
         if action == "predict":
+            if values.get("prediction_mode") == "image_batch":
+                from app.core.config.settings import settings
+                deadline = asyncio.get_running_loop().time() + settings.genai_autodl_batch_prediction_timeout_seconds - 10
+                winner = await asyncio.to_thread(self.autodl_training.repository.get_winning_model, run_id, owner_id)
+                predictions: list[dict[str, Any]] = []
+                errors: list[dict[str, Any]] = []
+                for index, image_id in enumerate(dict.fromkeys(values.get("prediction_attachment_ids") or []), 1):
+                    filename = f"image_{index}"
+                    try:
+                        metadata, image_bytes = await values["_repository"].read_attachment(image_id, owner_id)
+                        filename = str(metadata.get("filename") or filename)
+                        remaining = deadline - asyncio.get_running_loop().time()
+                        if remaining <= 0:
+                            raise TimeoutError
+                        native = await asyncio.wait_for(
+                            asyncio.to_thread(
+                                self.autodl_prediction.predict, run_id=run_id, owner_id=owner_id,
+                                filename=filename, contents=image_bytes, manual_input=None,
+                                include_explanation=False, ground_truth=None,
+                            ), timeout=min(settings.genai_prediction_timeout_seconds, remaining),
+                        )
+                        predictions.append({"row": index, "image_name": filename, **(native.get("prediction") or {}),
+                                            "prediction_id": native.get("prediction_id")})
+                    except TimeoutError:
+                        errors.append({"row": index, "image_name": filename, "message": "prediction timed out"})
+                    except Exception as exc:
+                        errors.append({"row": index, "image_name": filename, "message": str(exc)[:500]})
+                return _prediction_result("autodl", {
+                    "input_mode": "image_batch", "run_id": run_id, "class_labels": winner.get("classes") or [],
+                    "business_problem": values.get("business_problem"),
+                    "predictions": predictions, "errors": errors, "valid_rows": len(predictions),
+                    "row_count": len(predictions) + len(errors),
+                })
             filename = None
             contents = None
             attachment_id = str(values.get("attachment_id") or "").strip()
             if attachment_id:
                 metadata, contents = await values["_repository"].read_attachment(attachment_id, owner_id)
                 filename = str(metadata.get("filename") or "prediction-input")
-            return _prediction_result("autodl", await asyncio.to_thread(
+            prediction = await asyncio.to_thread(
                 self.autodl_prediction.predict, run_id=run_id, owner_id=owner_id,
                 filename=filename, contents=contents, manual_input=values.get("input"),
-                include_explanation=bool(values.get("include_explanation")), ground_truth=values.get("actual_value"),
-            ))
+                include_explanation=bool(values.get("include_explanation") or re.search(
+                    r"\b(?:explain|explanation|why|heatmap|grad.cam)\b", str(values.get("_query") or ""), re.I,
+                )), ground_truth=values.get("actual_value"),
+            )
+            winner = await asyncio.to_thread(self.autodl_training.repository.get_winning_model, run_id, owner_id)
+            prediction["class_labels"] = winner.get("classes") or []
+            prediction["business_problem"] = values.get("business_problem")
+            if str((prediction.get("problem") or {}).get("task") or "").startswith("time_series_"):
+                preprocessing = winner.get("preprocessing") or {}
+                prediction["sequence"] = {**(prediction.get("sequence") or {}),
+                                          "window_size": preprocessing.get("window_size"),
+                                          "timestamp_column": preprocessing.get("timestamp_column")}
+            return _prediction_result("autodl", prediction)
         raise ValueError("Supported AutoDL actions are readiness, inspection, status, result, models, train, and predict.")
 
     async def _autonlp(self, user: Any, values: dict[str, Any]) -> ToolResult:
@@ -1558,7 +2107,12 @@ class GenAILabAdapters:
                     contents=contents, filename=str(metadata.get("filename") or "predictions.csv"),
                     text_column=text_column,
                 )
-                return _prediction_result("autonlp", batch)
+                batch_result = _safe_value(batch)
+                batch_result["label_display_mapping"] = (((registered.configuration or {}).get("result") or {}).get("dataset_summary") or {}).get("label_display_mapping") or {}
+                batch_result["task"] = str(getattr(registered.task, "value", registered.task))
+                batch_result["source_attachment_id"] = attachment_id
+                batch_result["business_problem"] = values.get("business_problem")
+                return _prediction_result("autonlp", batch_result)
             if not model_id or not text:
                 raise ValueError("AutoNLP prediction requires model_id and text or a selected CSV attachment.")
             request_task = _nlp_task_intent(str(values.get("original_query") or values.get("_query") or ""))
@@ -1566,11 +2120,13 @@ class GenAILabAdapters:
                 "sentiment_analysis": "Sentiment", "intent_classification": "Intent",
                 "spam_classification": "Spam classification", "text_classification": "Prediction",
             }.get(request_task or "", "Prediction")
-            return _prediction_result(
-                "autonlp", await asyncio.to_thread(
-                    self.autonlp.predict, model_id=model_id, text=text, owner_id=owner_id,
-                ), label=heading,
-            )
+            prediction = _safe_value(await asyncio.to_thread(
+                self.autonlp.predict, model_id=model_id, text=text, owner_id=owner_id,
+            ))
+            registered = self.autonlp._registered_model(model_id, owner_id)
+            prediction["label_display_mapping"] = (((registered.configuration or {}).get("result") or {}).get("dataset_summary") or {}).get("label_display_mapping") or {}
+            prediction["business_problem"] = values.get("business_problem")
+            return _prediction_result("autonlp", prediction, label=heading)
         raise ValueError("Supported AutoNLP actions are models, monitoring, and predict.")
 
     async def _automl(self, user: Any, values: dict[str, Any]) -> ToolResult:
@@ -1604,8 +2160,30 @@ class GenAILabAdapters:
                 values.get("require_prediction_support"),
             )
             trained = await train_service(self.automl, dataframe, target, task, configuration)
+            if trained.model_artifact is not None:
+                artifact_metadata = trained.model_artifact.metadata or {}
+                if target:
+                    target_metadata = ((artifact_metadata.get("prediction_schema") or {}).get("target") or {})
+                    target_metadata.update({"label_mapping": values.get("target_label_mapping") or {},
+                                            "business_problem": values.get("business_problem"),
+                                            "target_classes": values.get("target_classes") or [],
+                                            "target_detection_source": values.get("target_detection_source"),
+                                            "target_detection_confidence": values.get("target_detection_confidence"),
+                                            "target_confirmed_by_user": values.get("target_confirmed_by_user")})
+                    artifact_metadata.setdefault("prediction_schema", {})["target"] = target_metadata
+                artifact_metadata["business_problem"] = values.get("business_problem")
+                if task == "clustering":
+                    artifact_metadata.setdefault("clustering", {}).update({
+                        "prediction_required": bool(values.get("prediction_required")),
+                        "cluster_count": values.get("cluster_count"),
+                        "cluster_count_source": values.get("cluster_count_source"),
+                    })
+                trained.model_artifact.metadata = artifact_metadata
             filename = await save_training_artifact(self.automl, trained, owner_id)
-            return _training_result("automl", self.automl.complete_response(trained, model_filename=filename))
+            response = self.automl.complete_response(trained, model_filename=filename)
+            if task == "clustering":
+                response["cluster_profiles"] = ((trained.model_artifact.metadata or {}).get("clustering") or {}).get("cluster_profiles", {}) if trained.model_artifact else {}
+            return _training_result("automl", response)
         filename = str(values.get("model_filename") or "").strip()
         if not filename:
             raise ValueError("AutoML action requires an owner-scoped model_filename.")
@@ -1619,13 +2197,54 @@ class GenAILabAdapters:
             attachment_id = str(values.get("attachment_id") or "").strip()
             if attachment_id and values.get("_batch_prediction"):
                 _, _, dataframe = await self._load_tabular_attachment(owner_id, attachment_id)
-                predicted = await asyncio.to_thread(self.automl.predict_artifact_values, artifact, dataframe)
+                try:
+                    predicted = await asyncio.to_thread(self.automl.predict_artifact_values, artifact, dataframe)
+                except Exception as batch_error:
+                    # Keep native inference as the only predictor while isolating bad rows.
+                    row_results = []
+                    first_success = None
+                    for index in range(len(dataframe)):
+                        try:
+                            result = await asyncio.to_thread(
+                                self.automl.predict_artifact_values, artifact, dataframe.iloc[[index]],
+                            )
+                            first_success = first_success or result
+                            row_results.append({"row_index": index, "native": result})
+                        except Exception as row_error:
+                            row_results.append({"row_index": index, "error": str(row_error)[:500]})
+                    if first_success is None:
+                        raise batch_error
+                    predicted = {**first_success, "rows": len(dataframe), "row_results": row_results,
+                                 "predictions": [item["native"]["predictions"][0] if "native" in item else None for item in row_results],
+                                 "prediction_confidences": [((item["native"].get("prediction_confidences") or [None])[0]) if "native" in item else None for item in row_results],
+                                 "probabilities": [((item["native"].get("probabilities") or [None])[0]) if "native" in item else None for item in row_results]}
+                    if artifact.task == "clustering":
+                        predicted["segment_labels"] = [((item["native"].get("segment_labels") or [None])[0]) if "native" in item else None for item in row_results]
+                        predicted["prediction_labels"] = predicted["segment_labels"]
                 predicted["input_mode"] = "csv"
+                predicted["business_problem"] = values.get("business_problem")
+                predicted["source_attachment_id"] = attachment_id
+                predicted["model_filename"] = filename
+                predicted["feature_importance"] = (artifact.metadata or {}).get("feature_importance") or []
+                predicted["input_features"] = list(artifact.original_feature_names or [])
+                if artifact.task == "clustering":
+                    mapping = values.get("cluster_name_mapping") if values.get("cluster_names_confirmed") else {}
+                    predicted["cluster_name_mapping"] = mapping or {}
+                    predicted["segment_labels"] = [predicted["cluster_name_mapping"].get(str(cluster_id)) for cluster_id in predicted.get("predictions") or []]
+                    predicted["prediction_labels"] = predicted["segment_labels"]
                 return _prediction_result("automl", predicted)
             rows = values.get("rows")
             if not isinstance(rows, list) or not rows:
                 raise ValueError("AutoML prediction requires a non-empty rows list or a selected CSV attachment.")
-            return _prediction_result(
-                "automl", await asyncio.to_thread(self.automl.predict_artifact_values, artifact, pd.DataFrame(rows)),
-            )
+            predicted = await asyncio.to_thread(self.automl.predict_artifact_values, artifact, pd.DataFrame(rows))
+            predicted["model_filename"] = filename
+            predicted["business_problem"] = values.get("business_problem")
+            predicted["feature_importance"] = (artifact.metadata or {}).get("feature_importance") or []
+            predicted["input_features"] = list(artifact.original_feature_names or [])
+            if artifact.task == "clustering":
+                mapping = values.get("cluster_name_mapping") if values.get("cluster_names_confirmed") else {}
+                predicted["cluster_name_mapping"] = mapping or {}
+                predicted["segment_labels"] = [predicted["cluster_name_mapping"].get(str(cluster_id)) for cluster_id in predicted.get("predictions") or []]
+                predicted["prediction_labels"] = predicted["segment_labels"]
+            return _prediction_result("automl", predicted)
         raise ValueError("Supported AutoML actions are models, information, and predict.")
