@@ -13,6 +13,7 @@ from gridfs.errors import NoFile
 from motor.motor_asyncio import AsyncIOMotorDatabase
 from pymongo import ASCENDING, DESCENDING, ReturnDocument
 
+from app.core.config.settings import settings
 from app.modules.genai.constants import DEFAULT_CONVERSATION_TITLE
 
 
@@ -21,6 +22,15 @@ _INDEXES_READY = False
 
 def _now() -> datetime:
     return datetime.now(UTC)
+
+
+def knowledge_retrieval_limit(query: str, document_count: int) -> int:
+    base = settings.genai_knowledge_retrieval_chunks
+    if document_count > 1 and re.search(r"\b(compare|comparison|contrast|differences?|similarities|between)\b", query, re.I):
+        return min(20, max(base, 16))
+    if re.search(r"\b(explain|summari[sz]e|analy[sz]e|detailed|chapter|textbook|research paper)\b", query, re.I):
+        return min(20, max(base, 12))
+    return base
 
 
 def _public(document: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -331,6 +341,7 @@ class GenAIRepository:
     async def save_attachment(
         self, owner_id: str, conversation_id: str | None, project_id: str | None,
         filename: str, content_type: str, content: bytes, chunks: list[str], extraction: dict[str, Any],
+        chunk_sources: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         attachment_id = str(uuid.uuid4())
         await asyncio.to_thread(
@@ -347,7 +358,8 @@ class GenAIRepository:
         if chunks:
             await self.attachment_chunks.insert_many([
                 {"_id": str(uuid.uuid4()), "owner_id": owner_id, "attachment_id": attachment_id,
-                 "filename": filename, "chunk_index": index, "content": chunk}
+                 "filename": filename, "chunk_index": index, "content": chunk,
+                 **({"source": chunk_sources[index]} if chunk_sources and chunk_sources[index] else {})}
                 for index, chunk in enumerate(chunks)
             ])
         return _public(document) or {}
@@ -391,6 +403,36 @@ class GenAIRepository:
         documents = await self.attachments.find({"owner_id": owner_id, "project_id": project_id}, {"_id": 1}).to_list(length=100)
         return [str(item["_id"]) for item in documents]
 
+    async def selected_project_document_ids(self, owner_id: str, project_id: str | None) -> list[str]:
+        project = await self.get_project(project_id, owner_id)
+        if not project:
+            return []
+        selected = list(dict.fromkeys(project.get("knowledge_document_ids") or []))[:50]
+        if not selected:
+            return []
+        documents = await self.attachments.find({
+            "_id": {"$in": selected}, "owner_id": owner_id,
+            "project_id": project_id, "conversation_id": None,
+        }, {"_id": 1}).to_list(length=50)
+        valid = {str(item["_id"]) for item in documents}
+        return [item for item in selected if item in valid]
+
+    async def explicitly_named_attachment_ids(self, owner_id: str, attachment_ids: list[str], query: str) -> list[str]:
+        """Narrow an explicit document reference without changing chunk ranking."""
+        if not attachment_ids:
+            return []
+        normalized_query = " ".join(re.findall(r"[a-z0-9]+", query.casefold()))
+        documents = await self.attachments.find({
+            "_id": {"$in": attachment_ids}, "owner_id": owner_id,
+        }, {"_id": 1, "filename": 1}).to_list(length=len(attachment_ids))
+        named = set()
+        for item in documents:
+            stem = str(item.get("filename") or "").rsplit(".", 1)[0]
+            normalized_stem = " ".join(re.findall(r"[a-z0-9]+", stem.casefold()))
+            if len(normalized_stem) >= 4 and normalized_stem in normalized_query:
+                named.add(str(item["_id"]))
+        return [item for item in attachment_ids if item in named] if named else attachment_ids
+
     async def delete_attachment(self, attachment_id: str, owner_id: str) -> bool:
         result = await self.attachments.delete_one({"_id": attachment_id, "owner_id": owner_id})
         if not result.deleted_count:
@@ -428,20 +470,24 @@ class GenAIRepository:
             raise LookupError("Prediction export was not found.") from exc
         return _public(document) or {}, await asyncio.to_thread(grid_file.read)
 
-    async def search_attachment_chunks(self, owner_id: str, attachment_ids: list[str], query: str, limit: int = 8) -> list[dict[str, Any]]:
+    async def search_attachment_chunks(self, owner_id: str, attachment_ids: list[str], query: str,
+                                       limit: int = 8, balanced: bool = False) -> list[dict[str, Any]]:
         if not attachment_ids:
             return []
         # Only whole-document requests bypass lexical relevance. Topic-specific
         # summaries and factual questions continue through the existing search.
         query_text = " ".join(query.casefold().split()).strip(" .?!")
-        target = r"(?:(?:this|these|the|my|selected|attached|uploaded)\s+)*(?:documents?|papers?|files?)"
+        target = r"(?:(?:this|these|the|my|selected|attached|uploaded)\s+)*(?:research\s+)?(?:documents?|papers?|files?)"
         summary_intent = re.fullmatch(
             rf"(?:please\s+)?(?:summari[sz]e\s+{target}|"
             rf"(?:give\s+me\s+|provide\s+)?(?:a\s+|an\s+|the\s+)?(?:summary|overview)\s+of\s+{target}|"
             rf"what\s+(?:is|are)\s+{target}\s+about)(?:\s+please)?",
             query_text,
         )
-        if summary_intent:
+        whole_document_comparison = len(attachment_ids) > 1 and re.fullmatch(
+            rf"(?:please\s+)?(?:compare|contrast)\s+{target}(?:\s+please)?", query_text,
+        )
+        if summary_intent or whole_document_comparison:
             selected_ids = list(dict.fromkeys(attachment_ids[:50]))
             metadata = await self.attachments.find({
                 "owner_id": owner_id, "_id": {"$in": selected_ids},
@@ -468,9 +514,21 @@ class GenAIRepository:
                 }).sort("chunk_index", ASCENDING).limit(take).to_list(length=take)
                 selected.extend(item for item in chunks if str(item.get("content", "")).strip())
             return [{key: value for key, value in item.items() if key not in {"_id", "owner_id"}} for item in selected]
-        documents = await self.attachment_chunks.find({
-            "owner_id": owner_id, "attachment_id": {"$in": attachment_ids[:50]},
-        }).limit(2000).to_list(length=2000)
+        comparison = len(attachment_ids) > 1 and bool(re.search(
+            r"\b(compare|comparison|contrast|differences?|similarities|across|between)\b", query_text,
+        ))
+        if comparison or (balanced and len(attachment_ids) > 1):
+            selected_ids = list(dict.fromkeys(attachment_ids[:20]))
+            per_file_limit = min(1500, max(300, 6000 // len(selected_ids)))
+            documents = []
+            for attachment_id in selected_ids:
+                documents.extend(await self.attachment_chunks.find({
+                    "owner_id": owner_id, "attachment_id": attachment_id,
+                }).sort("chunk_index", ASCENDING).limit(per_file_limit).to_list(length=per_file_limit))
+        else:
+            documents = await self.attachment_chunks.find({
+                "owner_id": owner_id, "attachment_id": {"$in": attachment_ids[:50]},
+            }).limit(3000).to_list(length=3000)
         attachment_documents = await self.attachments.find({
             "owner_id": owner_id, "_id": {"$in": attachment_ids[:50]},
         }).to_list(length=50)
@@ -505,16 +563,14 @@ class GenAIRepository:
         stopwords = {
             "a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "how", "in", "is",
             "it", "me", "of", "on", "or", "the", "this", "to", "what", "when", "where", "which",
-            "who", "why", "with", "file", "document", "attached", "uploaded", "please", "tell",
+            "who", "why", "with", "file", "document", "documents", "paper", "papers", "attached", "uploaded", "please", "tell",
+            "compare", "comparison", "contrast", "differences", "similarities", "these", "those", "selected",
         }
         query_tokens = [
             term for term in re.findall(r"[a-z0-9_+-]{2,}", query_text)
             if term not in stopwords
         ]
         terms = set(query_tokens)
-        comparison = len(attachment_ids) > 1 and bool(re.search(
-            r"\b(compare|comparison|contrast|differences?|similarities|across|between)\b", query_text,
-        ))
         structured_summary = bool(re.search(
             r"\b(rows?|row count|columns?|dataset summary|sheets?|sample values|workbook)\b", query_text,
         ))
@@ -552,22 +608,45 @@ class GenAIRepository:
             ranked.append((score, item))
         ranked.sort(key=lambda pair: (pair[0], -int(pair[1].get("chunk_index", 0))), reverse=True)
         minimum_score = 1.0
-        selected = [item for score, item in ranked if score >= minimum_score][:limit]
+        expand_context = not comparison and bool(re.search(r"\b(explain|summari[sz]e|analy[sz]e|detailed|chapter)\b", query_text))
+        primary_limit = max(1, limit - 2) if expand_context and limit > 2 else limit
+        selected = [item for score, item in ranked if score >= minimum_score][:primary_limit]
         if comparison:
             # Comparison is an explicit request for cross-file coverage, not a
             # weak-query fallback. Include one bounded representative passage
             # from each selected file, then fill remaining slots by relevance.
             per_file: list[dict[str, Any]] = []
             for attachment_id in attachment_ids[:limit]:
-                candidates = [pair for pair in ranked if str(pair[1].get("attachment_id")) == attachment_id]
+                candidates = [pair for pair in ranked if pair[0] >= minimum_score and str(pair[1].get("attachment_id")) == attachment_id]
                 if candidates:
-                    metadata = next((item for score, item in candidates if item.get("kind") == "metadata"), None)
-                    per_file.append(metadata or candidates[0][1])
-            if len(per_file) == len(attachment_ids[:limit]):
+                    per_file.append(candidates[0][1])
+            if per_file:
                 seen = {(str(item.get("attachment_id")), int(item.get("chunk_index", 0))) for item in per_file}
                 selected = per_file + [
                     item for score, item in ranked
                     if score >= minimum_score
                     and (str(item.get("attachment_id")), int(item.get("chunk_index", 0))) not in seen
                 ][:max(0, limit - len(per_file))]
+        elif expand_context and selected:
+            by_position = {(str(item.get("attachment_id")), int(item.get("chunk_index", -1))): item
+                           for item in documents if int(item.get("chunk_index", -1)) >= 0}
+            seen = {(str(item.get("attachment_id")), int(item.get("chunk_index", -1))) for item in selected}
+            score_by_position = {(str(item.get("attachment_id")), int(item.get("chunk_index", -1))): score
+                                 for score, item in ranked}
+            for anchor in selected[:2]:
+                key = (str(anchor.get("attachment_id")), int(anchor.get("chunk_index", -1)))
+                if key[1] < 0 or score_by_position.get(key, 0) < 2:
+                    continue
+                for index in (key[1] - 1, key[1] + 1):
+                    neighbor_key = (key[0], index)
+                    if len(selected) >= limit:
+                        break
+                    if neighbor_key in by_position and neighbor_key not in seen:
+                        selected.append(by_position[neighbor_key])
+                        seen.add(neighbor_key)
+            selected.extend([
+                item for score, item in ranked
+                if score >= minimum_score
+                and (str(item.get("attachment_id")), int(item.get("chunk_index", -1))) not in seen
+            ][:max(0, limit - len(selected))])
         return [{key: value for key, value in item.items() if key not in {"_id", "owner_id"}} for item in selected]

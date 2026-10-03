@@ -15,8 +15,10 @@ import httpx
 from fastapi import HTTPException
 
 from app.core.config.settings import settings
+from app.modules.genai.attachments import assemble_source_evidence, source_title
 from app.modules.genai.freshness import explicit_freshness_requirement, freshness_requirement
 from app.modules.genai.metrics import current_request, observe_tool
+from app.modules.genai.repository import knowledge_retrieval_limit
 from app.modules.autonlp.exceptions import AutoNLPException
 
 
@@ -29,6 +31,7 @@ class ToolExecutionContext:
     current_user: Any = None
     adapters: Any = None
     request_id: str | None = field(default_factory=lambda: current_request.get().request_id if current_request.get() else None)
+    knowledge_document_ids: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -486,27 +489,35 @@ async def _weather_handler(context: ToolExecutionContext, arguments: dict[str, A
 async def _files_handler(context: ToolExecutionContext, arguments: dict[str, Any]) -> ToolResult:
     if not context.attachment_ids:
         return ToolResult("files", False, error_code="FILE_SELECTION_REQUIRED", error_message="Select or upload a file before asking about its contents.")
+    retrieval_query = arguments.get("query") or context.query
+    limit = knowledge_retrieval_limit(retrieval_query, len(context.attachment_ids)) if context.knowledge_document_ids else 8
+    attachment_ids = (await context.repository.explicitly_named_attachment_ids(
+        context.owner_id, context.attachment_ids, retrieval_query,
+    )) if context.knowledge_document_ids else context.attachment_ids
     chunks = await context.repository.search_attachment_chunks(
-        context.owner_id, context.attachment_ids, arguments.get("query") or context.query, limit=8,
+        context.owner_id, attachment_ids, retrieval_query, limit=limit,
+        balanced=bool(context.knowledge_document_ids),
     )
     trace = current_request.get()
     if trace:
         trace.retrieved_chunk_count += len(chunks)
     if not chunks:
         return ToolResult("files", False, error_code="FILE_EVIDENCE_INSUFFICIENT", error_message="The selected files do not contain enough relevant evidence to answer this request.")
-    citations: list[dict[str, str]] = []
-    passages: list[str] = []
-    for item in chunks:
-        metadata_chunk = item.get("kind") == "metadata"
-        anchor = "metadata" if metadata_chunk else f"chunk-{item['chunk_index']}"
-        label = "structured metadata" if metadata_chunk else f"section {item['chunk_index'] + 1}"
-        citations.append({
-            "title": item["filename"],
-            "url": f"attachment:{item['attachment_id']}#{anchor}",
-        })
-        passages.append(f"{item['filename']} ({label}):\n{item['content']}")
-    content = "\n\n".join(passages)
-    return ToolResult("files", True, content[:18000], citations=citations)
+    if not context.knowledge_document_ids:
+        citations: list[dict[str, str]] = []
+        passages: list[str] = []
+        per_chunk_chars = max(200, 17000 // len(chunks) - 250)
+        for item in chunks:
+            metadata_chunk = item.get("kind") == "metadata"
+            anchor = "metadata" if metadata_chunk else f"chunk-{item['chunk_index']}"
+            label = "structured metadata" if metadata_chunk else source_title(item)
+            citations.append({"title": source_title(item), "url": f"attachment:{item['attachment_id']}#{anchor}"})
+            passages.append(f"{label[:180]}:\n{str(item['content'])[:per_chunk_chars]}")
+        return ToolResult("files", True, "\n\n".join(passages)[:18000], citations=citations)
+    content, citations = assemble_source_evidence(chunks)
+    if not content:
+        return ToolResult("files", False, error_code="FILE_EVIDENCE_INSUFFICIENT", error_message="The selected files do not contain enough relevant evidence to answer this request.")
+    return ToolResult("files", True, content, citations=citations)
 
 
 async def _lab_handler(context: ToolExecutionContext, arguments: dict[str, Any]) -> ToolResult:
