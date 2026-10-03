@@ -429,3 +429,8 @@ async def tool_statuses(service: GenAIService = Depends(get_genai_service), curr
 async def health(service: GenAIService = Depends(get_genai_service), current_user: UserModel = Depends(get_current_user)):
     _owner(current_user)
     return await service.health()
+
+
+# Optional GenAI workspaces keep existing chat endpoints and contracts intact.
+from app.modules.genai.workspace import router as workspace_router
+router.include_router(workspace_router)

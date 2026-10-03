@@ -384,6 +384,7 @@ class Settings(BaseSettings):
     genai_inference_timeout_seconds: float = Field(default=120.0, alias="GENAI_INFERENCE_TIMEOUT_SECONDS", ge=5)
     genai_tool_timeout_seconds: float = Field(default=20.0, alias="GENAI_TOOL_TIMEOUT_SECONDS", ge=2, le=120)
     genai_prediction_timeout_seconds: float = Field(default=120.0, alias="GENAI_PREDICTION_TIMEOUT_SECONDS", ge=2, le=600)
+    genai_knowledge_retrieval_chunks: int = Field(default=8, alias="GENAI_KNOWLEDGE_RETRIEVAL_CHUNKS", ge=4, le=20)
     genai_autodl_batch_prediction_timeout_seconds: float = Field(default=3000.0, alias="GENAI_AUTODL_BATCH_PREDICTION_TIMEOUT_SECONDS", ge=120, le=7200)
     genai_web_search_provider: str = Field(default="generic", alias="GENAI_WEB_SEARCH_PROVIDER")
     genai_web_search_url: str | None = Field(default=None, alias="GENAI_WEB_SEARCH_URL")

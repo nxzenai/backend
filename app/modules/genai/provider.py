@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+import re
 from dataclasses import dataclass
 from typing import Any, AsyncIterator, Protocol
 
@@ -14,6 +16,24 @@ from app.modules.genai.metrics import current_request
 from time import perf_counter
 
 
+logger = logging.getLogger(__name__)
+
+
+def _safe_error_body(body: str) -> str:
+    """Keep only bounded error details, without credentials or response metadata."""
+    try:
+        parsed = json.loads(body)
+        error = parsed.get("error") if isinstance(parsed, dict) else None
+        if isinstance(error, dict):
+            body = json.dumps({key: error[key] for key in ("code", "type", "message") if key in error})
+    except (json.JSONDecodeError, TypeError):
+        pass
+    body = re.sub(r"(?i)\bbearer\s+[^\s\"',}]+", "Bearer [REDACTED]", body)
+    body = re.sub(r"(?i)\b(?:sk|or)-[a-z0-9_-]{8,}\b", "[REDACTED]", body)
+    body = re.sub(r"(?i)(\b(?:api[_-]?key|access[_-]?token|authorization)\b\s*[:=]\s*[\"']?)[^\s\"',}]+", r"\1[REDACTED]", body)
+    return " ".join(body[:2000].split())
+
+
 @dataclass(frozen=True)
 class ProviderConfig:
     tier: ModelTier
@@ -22,6 +42,7 @@ class ProviderConfig:
     model: str
     context_limit: int
     max_output_tokens: int
+    temperature_override: float | None = None
 
     @property
     def configured(self) -> bool:
@@ -167,10 +188,12 @@ class OpenAICompatibleProvider:
         url = f"{str(config.base_url).strip().rstrip('/')}/chat/completions"
         payload = {
             "model": config.model, "messages": messages, "stream": True,
-            "temperature": self._temperature(reasoning), "max_tokens": config.max_output_tokens,
+            "temperature": config.temperature_override if config.temperature_override is not None else self._temperature(reasoning),
+            "max_tokens": config.max_output_tokens,
         }
         timeout = httpx.Timeout(settings.genai_inference_timeout_seconds, connect=10.0)
         received_content = False
+        error_body = ""
         try:
             async with httpx.AsyncClient(timeout=timeout) as client:
                 headers = self._headers(config)
@@ -178,6 +201,11 @@ class OpenAICompatibleProvider:
                 if trace:
                     headers["X-Request-ID"] = trace.request_id
                 async with client.stream("POST", url, headers=headers, json=payload) as response:
+                    if response.status_code >= 400:
+                        async for part in response.aiter_text():
+                            error_body += part[:2000 - len(error_body)]
+                            if len(error_body) >= 2000:
+                                break
                     response.raise_for_status()
                     async for line in response.aiter_lines():
                         if cancellation.is_set():
@@ -205,6 +233,20 @@ class OpenAICompatibleProvider:
                 raise ProviderConnectionError("The selected inference service returned no response text.")
         except LlamaModelNotAvailableError:
             raise
+        except httpx.HTTPStatusError as exc:
+            trace = current_request.get()
+            logger.error("OpenRouter request failed model=%s status=%s request_id=%s exception_type=%s body=%s",
+                         config.model, exc.response.status_code, trace.request_id if trace else None,
+                         type(exc).__name__, _safe_error_body(error_body))
+            raise ProviderConnectionError("The selected inference service is unavailable or timed out.") from exc
+        except httpx.TimeoutException as exc:
+            logger.error("OpenRouter request timed out model=%s exception_type=%s error=%s",
+                         config.model, type(exc).__name__, _safe_error_body(str(exc)[:500]))
+            raise ProviderConnectionError("The selected inference service is unavailable or timed out.") from exc
+        except httpx.RequestError as exc:
+            logger.error("OpenRouter request failed model=%s exception_type=%s error=%s",
+                         config.model, type(exc).__name__, _safe_error_body(str(exc)[:500]))
+            raise ProviderConnectionError("The selected inference service is unavailable or timed out.") from exc
         except (httpx.HTTPError, TimeoutError, ValueError) as exc:
             raise ProviderConnectionError("The selected inference service is unavailable or timed out.") from exc
 
