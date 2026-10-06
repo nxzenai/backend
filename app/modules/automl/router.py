@@ -366,6 +366,7 @@ async def train_service(
     target_column: Optional[str],
     task: Optional[str],
     clustering_config: ClusteringConfig | None = None,
+    optimization_metric: Optional[str] = None,
 ):
 
     return await asyncio.to_thread(
@@ -374,6 +375,7 @@ async def train_service(
         target_column,
         task=task,
         clustering_config=clustering_config,
+        optimization_metric=optimization_metric,
     )
 
 
@@ -442,6 +444,7 @@ async def train_dataset(
     task: Optional[str] = Form(
         default=None
     ),
+    optimization_metric: Optional[str] = Form(default=None),
     cluster_count_mode: Optional[str] = Form(
         default=None
     ),
@@ -489,6 +492,7 @@ async def train_dataset(
             normalized_target,
             normalized_task,
             clustering_config,
+            optimization_metric,
         )
 
         model_filename = await save_training_artifact(
@@ -532,6 +536,7 @@ async def train_from_file(
     filepath: str,
     target_column: Optional[str] = None,
     task: Optional[str] = None,
+    optimization_metric: Optional[str] = None,
     cluster_count_mode: Optional[str] = None,
     number_of_clusters: Optional[int] = None,
     require_prediction_support: Optional[bool] = None,
@@ -565,6 +570,7 @@ async def train_from_file(
             normalized_target,
             task=normalized_task,
             clustering_config=clustering_config,
+            optimization_metric=optimization_metric,
         )
 
         model_filename = await save_training_artifact(
