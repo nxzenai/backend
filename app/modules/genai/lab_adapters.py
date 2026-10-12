@@ -696,6 +696,86 @@ def _prediction_result(tool: str, value: Any, *, label: str | None = None) -> To
     return ToolResult(tool, True, content="\n\n".join(lines), data={"result": raw})
 
 
+
+def _metric_aliases(metric: str, module: str = "") -> tuple[str, ...]:
+    """Display lookup only; native optimization names are unchanged."""
+    if module == "automl":
+        weighted = (("weighted_precision", "precision"), ("weighted_recall", "recall"), ("weighted_f1", "f1_score", "f1"))
+        group = next((group for group in weighted if metric in group), ())
+        if group:
+            return (metric, *(key for key in group if key != metric))
+    groups = (("f1", "f1_score"), ("r2", "r2_score"),
+              ("silhouette", "silhouette_score"), ("davies_bouldin", "davies_bouldin_score"),
+              ("calinski_harabasz", "calinski_harabasz_score"))
+    if module == "autodl" and metric == "weighted_f1":
+        return ("weighted_f1", "f1")
+    group = next((group for group in groups if metric in group), ())
+    return (metric, *(key for key in group if key != metric))
+
+
+def _metric_score(values: dict[str, Any], metric: str, module: str = "") -> Any:
+    return next((values[key] for key in _metric_aliases(metric, module)
+                 if isinstance(values.get(key), (int, float)) and not isinstance(values[key], bool)
+                 and math.isfinite(values[key])), None)
+
+
+def _metric_label(metric: str, module: str = "") -> str:
+    if module == "automl":
+        metric = {"precision": "weighted_precision", "recall": "weighted_recall", "f1": "weighted_f1", "f1_score": "weighted_f1"}.get(metric, metric)
+    labels = {"precision_positive": "Positive-class Precision", "recall_positive": "Positive-class Recall (Sensitivity)",
+              "f1_positive": "Positive-class F1", "weighted_precision": "Weighted Precision", "weighted_recall": "Weighted Recall",
+              "macro_precision": "Macro Precision", "macro_recall": "Macro Recall",
+              "accuracy": "Accuracy", "precision": "Precision", "recall": "Recall",
+              "f1": "F1", "f1_score": "F1 Score", "macro_f1": "Macro F1", "weighted_f1": "Weighted F1",
+              "roc_auc": "ROC-AUC", "r2": "R²", "r2_score": "R²", "mae": "MAE",
+              "mse": "MSE", "rmse": "RMSE", "mape": "MAPE",
+              "silhouette": "Silhouette", "silhouette_score": "Silhouette Score",
+              "davies_bouldin": "Davies-Bouldin", "davies_bouldin_score": "Davies-Bouldin",
+              "calinski_harabasz": "Calinski-Harabasz", "calinski_harabasz_score": "Calinski-Harabasz"}
+    return labels.get(metric, metric.replace("_", " ").title())
+
+
+def _metric_value(metric: str, value: Any) -> str:
+    if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value):
+        return "Unavailable"
+    if metric in {"accuracy", "precision", "recall", "f1", "f1_score", "macro_f1", "weighted_f1", "roc_auc",
+                  "precision_positive", "recall_positive", "f1_positive", "weighted_precision", "weighted_recall", "macro_precision", "macro_recall"}:
+        return _percentage(value) or _display(value)
+    return _display(value)
+
+
+def _optimization_lines(module: str, metric: str | None, score: Any, evaluation: dict[str, Any]) -> list[str]:
+    lines = ["**Optimization Result**",
+             f"**Optimization metric selected:** {_display(_metric_label(metric, module)) if metric else 'Unavailable'}",
+             f"**Best optimization score:** {_metric_value(metric or '', score)}"]
+    aliases = set(_metric_aliases(metric, module)) if metric else set()
+    secondary = {key: value for key, value in evaluation.items()
+                 if key not in aliases and not (module == "automl" and key in {"precision", "recall", "f1_score"}
+                 and {"precision": "weighted_precision", "recall": "weighted_recall", "f1_score": "weighted_f1"}[key] in evaluation)
+                 and isinstance(value, (int, float))
+                 and not isinstance(value, bool) and math.isfinite(value)}
+    if secondary:
+        lines.append("**Secondary Evaluation Metrics:** " + ", ".join(
+            f"{_display(_metric_label(key, module))}: {_metric_value(key, value)}" for key, value in secondary.items()))
+    return lines
+
+
+def _classification_selection_lines(selection: dict[str, Any] | None) -> list[str]:
+    if not selection:
+        return ["**Recommended Model:** Recommendation analysis unavailable for this historical run."]
+    quality = (selection.get("winner_quality") or {}).get("metrics") or {}
+    lines = ["**Quality Assessment:** " + ", ".join(f"{_metric_label(key, 'automl')}: {_metric_value(key, quality[key])}"
+             for key in ("precision_positive", "f1_positive", "accuracy", "roc_auc") if quality.get(key) is not None)]
+    for warning in selection.get("quality_warnings") or []:
+        lines.append(f"**Warning:** {_display(warning.get('message') or warning.get('code'))}")
+    recommended = selection.get("recommended_model")
+    lines.append(f"**Recommended Model:** {_display(str(recommended).replace('_', ' ').title()) if recommended else 'None'}")
+    if recommended:
+        lines.append(f"**Recommended selected-metric score:** {_metric_value(selection.get('optimization_metric') or '', selection.get('recommended_optimization_score'))}")
+    lines.append(_display(selection.get("recommendation_reason") or "Recommendation analysis is unavailable."))
+    return lines
+
+
 def _training_result(tool: str, value: Any) -> ToolResult:
     raw = _safe_value(value)
     labels = {"automl": "AutoML", "autonlp": "AutoNLP", "autodl": "AutoDL"}
@@ -707,29 +787,31 @@ def _training_result(tool: str, value: Any) -> ToolResult:
     winner = raw.get("winner_architecture") or raw.get("best_model") or raw.get("model_name")
     if isinstance(winner, dict):
         winner = winner.get("name") or winner.get("model_name")
-    if winner:
-        lines.append(f"**Best model:** {_display(winner)}")
     metrics = raw.get("metrics") or {}
-    if tool == "autonlp":
-        test_metrics = metrics.get("test_metrics") or {}
-        validation_metrics = metrics.get("validation_metrics") or {}
-        for label, source, key in (
-            ("Test macro F1", test_metrics, "macro_f1"),
-            ("Test accuracy", test_metrics, "accuracy"),
-            ("Validation macro F1", validation_metrics, "macro_f1"),
-        ):
-            if source.get(key) is not None:
-                lines.append(f"**{label}:** {_percentage(source[key])}")
-    elif tool == "automl" and isinstance(raw.get("best_model"), dict):
-        best = raw["best_model"]
-        for label, key in (
-            ("F1 score", "f1_score"), ("Accuracy", "accuracy"),
-            ("R²", "r2_score"), ("RMSE", "rmse"),
-            ("Silhouette score", "silhouette_score"),
-        ):
-            if best.get(key) is not None:
-                value_text = _percentage(best[key]) if key in {"f1_score", "accuracy"} else _display(best[key])
-                lines.append(f"**{label}:** {value_text}")
+    selected_metric = raw.get("optimization_metric") or raw.get("ranking_metric")
+    evaluation = raw.get("evaluation_metrics") or metrics.get("test_metrics") or metrics.get("validation_metrics") or {}
+    score = raw.get("optimization_score")
+    if score is None and selected_metric:
+        # NLP optimizes validation metrics; never substitute a held-out test score.
+        selection = (metrics.get("validation_metrics") or {}) if tool == "autonlp" else evaluation
+        if tool == "automl" and not selection and isinstance(raw.get("best_model"), dict):
+            selection = raw["best_model"]
+        score = _metric_score(selection, selected_metric, tool)
+    summary = _optimization_lines(tool, selected_metric, score, evaluation)
+    if winner:
+        label = "Optimization Winner" if tool == "automl" and task == "classification" else "Best model"
+        summary.insert(3, f"**{label}:** {_display(str(winner).replace('_', ' ').title())}")
+    lines.extend(summary)
+    if tool == "automl" and task == "classification":
+        lines.extend(_classification_selection_lines(raw.get("model_selection")))
+    reference = raw.get("model_filename") or raw.get("model_id") or raw.get("run_id")
+    if reference:
+        lines.append(f"**Result reference:** {_display(reference)}")
+    if tool == "automl":
+        capability = raw.get("artifact") or {}
+        lines.append("**Prediction support:** " + ("Available" if capability.get("prediction_supported") else "Unavailable"))
+    elif tool == "autonlp" and status == "completed":
+        lines.append("**Prediction support:** Available")
     if raw.get("run_id"):
         lines.append("Training status is available in the native AutoDL workspace.")
     warnings = raw.get("warnings") or []
@@ -782,21 +864,17 @@ def _autodl_status_result(status_value: Any, result_value: Any | None = None) ->
         performance = result.get("performance") or {}
         if problem.get("display_name") or problem.get("task"):
             lines.append(f"**Task:** {_display(problem.get('display_name') or problem.get('task'))}")
+        metric = result.get("optimization_metric") or performance.get("key_metric")
+        score = result.get("optimization_score")
+        if score is None and metric:
+            score = _metric_score(performance, metric, "autodl")
+            if score is None and performance.get("key_metric") in _metric_aliases(metric, "autodl"):
+                score = performance.get("value")
+        summary = _optimization_lines("autodl", metric, score, performance)
         if best.get("name"):
-            lines.append(f"**Best model:** {_display(best['name'])}")
-        metric_keys = (
-            ("Accuracy", "accuracy"), ("Weighted F1", "weighted_f1"),
-            ("RMSE", "rmse"), ("MAE", "mae"), ("R²", "r2"),
-        )
-        for label, key in metric_keys:
-            if performance.get(key) is not None:
-                value = _percentage(performance[key]) if key in {"accuracy", "weighted_f1"} else _display(performance[key])
-                lines.append(f"**{label}:** {value}")
-        primary_key = str(performance.get("key_metric") or "")
-        if performance.get("value") is not None and not performance.get(primary_key):
-            primary_label = primary_key.replace("_", " ").title() or "Metric"
-            primary_value = _percentage(performance["value"]) if primary_key in {"accuracy", "weighted_f1"} else _display(performance["value"])
-            lines.append(f"**{_display(primary_label)}:** {primary_value}")
+            summary.insert(3, f"**Best model:** {_display(str(best['name']).replace('_', ' ').title())}")
+        lines.extend(summary)
+        lines.append(f"**Result reference:** {_display(result.get('run_id'))}")
         if status.get("completed_at"):
             lines.append(f"**Completed:** {_display(status['completed_at'])}")
         if result.get("prediction_ready") is not None:
@@ -1212,6 +1290,7 @@ class GenAILabAdapters:
             values.setdefault("target_detection_source", "user_selected")
             values.setdefault("target_detection_confidence", "high")
         if values.get("target_label_mapping_target") and values["target_label_mapping_target"] != selected:
+            values.pop("positive_label", None)
             values.pop("target_label_mapping", None)
             values.pop("label_display_mapping", None)
         observed_values = [str(item) for item in dataframe[selected].dropna().unique()[:10]]
@@ -1224,11 +1303,18 @@ class GenAILabAdapters:
                     ["target confirmation"], values,
                 )
         series = dataframe[selected].dropna()
+        if task in {"regression", "tabular_regression", "time_series_regression"}:
+            values["_mape_valid"] = not bool((series == 0).any())
         classes = [str(item) for item in series.unique()]
         if task not in {"regression", "tabular_regression", "time_series_regression"}:
-            values["target_classes"] = classes
+            values["target_classes"] = ([bool(item) for item in dataframe[selected].dropna().unique()]
+                                        if str(dataframe[selected].dtype) in {"bool", "boolean"} else classes)
             numeric_classes = bool(classes) and all(re.fullmatch(r"[-+]?\d+(?:\.\d+)?", item) for item in classes)
             mapping = values.get("target_label_mapping") or values.get("label_display_mapping") or {}
+            dataset_metadata = await self.genai_repository.attachments.find_one({"_id": attachment_id, "owner_id": _owner(user)})
+            confirmed_mapping = (((dataset_metadata or {}).get("dataset_context") or {}).get("confirmed") or {}).get(selected) or {}
+            if set(confirmed_mapping) == set(classes):
+                mapping = confirmed_mapping
             if numeric_classes and not mapping:
                 mapping = _mapping_from_text(query, classes)
             if numeric_classes and (set(mapping) != set(classes) or any(not str(item).strip() for item in mapping.values())):
@@ -1236,7 +1322,7 @@ class GenAILabAdapters:
                     f"The target `{selected}` contains values {', '.join(classes[:20])}. How should they be interpreted? Reply with every mapping, for example `0=Label, 1=Label`.",
                     ["target label mapping"], values,
                 )
-            values["target_label_mapping"] = mapping if numeric_classes else {item: item for item in classes}
+            values["target_label_mapping"] = mapping or {item: item for item in classes}
             values["target_label_mapping_target"] = selected
             if tool == "autonlp":
                 values["label_display_mapping"] = values["target_label_mapping"]
@@ -1964,6 +2050,8 @@ class GenAILabAdapters:
                 admin=getattr(user, "role", "user") in {"admin", "super_admin"}, requested_stage=requested_stage,
             ))
         if action == "train":
+            from app.modules.genai.training_metrics import require_confirmed_metric
+            selected_metric = require_confirmed_metric("autodl", values)
             attachment_ids = values.get("_attachment_ids") or []
             attachment_id = str(values.get("attachment_id") or (attachment_ids[0] if attachment_ids else ""))
             if not attachment_id:
@@ -1984,6 +2072,7 @@ class GenAILabAdapters:
                     horizontal_flip_safe=bool(values.get("horizontal_flip_safe")), confirmed_task=values.get("confirmed_task"),
                     confirmed_target=values.get("confirmed_target"), confirmed_timestamp=values.get("confirmed_timestamp"),
                     rows_are_ordered=bool(values.get("rows_are_ordered")), timestamp_handling=str(values.get("timestamp_handling") or "strict"),
+                    optimization_metric=selected_metric,
                 )
                 runtime.submit_reserved(self.autodl_training.execute_direct(run_id, owner_id), run_id)
             except Exception:
@@ -1992,6 +2081,7 @@ class GenAILabAdapters:
             return _training_result("autodl", {
                 "run_id": run_id, "status": "queued",
                 "task": submission["configuration"].get("task"),
+                "optimization_metric": selected_metric,
                 "selected_models": submission["configuration"]["models"],
             })
         if action == "predict":
@@ -2079,13 +2169,15 @@ class GenAILabAdapters:
             required = ("text_column", "target_column", "task")
             if any(not values.get(item) for item in required):
                 raise ValueError("AutoNLP training requires confirmed text_column, target_column, and task.")
+            from app.modules.genai.training_metrics import require_confirmed_metric
+            selected_metric = require_confirmed_metric("autonlp", values)
             trained = await asyncio.to_thread(
                 self.autonlp.train_model, dataframe=dataframe, filename=upload.filename or "dataset.csv",
                 text_column=str(values["text_column"]), target_column=str(values["target_column"]),
                 task=NLPTask(str(values["task"])), max_epochs=int(values.get("max_epochs") or 30),
                 owner_id=owner_id, candidate_architectures=[str(item) for item in values.get("candidate_architectures", [])],
                 strategy=str(values.get("strategy") or "auto"), dataset_hash=sha256_bytes(contents),
-                label_display_mapping=values.get("label_display_mapping") or {},
+                label_display_mapping=values.get("label_display_mapping") or {}, optimization_metric=selected_metric,
             )
             return _training_result("autonlp", trained)
         if action == "predict":
@@ -2159,12 +2251,16 @@ class GenAILabAdapters:
                 values.get("cluster_count_mode"), values.get("number_of_clusters"),
                 values.get("require_prediction_support"),
             )
-            trained = await train_service(self.automl, dataframe, target, task, configuration)
+            from app.modules.genai.training_metrics import require_confirmed_metric
+            if task == "regression" and target:
+                values["_mape_valid"] = not bool((dataframe[target].dropna() == 0).any())
+            selected_metric = require_confirmed_metric("automl", values)
+            trained = await train_service(self.automl, dataframe, target, task, configuration, selected_metric, values.get("positive_label"))
             if trained.model_artifact is not None:
                 artifact_metadata = trained.model_artifact.metadata or {}
                 if target:
                     target_metadata = ((artifact_metadata.get("prediction_schema") or {}).get("target") or {})
-                    target_metadata.update({"label_mapping": values.get("target_label_mapping") or {},
+                    target_metadata.update({"positive_label": getattr(trained.best_model, "positive_label", None), "label_mapping": values.get("target_label_mapping") or {},
                                             "business_problem": values.get("business_problem"),
                                             "target_classes": values.get("target_classes") or [],
                                             "target_detection_source": values.get("target_detection_source"),
@@ -2172,6 +2268,11 @@ class GenAILabAdapters:
                                             "target_confirmed_by_user": values.get("target_confirmed_by_user")})
                     artifact_metadata.setdefault("prediction_schema", {})["target"] = target_metadata
                 artifact_metadata["business_problem"] = values.get("business_problem")
+                artifact_metadata["optimization_metric"] = selected_metric
+                from app.modules.automl.metrics import EXPLICIT_CLASSIFICATION_METRICS
+                artifact_metadata["positive_label"] = getattr(trained.best_model, "positive_label", None)
+                artifact_metadata["optimization_score"] = getattr(trained.best_model, selected_metric, None)
+                artifact_metadata["evaluation_metrics"] = {name: getattr(trained.best_model, name, None) for name in ("accuracy", "precision", "recall", "f1_score", "roc_auc", "r2_score", "mae", "mse", "rmse", "mape", "silhouette_score", "davies_bouldin_score", "calinski_harabasz_score", *EXPLICIT_CLASSIFICATION_METRICS)}
                 if task == "clustering":
                     artifact_metadata.setdefault("clustering", {}).update({
                         "prediction_required": bool(values.get("prediction_required")),
@@ -2181,6 +2282,9 @@ class GenAILabAdapters:
                 trained.model_artifact.metadata = artifact_metadata
             filename = await save_training_artifact(self.automl, trained, owner_id)
             response = self.automl.complete_response(trained, model_filename=filename)
+            response["optimization_metric"] = selected_metric
+            response["optimization_score"] = getattr(trained.best_model, selected_metric, None)
+            response["evaluation_metrics"] = (trained.model_artifact.metadata or {}).get("evaluation_metrics", {}) if trained.model_artifact else {}
             if task == "clustering":
                 response["cluster_profiles"] = ((trained.model_artifact.metadata or {}).get("clustering") or {}).get("cluster_profiles", {}) if trained.model_artifact else {}
             return _training_result("automl", response)

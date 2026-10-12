@@ -5,7 +5,7 @@ import ipaddress
 import re
 import socket
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from email.utils import parsedate_to_datetime
 from html.parser import HTMLParser
 from typing import Any, Awaitable, Callable
@@ -239,7 +239,9 @@ class ToolRouter:
             r"\b(how\s+to|show\s+me\s+how|example|sample\s+code|write\s+(?:code|a\s+function)|syntax)\b",
             query, re.I,
         )
-        if attachment_ids and not static_instruction:
+        # File presence alone is not a content request. Grounded references are
+        # resolved against the previous exchange by GenAIService.
+        if attachment_ids and not static_instruction and re.search(r"\b(?:columns?|rows?|dataset|spreadsheet|csv|files?|documents?)\b", query, re.I):
             return ["files"]
         return []
 
@@ -363,6 +365,11 @@ async def _web_handler(context: ToolExecutionContext, arguments: dict[str, Any])
     required_range, _ = freshness_requirement(context.query)
     search_query = context.query if required_range else str(arguments.get("query") or context.query)
     time_range, freshness_cutoff = explicit_freshness_requirement(search_query)
+    evidence_days = arguments.get("evidence_window_days")
+    if evidence_days == 1095:
+        # Evidence Intelligence only; ordinary chat freshness is unchanged.
+        time_range = None
+        freshness_cutoff = datetime.now(UTC) - timedelta(days=1095)
     payload: dict[str, Any] = {"query": search_query, "max_results": settings.genai_web_max_results}
     if time_range:
         payload["time_range"] = time_range
@@ -380,6 +387,7 @@ async def _web_handler(context: ToolExecutionContext, arguments: dict[str, Any])
                 response = await client.get(search_url, params={
                     "q": payload["query"], "num": min(payload["max_results"], 10),
                     "key": api_key, "cx": engine_id,
+                    **({"dateRestrict": "y3"} if evidence_days == 1095 else {}),
                     **({"dateRestrict": {"day": "d1", "week": "w1", "month": "m1"}[time_range]} if time_range else {}),
                 })
             else:
@@ -422,7 +430,8 @@ async def _web_handler(context: ToolExecutionContext, arguments: dict[str, Any])
         if time_range else ""
     )
     return ToolResult("web", True, freshness_note + "\n".join(item[2] for item in ranked_results),
-                      citations=[item[1] for item in ranked_results], data={"freshness": time_range})
+                      citations=[item[1] for item in ranked_results], data={"freshness": time_range,
+                          "sources": [{**item[1], "excerpt": item[2]} for item in ranked_results]})
 
 
 def _location_from_query(query: str) -> str:

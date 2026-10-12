@@ -19,8 +19,14 @@ Responsibilities
 from __future__ import annotations
 
 import asyncio
+import json
+import logging
+from datetime import UTC, datetime
+from hashlib import sha256
+from math import isfinite
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
+from uuid import uuid4
 
 import pandas as pd
 
@@ -39,6 +45,8 @@ from fastapi import (
     status,
 
 )
+from motor.motor_asyncio import AsyncIOMotorDatabase
+from app.core.database import get_database
 
 from app.modules.automl.algorithms.clustering import ClusteringConfig
 from app.modules.automl.exceptions import (
@@ -75,6 +83,7 @@ router = APIRouter(
     ],
 
 )
+logger = logging.getLogger(__name__)
 
 
 # ================================================================
@@ -367,6 +376,7 @@ async def train_service(
     task: Optional[str],
     clustering_config: ClusteringConfig | None = None,
     optimization_metric: Optional[str] = None,
+    positive_label: Any = None,
 ):
 
     return await asyncio.to_thread(
@@ -376,18 +386,62 @@ async def train_service(
         task=task,
         clustering_config=clustering_config,
         optimization_metric=optimization_metric,
+        positive_label=positive_label,
     )
+
+
+async def upload_dataset_identity(upload: UploadFile) -> str:
+    """Hash the already uploaded bytes without keeping a second dataset copy."""
+    digest = sha256()
+    await upload.seek(0)
+    while chunk := await upload.read(1024 * 1024):
+        digest.update(chunk)
+    await upload.seek(0)
+    return f"sha256:{digest.hexdigest()}"
+
+
+def file_dataset_identity(filepath: str) -> str:
+    digest = sha256()
+    with Path(filepath).open("rb") as source:
+        while chunk := source.read(1024 * 1024):
+            digest.update(chunk)
+    return f"sha256:{digest.hexdigest()}"
+
+
+async def record_prediction_observation(db: AsyncIOMotorDatabase, owner_id: str,
+                                        model_filename: str, artifact, mode: str, row_count: int) -> None:
+    if row_count < 1:
+        return
+    now = datetime.now(UTC)
+    features = sorted(str(name) for name in ((artifact.metadata or {}).get("required_features") or
+                                              artifact.original_feature_names))
+    schema = {"task": artifact.task, "target": str(artifact.target_column or ""),
+              "features": features}
+    schema_identity = sha256(json.dumps(schema, sort_keys=True).encode()).hexdigest()
+    activities = await db.learning_progress.find({"owner_id": owner_id,
+        "lifecycle_stages.MODEL_DEVELOPMENT.reference": model_filename,
+        "activity_started_at": {"$lte": now}}, {"topic_id": 1}).sort(
+            "activity_started_at", -1).limit(1).to_list(length=1)
+    await db.automl_prediction_observations.insert_one({
+        "_id": str(uuid4()), "owner_id": owner_id, "artifact_reference": model_filename,
+        "task_type": artifact.task, "prediction_mode": mode, "successful": True,
+        "row_count": row_count, "created_at": now,
+        "activity_id": activities[0].get("topic_id") if activities else None,
+        "input_schema_fingerprint": schema_identity,
+    })
 
 
 async def save_training_artifact(
     service: AutoMLService,
     result,
     owner_id: str,
+    dataset_identity: str | None = None,
 ) -> str:
 
     if (
         result is None
         or not result.success
+        or result.best_model is None
         or result.model_artifact is None
     ):
         raise HTTPException(
@@ -399,10 +453,32 @@ async def save_training_artifact(
         )
 
     try:
+        best = result.best_model
+        field_map = {
+            "classification": {"accuracy": "accuracy", "precision": "precision", "recall": "recall",
+                               "f1": "f1_score", "roc_auc": "roc_auc"},
+            "regression": {"r2": "r2_score", "mae": "mae", "rmse": "rmse", "mape": "mape"},
+            "clustering": {"silhouette": "silhouette_score", "davies_bouldin": "davies_bouldin_score",
+                           "calinski_harabasz": "calinski_harabasz_score", "cluster_count": "n_clusters"},
+        }
+        metrics = {}
+        for label, field in field_map.get(result.task, {}).items():
+            value = getattr(best, field, None)
+            if isinstance(value, (int, float)) and not isinstance(value, bool) and isfinite(float(value)):
+                metrics[label] = float(value) if label != "cluster_count" else int(value)
+        matrix = getattr(best, "confusion_matrix", None)
+        if result.task == "classification" and isinstance(matrix, list) and len(matrix) <= 20 and all(
+            isinstance(row, list) and len(row) == len(matrix) and
+            all(isinstance(cell, (int, float)) and isfinite(float(cell)) for cell in row) for row in matrix
+        ):
+            metrics["confusion_matrix"] = [[int(cell) for cell in row] for row in matrix]
         result.model_artifact.metadata = {
             **(result.model_artifact.metadata or {}),
             "owner_id": owner_id,
             "ownership_version": 1,
+            "learning_evaluation": {"task_type": result.task, "optimization_metric": result.ranking_metric,
+                                    "best_model_name": best.model_name, "created_at": datetime.now(UTC),
+                                    "dataset_identity": dataset_identity, "metrics": metrics},
         }
         filepath = await asyncio.to_thread(
             service.save_best_model_unique,
@@ -467,6 +543,7 @@ async def train_dataset(
                 file
             )
         )
+        dataset_identity = await upload_dataset_identity(file)
 
         normalized_target = (
             normalize_target_column(
@@ -496,7 +573,7 @@ async def train_dataset(
         )
 
         model_filename = await save_training_artifact(
-            service, result, authenticated_owner(current_user),
+            service, result, authenticated_owner(current_user), dataset_identity,
         )
 
         return service.complete_response(
@@ -575,6 +652,7 @@ async def train_from_file(
 
         model_filename = await save_training_artifact(
             service, result, authenticated_owner(current_user),
+            await asyncio.to_thread(file_dataset_identity, filepath),
         )
 
         return service.complete_response(
@@ -769,6 +847,7 @@ async def predict(
     file: UploadFile = File(...),
     service: AutoMLService = Depends(get_automl_service),
     current_user: UserModel = Depends(get_current_user),
+    db: AsyncIOMotorDatabase = Depends(get_database),
 ):
 
     try:
@@ -788,6 +867,11 @@ async def predict(
         )
         result["model"] = model_filename
         result["model_filename"] = model_filename
+        try:
+            await record_prediction_observation(db, authenticated_owner(current_user),
+                                                model_filename, artifact, "csv", int(result["rows"]))
+        except Exception as exc:
+            logger.warning("AutoML prediction observation unavailable: %s", type(exc).__name__)
         return result
 
     except HTTPException:
@@ -833,6 +917,7 @@ async def predict_values(
     request: PredictionValuesRequest,
     service: AutoMLService = Depends(get_automl_service),
     current_user: UserModel = Depends(get_current_user),
+    db: AsyncIOMotorDatabase = Depends(get_database),
 ):
 
     try:
@@ -845,6 +930,11 @@ async def predict_values(
             dataframe,
         )
         result["model_filename"] = request.model_filename
+        try:
+            await record_prediction_observation(db, authenticated_owner(current_user),
+                                                request.model_filename, artifact, "manual", int(result["rows"]))
+        except Exception as exc:
+            logger.warning("AutoML prediction observation unavailable: %s", type(exc).__name__)
         return result
 
     except ModelNotFoundError as exc:

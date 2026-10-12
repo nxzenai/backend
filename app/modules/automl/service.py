@@ -374,6 +374,7 @@ class AutoMLService:
         task: AutoMLTask | str | None = None,
         clustering_config: ClusteringConfig | None = None,
         optimization_metric: str | None = None,
+        positive_label: Any = None,
     ) -> AutoMLResult:
 
         if dataframe is None:
@@ -402,6 +403,7 @@ class AutoMLService:
             task=task,
             clustering_config=clustering_config,
             optimization_metric=optimization_metric,
+            positive_label=positive_label,
         )
 
         if (
@@ -427,6 +429,7 @@ class AutoMLService:
         task: AutoMLTask | str | None = None,
         clustering_config: ClusteringConfig | None = None,
         optimization_metric: str | None = None,
+        positive_label: Any = None,
     ) -> AutoMLResult:
 
         dataframe = self.load_dataset(
@@ -439,6 +442,7 @@ class AutoMLService:
             task=task,
             clustering_config=clustering_config,
             optimization_metric=optimization_metric,
+            positive_label=positive_label,
         )
 
     # ============================================================
@@ -1447,6 +1451,8 @@ class AutoMLService:
 
         response = {
             "task": result.task,
+
+            **({"model_selection": getattr(result, "model_selection", None)} if result.task == "classification" else {}),
 
             "model_filename": model_filename,
 

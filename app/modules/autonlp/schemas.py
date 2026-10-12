@@ -51,6 +51,7 @@ class AutoNLPDatasetSummary(BaseModel):
     max_sequence_length: int | None = None
     classes: list[str] = Field(default_factory=list)
     class_count: int | None = None
+    class_distribution: dict[str, int] = Field(default_factory=dict)
     text_column: str | None = None
     target_column: str | None = None
     cleaning_summary: dict[str, int] = Field(default_factory=dict)
@@ -147,6 +148,8 @@ class AutoNLPTrainResponse(BaseModel):
     status: str = "completed"
     task: NLPTask
     architecture: NLPArchitecture
+    optimization_metric: str = "macro_f1"
+    optimization_score: float | None = None
     metrics: AutoNLPMetrics
     dataset_summary: AutoNLPDatasetSummary
     training_info: AutoNLPTrainingInfo

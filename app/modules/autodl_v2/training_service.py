@@ -51,6 +51,7 @@ class AutoDLV2TrainingService:
         confirmed_task: str | None = None, confirmed_target: str | None = None,
         confirmed_timestamp: str | None = None, rows_are_ordered: bool = False,
         timestamp_handling: str = "strict",
+        optimization_metric: str | None = None,
     ) -> dict[str, Any]:
         run = self.repository.get_run(run_id, owner_id)
         if sha256_bytes(contents) != run["dataset_hash"]:
@@ -61,6 +62,11 @@ class AutoDLV2TrainingService:
             raise ValueError("Choose and confirm the target and observation order before training.")
         advanced = run.get("advanced_details") or {}
         task = AutoDLV2Task(detected)
+        from app.modules.autodl_v2.constants import CLASSIFICATION_OPTIMIZATION_METRICS, REGRESSION_OPTIMIZATION_METRICS
+        metric_options = (CLASSIFICATION_OPTIMIZATION_METRICS if task.value.endswith("classification") else REGRESSION_OPTIMIZATION_METRICS)
+        optimization_metric = optimization_metric or next(iter(metric_options))
+        if optimization_metric not in metric_options:
+            raise ValueError("Unsupported AutoDL optimization metric for this task.")
         time_series_task = task in {
             AutoDLV2Task.TIME_SERIES_CLASSIFICATION,
             AutoDLV2Task.TIME_SERIES_REGRESSION,
@@ -152,6 +158,7 @@ class AutoDLV2TrainingService:
         )
         configuration = {
             "strategy": strategy, "models": selected, "task": task.value,
+            "optimization_metric": optimization_metric,
             "max_epochs": max_epochs, "batch_size": batch_size,
             "learning_rate": learning_rate, "window_size": window_size,
             "image_size": image_size, "random_seed": random_seed,
@@ -337,8 +344,8 @@ class AutoDLV2TrainingService:
                         "Please use more representative images or adjust the dataset."
                     )
                 raise ValueError("No model completed training with the requested configuration.")
-            leaderboard = self._rank_candidates(task, candidates)
-            eligible_leaderboard = self._rank_candidates(task, eligible_candidates)
+            leaderboard = self._rank_candidates(task, candidates, configuration.get("optimization_metric"))
+            eligible_leaderboard = self._rank_candidates(task, eligible_candidates, configuration.get("optimization_metric"))
             if task == AutoDLV2Task.IMAGE_CLASSIFICATION and not eligible_leaderboard:
                 experimental = leaderboard[0]
                 message = (
@@ -438,6 +445,10 @@ class AutoDLV2TrainingService:
             AutoDLV2Task.TIME_SERIES_CLASSIFICATION,
             AutoDLV2Task.TABULAR_CLASSIFICATION,
         }
+        from app.modules.autodl_v2.constants import CLASSIFICATION_OPTIMIZATION_METRICS, REGRESSION_OPTIMIZATION_METRICS
+        options = CLASSIFICATION_OPTIMIZATION_METRICS if classification else REGRESSION_OPTIMIZATION_METRICS
+        selected_metric = (run.get("training_configuration") or {}).get("optimization_metric") or next(iter(options))
+        selected_field = options[selected_metric]
         clean_leaderboard = []
         for item in run.get("leaderboard") or []:
             metrics = (
@@ -447,8 +458,8 @@ class AutoDLV2TrainingService:
             clean_leaderboard.append({
                 "rank": item["rank"], "model": item["display_name"],
                 "model_key": item["model_key"],
-                "key_metric_name": "Weighted F1" if classification else "RMSE",
-                "key_metric_value": metrics["f1"] if classification else metrics["rmse"],
+                "key_metric_name": selected_metric,
+                "key_metric_value": metrics.get(selected_field),
                 "accuracy": metrics.get("accuracy"), "mae": metrics.get("mae"),
                 "r2": metrics.get("r2"),
                 "selected_winner": bool(prediction_ready and item["model_id"] == winner["_id"]),
@@ -506,9 +517,14 @@ class AutoDLV2TrainingService:
             visual = winner.get("evaluation_visualization") or {
                 "kind": "actual_vs_predicted", "points": [],
             }
+        score_metrics = (winner.get("validation_metrics") or winner["metrics"]) if classification else winner["metrics"]
+        performance["key_metric"] = selected_metric
+        performance["value"] = score_metrics.get(selected_field)
         tried = [item["model"] for item in clean_leaderboard]
         return {
             "run_id": run_id,
+            "optimization_metric": selected_metric,
+            "optimization_score": score_metrics.get(selected_field),
             "problem": {
                 "task": task.value, "display_name": TASK_DISPLAY_NAMES[task],
                 "explanation": run["inspection"]["task_intelligence"]["explanation"],
@@ -984,7 +1000,7 @@ class AutoDLV2TrainingService:
         ]
 
     @staticmethod
-    def _rank_candidates(task: AutoDLV2Task, candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def _rank_candidates(task: AutoDLV2Task, candidates: list[dict[str, Any]], optimization_metric: str | None = None) -> list[dict[str, Any]]:
         classification = task in {
             AutoDLV2Task.IMAGE_CLASSIFICATION,
             AutoDLV2Task.TIME_SERIES_CLASSIFICATION,
@@ -995,10 +1011,19 @@ class AutoDLV2TrainingService:
                 return item.get("validation_metrics") or item["metrics"]
             return item["metrics"]
 
+        from app.modules.autodl_v2.constants import CLASSIFICATION_OPTIMIZATION_METRICS, REGRESSION_OPTIMIZATION_METRICS
+        options = CLASSIFICATION_OPTIMIZATION_METRICS if classification else REGRESSION_OPTIMIZATION_METRICS
+        selected = optimization_metric or next(iter(options))
+        if selected not in options:
+            raise ValueError("Unsupported AutoDL optimization metric.")
+        field = options[selected]
+        direction = -1 if classification or selected == "r2" else 1
+        # Keep the established ordering as tie breakers and preserve eligibility gates.
         ranked = sorted(
             candidates,
-            key=(lambda item: (-ranking_metrics(item)["f1"], -ranking_metrics(item)["accuracy"]))
-            if classification else (lambda item: (item["metrics"]["rmse"], item["metrics"]["mae"])),
+            key=lambda item: (direction * ranking_metrics(item)[field],
+                -ranking_metrics(item)["f1"] if classification else ranking_metrics(item)["rmse"],
+                -ranking_metrics(item)["accuracy"] if classification else ranking_metrics(item)["mae"]),
         )
         return [{"rank": index + 1, **item} for index, item in enumerate(ranked)]
 

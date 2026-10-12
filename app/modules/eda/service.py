@@ -1,6 +1,7 @@
 from __future__ import annotations
 import re
 import shutil
+from hashlib import sha256
 from datetime import UTC, datetime
 from math import ceil
 from pathlib import Path
@@ -70,6 +71,14 @@ class EDAService:
         return user.id
 
     @staticmethod
+    def _dataset_identity(path: Path) -> str:
+        digest = sha256()
+        with path.open("rb") as source:
+            while chunk := source.read(1024 * 1024):
+                digest.update(chunk)
+        return f"sha256:{digest.hexdigest()}"
+
+    @staticmethod
     def _safe_original_name(filename: str | None) -> str:
         name = Path((filename or "upload").replace("\\", "/")).name.strip()
         name = re.sub(r"[^A-Za-z0-9._() -]", "_", name)[:200]
@@ -126,6 +135,7 @@ class EDAService:
             overview = build_overview(frame, final_path.stat().st_size)
             project = EDAProject(
                 owner_id=owner_id,
+                dataset_identity=self._dataset_identity(final_path),
                 original_filename=friendly_name,
                 storage_filename=storage_filename,
                 storage_path=str(final_path),
@@ -175,6 +185,7 @@ class EDAService:
         temp_path = EDA_TEMP_DIRECTORY / f"{storage_filename}.part"
         final_path = EDA_STORAGE_DIRECTORY / storage_filename
         size = 0
+        digest = sha256()
         try:
             with temp_path.open("wb") as output:
                 while chunk := await file.read(UPLOAD_CHUNK_SIZE):
@@ -182,6 +193,7 @@ class EDAService:
                     if size > MAX_UPLOAD_SIZE:
                         raise EDAUploadTooLarge()
                     output.write(chunk)
+                    digest.update(chunk)
             if size == 0:
                 raise EDAInvalidRequest("The uploaded file is empty.")
             self._validate_signature(temp_path, extension)
@@ -190,6 +202,7 @@ class EDAService:
             shutil.move(str(temp_path), str(final_path))
             project = EDAProject(
                 owner_id=self._owner_id(user),
+                dataset_identity=f"sha256:{digest.hexdigest()}",
                 original_filename=original,
                 storage_filename=storage_filename,
                 storage_path=str(final_path),
@@ -370,6 +383,7 @@ class EDAService:
         metadata, _ = create_html_report(
             project, overview, profiles, quality, correlation
         )
+        metadata["dataset_identity"] = project.dataset_identity
         project.reports.append(metadata)
         await self.repository.update(project)
         return {

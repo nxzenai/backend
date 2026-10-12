@@ -10,6 +10,7 @@ class EDAProject(BaseModel):
     id: str | None = None
     owner_id: str
     original_filename: str
+    dataset_identity: str | None = None
     storage_filename: str
     storage_path: str
     extension: str

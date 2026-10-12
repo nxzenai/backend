@@ -13,7 +13,7 @@ from app.core.config.settings import settings
 from app.modules.genai.dependencies import get_genai_service
 from app.modules.genai.exceptions import GenAIException, LlamaModelNotAvailableError
 from app.modules.genai.schemas import (
-    ChatRequest, ChatResponse, ConversationAttachmentSelection, ConversationCreate, ConversationDetail,
+    EvidenceResearchRequest, ChatRequest, ChatResponse, ConversationAttachmentSelection, ConversationCreate, ConversationDetail,
     ConversationProjectUpdate, ConversationSummary, ConversationUpdate, HealthResponse, MemoryCreate,
     MemoryResponse, PreferencesResponse, PreferencesUpdate, ProjectCreate, ProjectResponse,
     ProjectUpdate, AttachmentResponse, ToolStatus,
@@ -150,6 +150,34 @@ async def conversation_detail(
         return json_safe(await service.conversation_detail(conversation_id, _owner(current_user)))
     except GenAIException as exc:
         raise _http_error(exc) from exc
+
+
+@router.get("/conversations/{conversation_id}/evidence/{evidence_id}")
+async def get_evidence(
+    conversation_id: str, evidence_id: str, service: GenAIService = Depends(get_genai_service),
+    current_user: UserModel = Depends(get_current_user),
+):
+    try:
+        record = await service.repository.get_evidence(evidence_id, conversation_id, _owner(current_user))
+        if not record:
+            raise HTTPException(status_code=404, detail="Evidence not found.")
+        from app.modules.genai.evidence_intelligence import EvidenceIntelligence
+        return await EvidenceIntelligence(service.repository, service.lab_adapters).display_record(record, _owner(current_user))
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail="Evidence not found.") from exc
+
+
+@router.post("/conversations/{conversation_id}/evidence/{evidence_id}/research")
+async def validate_evidence_research(
+    conversation_id: str, evidence_id: str, payload: EvidenceResearchRequest,
+    service: GenAIService = Depends(get_genai_service), current_user: UserModel = Depends(get_current_user),
+):
+    from app.modules.genai.evidence_intelligence import EvidenceIntelligence
+    try:
+        return json_safe(await EvidenceIntelligence(service.repository, service.lab_adapters, service.provider).research(
+            _owner(current_user), conversation_id, evidence_id, confirmed=payload.confirmed, refresh=payload.refresh))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.patch("/conversations/{conversation_id}", response_model=ConversationSummary)

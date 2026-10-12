@@ -71,3 +71,7 @@ DEFAULT_LEARNING_RATE = 0.001
 
 MODEL_FILENAME = "model.pt"
 METRICS_FILENAME = "metrics.json"
+
+# Metrics computed for every supported supervised task on the validation split.
+from app.modules.autonlp.metrics import NLPRankingMetric
+OPTIMIZATION_METRICS = ("macro_f1", *(metric.value for metric in NLPRankingMetric))

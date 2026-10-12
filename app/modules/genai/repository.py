@@ -55,6 +55,7 @@ class GenAIRepository:
         self.attachments = database["genai_attachment_metadata"]
         self.attachment_chunks = database["genai_attachment_chunks"]
         self.filesystem = gridfs.GridFS(database.delegate, collection="genai_attachments")
+        self.evidence = database["genai_evidence_intelligence"]
         self.prediction_exports = database["genai_prediction_exports"]
         self.export_filesystem = gridfs.GridFS(database.delegate, collection="genai_prediction_export_files")
 
@@ -72,7 +73,31 @@ class GenAIRepository:
         await self.attachments.create_index([("owner_id", ASCENDING), ("conversation_id", ASCENDING), ("created_at", DESCENDING)])
         await self.attachment_chunks.create_index([("owner_id", ASCENDING), ("attachment_id", ASCENDING), ("chunk_index", ASCENDING)], unique=True)
         await self.prediction_exports.create_index([("owner_id", ASCENDING), ("conversation_id", ASCENDING), ("created_at", DESCENDING)])
+        await self.evidence.create_index([("owner_id", ASCENDING), ("conversation_id", ASCENDING), ("project_id", ASCENDING), ("created_at", DESCENDING)])
         _INDEXES_READY = True
+
+    async def evidence_scope(self, conversation_id: str, owner_id: str) -> dict[str, Any]:
+        conversation = await self.get_conversation(conversation_id, owner_id)
+        if not conversation:
+            raise ValueError("Conversation not found.")
+        project_id = conversation.get("project_id")
+        if project_id and not await self.get_project(project_id, owner_id):
+            raise ValueError("Project not found.")
+        return {"owner_id": owner_id, "conversation_id": conversation_id, "project_id": project_id}
+
+    async def get_evidence(self, evidence_id: str, conversation_id: str, owner_id: str) -> dict[str, Any] | None:
+        scope = await self.evidence_scope(conversation_id, owner_id)
+        return _public(await self.evidence.find_one({"_id": evidence_id, **scope}))
+
+    async def save_native_evidence(self, evidence_id: str, conversation_id: str, owner_id: str, value: dict[str, Any]) -> dict[str, Any]:
+        scope = await self.evidence_scope(conversation_id, owner_id)
+        await self.evidence.update_one({"_id": evidence_id, **scope},
+            {"$setOnInsert": {**value, **scope, "created_at": _now()}}, upsert=True)
+        return await self.get_evidence(evidence_id, conversation_id, owner_id) or {}
+
+    async def list_evidence(self, conversation_id: str, owner_id: str) -> list[dict[str, Any]]:
+        scope = await self.evidence_scope(conversation_id, owner_id)
+        return [_public(item) for item in await self.evidence.find(scope).sort("created_at", -1).limit(5).to_list(length=5)]
 
     async def create_conversation(self, owner_id: str, title: str | None, tier: str, reasoning: str, project_id: str | None = None) -> dict[str, Any]:
         now = _now()
@@ -155,6 +180,23 @@ class GenAIRepository:
             }},
         )
 
+    async def set_dataset_understanding(self, conversation_id: str, owner_id: str, understanding: dict[str, Any]) -> None:
+        reference = str(understanding["dataset_reference"])
+        if not await self.attachments.find_one({"_id": reference, "owner_id": owner_id, "conversation_id": conversation_id}):
+            raise LookupError("Dataset is not bound to this conversation.")
+        await self.conversations.update_one({"_id": conversation_id, "owner_id": owner_id},
+            {"$set": {"dataset_understanding": understanding, "updated_at": _now()}})
+
+    async def cache_dataset_understanding(self, attachment_id: str, owner_id: str, profile: dict[str, Any], semantics: dict[str, Any] | None, confirmed: dict[str, Any]) -> None:
+        await self.attachments.update_one({"_id": attachment_id, "owner_id": owner_id},
+            {"$set": {"dataset_context": {"profile": profile, "semantics": semantics, "confirmed": confirmed}}})
+
+    async def set_native_training_context(self, conversation_id: str, owner_id: str, context: dict[str, Any]) -> None:
+        await self.conversations.update_one(
+            {"_id": conversation_id, "owner_id": owner_id},
+            {"$set": {"native_training_context": context, "updated_at": _now()}},
+        )
+
     async def set_pending_confirmation(
         self, conversation_id: str, owner_id: str, state: dict[str, Any],
     ) -> None:
@@ -196,6 +238,7 @@ class GenAIRepository:
         result = await self.conversations.delete_one({"_id": conversation_id, "owner_id": owner_id})
         if result.deleted_count:
             scope = {"conversation_id": conversation_id, "owner_id": owner_id}
+            await self.evidence.delete_many(scope)
             await self.messages.delete_many(scope)
             await self.summaries.delete_many(scope)
             await self.generations.delete_many(scope)

@@ -173,6 +173,18 @@ class ClassificationResult(
 
     f1_score: float | None = None
 
+    precision_positive: float | None = None
+    recall_positive: float | None = None
+    f1_positive: float | None = None
+    weighted_precision: float | None = None
+    weighted_recall: float | None = None
+    weighted_f1: float | None = None
+    macro_precision: float | None = None
+    macro_recall: float | None = None
+    macro_f1: float | None = None
+
+    positive_label: Any = None
+
     roc_auc: float | None = None
 
     confusion_matrix: list[list[int]] | None = None
@@ -531,6 +543,8 @@ class AutoMLResult:
     timeout_seconds: int = 30
 
     ranking_metric: str | None = None
+
+    model_selection: dict[str, Any] | None = None
 
     clustering: dict[str, Any] | None = None
 
