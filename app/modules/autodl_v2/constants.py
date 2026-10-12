@@ -27,3 +27,8 @@ TASK_DISPLAY_NAMES = {
 
 
 __all__ = ["AutoDLV2Task", "DatasetKind", "TASK_DISPLAY_NAMES"]
+
+
+# Learner-facing metric names map to persisted native evaluation fields.
+CLASSIFICATION_OPTIMIZATION_METRICS = {"weighted_f1": "f1", "accuracy": "accuracy"}
+REGRESSION_OPTIMIZATION_METRICS = {"rmse": "rmse", "mae": "mae", "r2": "r2"}

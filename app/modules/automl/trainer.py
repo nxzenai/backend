@@ -135,6 +135,13 @@ _SELECTION_ORDER = {
 }
 
 
+# Public native metric contract; GenAI consumes this rather than inventing names.
+from app.modules.automl.metrics import CLUSTERING_METRIC_DIRECTIONS, EXPLICIT_CLASSIFICATION_METRICS, binary_positive_label
+_SELECTION_ORDER["classification"].update({key: (key, "f1_score", "accuracy") for key in EXPLICIT_CLASSIFICATION_METRICS})
+OPTIMIZATION_METRICS = {task: tuple(order) for task, order in _SELECTION_ORDER.items()}
+OPTIMIZATION_METRICS["clustering"] = tuple(CLUSTERING_METRIC_DIRECTIONS)
+
+
 def _sort_for_metric(results: list[Any], task: str, metric: str) -> None:
     """Sort fitted results using existing held-out scores, with stable ties."""
     order = _SELECTION_ORDER[task][metric]
@@ -756,6 +763,11 @@ class AutoMLTrainer:
             ),
         }
 
+        if task == AutoMLTask.CLASSIFICATION:
+            metadata["positive_label"] = getattr(result, "positive_label", None)
+            if metadata["prediction_schema"].get("target") is not None:
+                metadata["prediction_schema"]["target"]["positive_label"] = metadata["positive_label"]
+
         feature_importance = (
             self._feature_importance(
                 model,
@@ -850,6 +862,19 @@ class AutoMLTrainer:
             summary=summary,
         )
 
+        model_selection = None
+        if task == AutoMLTask.CLASSIFICATION:
+            from app.modules.automl.selection_quality import select_recommendation
+            try:
+                model_selection = select_recommendation(training_results, best_model, ranking_metric or "f1_score", leaderboard)
+            except Exception:
+                # Recommendation analysis must never invalidate native training.
+                model_selection = {"optimization_winner_model": getattr(best_model, "model_name", None),
+                    "recommended_model": None, "recommendation_status": "ANALYSIS_UNAVAILABLE",
+                    "recommendation_reason": "Recommendation analysis is unavailable for this run.", "quality_warnings": []}
+            if artifact is not None:
+                artifact.metadata["model_selection"] = model_selection
+
         skipped = []
 
         for result in training_results:
@@ -898,6 +923,7 @@ class AutoMLTrainer:
             ),
             clustering=clustering,
             ranking_metric=ranking_metric,
+            model_selection=model_selection,
         )
 
     @staticmethod
@@ -1198,6 +1224,7 @@ class AutoMLTrainer:
         dataframe: pd.DataFrame,
         target_column: str,
         optimization_metric: str | None = None,
+        positive_label: Any = None,
     ) -> AutoMLResult:
 
         task, summary, processed = (
@@ -1208,11 +1235,18 @@ class AutoMLTrainer:
             )
         )
 
+        resolved_positive = binary_positive_label(np.unique(processed.y_train), positive_label)
+        if positive_label is not None and resolved_positive is None:
+            raise ValueError("Positive class must match a native label of a binary target.")
+        if optimization_metric and optimization_metric.endswith("_positive") and resolved_positive is None:
+            raise ValueError("Select a positive class before using positive-class metrics.")
+
         results = train_classification_models(
             X_train=processed.X_train,
             X_test=processed.X_test,
             y_train=processed.y_train,
             y_test=processed.y_test,
+            positive_label=resolved_positive,
             random_state=self.config.random_state,
             excluded_algorithms=(
                 self.config.excluded_algorithms
@@ -1230,9 +1264,15 @@ class AutoMLTrainer:
             if optimization_metric else best_classification_model(results)
         )
 
-        board = classification_leaderboard(
-            results
-        )
+        board = classification_leaderboard(results)
+        if optimization_metric:
+            from app.modules.automl.metrics import classification_leaderboard as rank_models
+            board = rank_models(results, ranking_metric)
+            native_order = {item.model_name: index for index, item in enumerate(results)}
+            board.sort(key=lambda row: native_order.get(row.get("model_name"), len(native_order)))
+            for index, row in enumerate(board):
+                if row.get("rank") is not None:
+                    row["rank"] = index + 1
 
         return self._make_result(
             task=task,
@@ -1285,11 +1325,15 @@ class AutoMLTrainer:
             if optimization_metric else best_regression_model(results)
         )
 
-        board = regression_leaderboard(
-            results
-        )
+        board = regression_leaderboard(results)
+        if optimization_metric:
+            from app.modules.automl.metrics import regression_leaderboard as rank_models
+            board = rank_models(results, ranking_metric)
+            native_order = {item.model_name: index for index, item in enumerate(results)}
+            board.sort(key=lambda row: native_order.get(row.get("model_name"), len(native_order)))
         for rank, row in enumerate(board, start=1):
-            row["rank"] = rank
+            if row.get("rank") is not None:
+                row["rank"] = rank
 
         return self._make_result(
             task=task,
@@ -1311,6 +1355,7 @@ class AutoMLTrainer:
         target_column: str | None = None,
         *,
         clustering_config: ClusteringConfig | None = None,
+        optimization_metric: str | None = None,
     ) -> AutoMLResult:
 
         requested_config = clustering_config or ClusteringConfig()
@@ -1342,13 +1387,12 @@ class AutoMLTrainer:
             clustering_config=effective_config,
         )
 
-        best = best_clustering_model(
-            results
-        )
-
-        board = clustering_leaderboard(
-            results
-        )
+        # Rank the already fitted models using the native metric implementation.
+        from app.modules.automl.metrics import best_clustering_model as select_best, clustering_leaderboard as rank_models
+        metric = optimization_metric or "silhouette_score"
+        eligible = [item for item in results if not effective_config.require_prediction_support or callable(getattr(item.model, "predict", None))]
+        best = select_best(eligible, metric)
+        board = rank_models(results, metric)
 
         clustering = {
             "cluster_count_mode": effective_config.cluster_count_mode,
@@ -1382,6 +1426,7 @@ class AutoMLTrainer:
             best_model=best,
             leaderboard=board,
             clustering=clustering,
+            ranking_metric=metric,
         )
 
     # ============================================================
@@ -1488,6 +1533,7 @@ class AutoMLTrainer:
         task: AutoMLTask | str | None = None,
         clustering_config: ClusteringConfig | None = None,
         optimization_metric: str | None = None,
+        positive_label: Any = None,
     ) -> AutoMLResult:
 
         normalized_target = _normalize_target(
@@ -1505,7 +1551,7 @@ class AutoMLTrainer:
             "r2": "r2_score",
         }.get(optimization_metric, optimization_metric)
 
-        allowed_metrics = _SELECTION_ORDER.get(effective_task.value)
+        allowed_metrics = OPTIMIZATION_METRICS.get(effective_task.value)
         if optimization_metric is not None and allowed_metrics is not None and optimization_metric not in allowed_metrics:
             raise ValueError(
                 f"Invalid optimization_metric '{optimization_metric}' for {effective_task.value}. "
@@ -1532,6 +1578,7 @@ class AutoMLTrainer:
                 dataframe,
                 normalized_target,
                 optimization_metric=optimization_metric,
+                positive_label=positive_label,
             )
 
         if (
@@ -1559,6 +1606,7 @@ class AutoMLTrainer:
                 dataframe,
                 normalized_target,
                 clustering_config=clustering_config,
+                optimization_metric=optimization_metric,
             )
 
         if (

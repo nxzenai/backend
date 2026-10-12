@@ -9,6 +9,7 @@ from app.modules.auth.models import UserModel
 
 
 PATH_MODULES = {
+    "learning": "dashboard",
     "notebooks": "python_lab",
     "execution": "python_lab",
     "python": "python_lab",

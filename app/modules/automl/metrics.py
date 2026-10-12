@@ -133,6 +133,24 @@ class DimensionalityRankingMetric(str, Enum):
     EXPLAINED_VARIANCE = "explained_variance"
 
 
+EXPLICIT_CLASSIFICATION_METRICS = ["precision_positive","recall_positive","f1_positive","weighted_precision","weighted_recall","weighted_f1","macro_precision","macro_recall","macro_f1"]
+
+
+def binary_positive_label(classes: Iterable[Any], selected: Any = None) -> Any:
+    """Resolve an explicit native label, otherwise only the binary 0/1 convention."""
+    values = list(classes)
+    if len(values) != 2:
+        return None
+    if selected is not None:
+        matches = [value for value in values if value == selected or str(value) == str(selected)]
+        return matches[0] if len(matches) == 1 else None
+    if all(isinstance(value, (bool, np.bool_)) for value in values):
+        return next((value for value in values if bool(value)), None)
+    if {str(value) for value in values} in ({"0", "1"}, {"0.0", "1.0"}):
+        return next(value for value in values if str(value) in {"1", "1.0"})
+    return None
+
+
 # ======================================================================
 # GENERIC HELPERS
 # ======================================================================
@@ -344,6 +362,7 @@ def classification_metrics(
     y_pred: Any,
     y_probability: Any = None,
     classes: Iterable[Any] | None = None,
+    positive_label: Any = None,
 ) -> dict[str, Any]:
     """
     Calculate classification metrics.
@@ -370,6 +389,8 @@ def classification_metrics(
         ),
     }
 
+    result.update({key: None for key in EXPLICIT_CLASSIFICATION_METRICS})
+    result["positive_label"] = None
     true_array = _to_numpy(y_true)
 
     pred_array = _to_numpy(y_pred)
@@ -421,9 +442,22 @@ def classification_metrics(
             )
         )
 
+        labels = result["classes"] if result["classes"] is not None else np.unique(np.concatenate([true_array, pred_array])).tolist()
+        result["classes"] = labels
+        positive = binary_positive_label(labels, positive_label)
+        result["positive_label"] = positive
+        for name, scorer, legacy in (("precision", precision_score, "precision"),
+                                     ("recall", recall_score, "recall"), ("f1", f1_score, "f1_score")):
+            result["weighted_" + name] = result[legacy]
+            result["macro_" + name] = _safe_float(scorer(true_array, pred_array, average="macro", zero_division=0))
+            if positive is not None:
+                result[name + "_positive"] = _safe_float(scorer(
+                    true_array, pred_array, average="binary", pos_label=positive, zero_division=0))
+
         matrix = confusion_matrix(
             true_array,
             pred_array,
+            labels=labels,
         )
 
         result["confusion_matrix"] = (
@@ -940,6 +974,7 @@ def build_classification_result(
     y_pred: Any,
     y_probability: Any = None,
     classes: Iterable[Any] | None = None,
+    positive_label: Any = None,
     **metadata: Any,
 ) -> ClassificationResult:
     """
@@ -951,6 +986,7 @@ def build_classification_result(
         y_pred=y_pred,
         y_probability=y_probability,
         classes=classes,
+        positive_label=positive_label,
     )
 
     return ClassificationResult(
@@ -982,6 +1018,8 @@ def build_classification_result(
         classes=metrics[
             "classes"
         ],
+        **{key: metrics.get(key) for key in EXPLICIT_CLASSIFICATION_METRICS},
+        positive_label=metrics.get("positive_label"),
         metadata=metadata,
     )
 
@@ -1190,6 +1228,7 @@ def build_dimensionality_result(
 
 
 CLASSIFICATION_METRIC_DIRECTIONS = {
+    **{key: HIGHER_IS_BETTER for key in EXPLICIT_CLASSIFICATION_METRICS},
     ClassificationRankingMetric.F1_SCORE.value: HIGHER_IS_BETTER,
     ClassificationRankingMetric.ACCURACY.value: HIGHER_IS_BETTER,
     ClassificationRankingMetric.PRECISION.value: HIGHER_IS_BETTER,
@@ -1307,6 +1346,8 @@ def leaderboard_entry(
     ):
         entry.update(
             {
+                **{key: getattr(result, key, None) for key in EXPLICIT_CLASSIFICATION_METRICS},
+                "positive_label": result.positive_label,
                 "accuracy": result.accuracy,
                 "precision": result.precision,
                 "recall": result.recall,

@@ -50,6 +50,8 @@ class ConversationDetail(ConversationSummary):
     pending_prediction: dict[str, Any] | None = None
     pending_confirmation: dict[str, Any] | None = None
     active_lab_resources: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    native_training_context: dict[str, Any] | None = None
+    dataset_understanding: dict[str, Any] | None = None
 
 
 class ChatRequest(BaseModel):
@@ -65,6 +67,11 @@ class ChatRequest(BaseModel):
     confirmed_tools: list[str] = Field(default_factory=list, max_length=10)
     confirmation_id: str | None = Field(default=None, max_length=100)
     tool_arguments: dict[str, dict[str, Any]] = Field(default_factory=dict, max_length=10)
+
+
+class EvidenceResearchRequest(BaseModel):
+    confirmed: bool = False
+    refresh: bool = False
 
 
 class ChatResponse(BaseModel):

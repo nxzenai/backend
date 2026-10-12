@@ -235,7 +235,8 @@ class AutoNLPService:
     def _train_model(self, *, dataframe: pd.DataFrame, filename: str, text_column: str, target_column: str,
                     task: NLPTask, max_epochs: int, owner_id: str, candidate_architectures: list[str] | None = None,
                     strategy: str = "auto", dataset_hash: str = "unknown", source_model_id: str | None = None,
-                    label_display_mapping: dict[str, str] | None = None) -> AutoNLPTrainResponse:
+                    label_display_mapping: dict[str, str] | None = None,
+                    optimization_metric: str = "macro_f1") -> AutoNLPTrainResponse:
         candidates = list(dict.fromkeys(str(value).strip().lower() for value in (candidate_architectures or []) if str(value).strip()))
         self._validate_request(
             dataframe, text_column, target_column, task, max_epochs, strategy, candidates,
@@ -245,7 +246,7 @@ class AutoNLPService:
         result = self.trainer.train(
             text_data=working[text_column].tolist(), labels=working[target_column].tolist(),
             target_column=target_column, candidate_architectures=candidates, max_epochs=max_epochs,
-            strategy=strategy,
+            strategy=strategy, optimization_metric=optimization_metric,
         )
         best = result.best_model
         processed = result.processed_dataset
@@ -322,6 +323,7 @@ class AutoNLPService:
             summary=best.summary, validation_metrics=best.validation_metrics,
             test_metrics=best.test_metrics, readiness=readiness, reliability_reason=reason,
         )
+        result.dataset_summary["class_distribution"] = dict(Counter(clean_labels))
         dataset_summary = AutoNLPDatasetSummary(
             **result.dataset_summary, text_column=text_column, readiness=readiness, reliability_reason=reason,
             label_display_mapping=display_mapping,
@@ -347,6 +349,8 @@ class AutoNLPService:
         )
         stored_result = {
             "status": "completed", "task": task.value, "architecture": architecture.value,
+            "optimization_metric": optimization_metric,
+            "optimization_score": best.validation_metrics.get(optimization_metric),
             "metrics": metrics.model_dump(mode="json"), "dataset_summary": dataset_summary.model_dump(mode="json"),
             "training_info": training_info.model_dump(mode="json"), "training_history": history.model_dump(mode="json"),
             "leaderboard": result.leaderboard, "evaluation": evaluation.model_dump(mode="json"),
@@ -366,7 +370,7 @@ class AutoNLPService:
             configuration={
                 "text_column": text_column, "target_column": target_column, "task": task.value,
                 "dataset_hash": dataset_hash,
-                "max_epochs": max_epochs, "strategy": strategy,
+                "max_epochs": max_epochs, "strategy": strategy, "optimization_metric": optimization_metric,
                 "candidate_architectures": result.requested_architectures, "result": stored_result,
             },
         )

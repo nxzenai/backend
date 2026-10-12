@@ -14,6 +14,7 @@ from app.modules.autonlp.algorithms.classical import (
 from app.modules.autonlp.algorithms.lstm import evaluate_recurrent_model, train_recurrent_model
 from app.modules.autonlp.algorithms.transformer import evaluate_transformer_model, train_transformer_model
 from app.modules.autonlp.embeddings import build_recurrent_embedding_matrix
+from app.modules.autonlp.constants import OPTIMIZATION_METRICS
 from app.modules.autonlp.preprocessing import (
     NLPProcessingConfig, ProcessedNLPDataset, canonical_tokens, preprocess_text_dataset,
 )
@@ -110,7 +111,9 @@ class AutoNLPTrainer:
 
     def train(self, text_data: list[str], labels: list[str], target_column: str,
               candidate_architectures: list[str] | None = None, max_epochs: int = 30, progress_callback=None,
-              strategy: str = "auto") -> AutoNLPResult:
+              strategy: str = "auto", optimization_metric: str = "macro_f1") -> AutoNLPResult:
+        if optimization_metric not in OPTIMIZATION_METRICS:
+            raise ValueError("Unsupported AutoNLP optimization metric.")
         allowed = CLASSICAL_ARCHITECTURES | {"lstm", "bilstm", "gru", "distilbert", "minilm"}
         strategy = strategy.strip().lower()
         if strategy not in {"auto", "custom"}:
@@ -227,6 +230,7 @@ class AutoNLPTrainer:
             reasons = "; ".join(f"{item['architecture']}: {item['reason']}" for item in rejected)
             raise RuntimeError(f"No selected candidate passed the validation quality gate. {reasons}")
         eligible_results.sort(key=lambda item: (
+            -float(item.validation_metrics.get(optimization_metric, 0)),
             -float(item.validation_metrics.get("macro_f1", 0)),
             -float(item.validation_metrics.get("f1_score", 0)),
             -float(item.validation_metrics.get("accuracy", 0)),
@@ -274,7 +278,7 @@ class AutoNLPTrainer:
                 )
         leaderboard = [{
             "rank": rank, "model_name": result.model_name,
-            "score": result.validation_metrics.get("macro_f1"), "accuracy": result.validation_metrics.get("accuracy"),
+            "score": result.validation_metrics.get(optimization_metric), "accuracy": result.validation_metrics.get("accuracy"),
             "precision": result.validation_metrics.get("precision"), "recall": result.validation_metrics.get("recall"),
             "f1_score": result.validation_metrics.get("f1_score"), "macro_f1": result.validation_metrics.get("macro_f1"),
             "validation_loss": result.validation_metrics.get("final_loss"),
@@ -283,7 +287,7 @@ class AutoNLPTrainer:
             "rejection_reason": result.selection_rejection_reason,
         } for rank, result in enumerate(eligible_results, 1)] + [{
             "rank": None, "model_name": result.model_name,
-            "score": result.validation_metrics.get("macro_f1"),
+            "score": result.validation_metrics.get(optimization_metric),
             "accuracy": result.validation_metrics.get("accuracy"),
             "f1_score": result.validation_metrics.get("f1_score"),
             "macro_f1": result.validation_metrics.get("macro_f1"),
@@ -310,7 +314,7 @@ class AutoNLPTrainer:
         return AutoNLPResult(task="text_classification", best_model=winner, leaderboard=leaderboard,
             dataset_summary=summary, processed_dataset=processed, training_results=results,
             recommended_model=winner.model_name,
-            recommendation_reason=f"{winner.model_name} ranked first by validation macro F1, weighted F1, accuracy, then lower loss; the independent test split was not used for ranking.",
+            recommendation_reason=f"{winner.model_name} ranked first by validation {optimization_metric}, with native tie breakers; the independent test split was not used for ranking.",
             requested_architectures=requested_architectures,
             attempted_architectures=list(requested_architectures),
             succeeded_architectures=[item.architecture for item in results],

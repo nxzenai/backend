@@ -37,6 +37,8 @@ from sklearn.linear_model import (
     RidgeClassifier,
     SGDClassifier,
 )
+from app.modules.automl.metrics import EXPLICIT_CLASSIFICATION_METRICS
+
 from sklearn.metrics import (
     accuracy_score,
     confusion_matrix,
@@ -374,60 +376,15 @@ def calculate_metrics(
     predictions: Any,
     scores: Any = None,
     classes: Any = None,
+    positive_label: Any = None,
 ) -> dict[str, Any]:
 
-    y_true = np.asarray(y_true)
-    predictions = np.asarray(predictions)
-
-    if classes is None:
-        classes = np.unique(y_true)
-
-    accuracy = accuracy_score(
-        y_true,
-        predictions,
-    )
-
-    precision = precision_score(
-        y_true,
-        predictions,
-        average="weighted",
-        zero_division=0,
-    )
-
-    recall = recall_score(
-        y_true,
-        predictions,
-        average="weighted",
-        zero_division=0,
-    )
-
-    f1 = f1_score(
-        y_true,
-        predictions,
-        average="weighted",
-        zero_division=0,
-    )
-
-    matrix = confusion_matrix(
-        y_true,
-        predictions,
-        labels=classes,
-    )
-
-    roc_auc = _safe_roc_auc(
-        y_true,
-        scores,
-        classes,
-    )
-
-    return {
-        "accuracy": float(accuracy),
-        "precision": float(precision),
-        "recall": float(recall),
-        "f1_score": float(f1),
-        "roc_auc": roc_auc,
-        "confusion_matrix": matrix,
-    }
+    from app.modules.automl.metrics import classification_metrics
+    values = classification_metrics(y_true, predictions, classes=classes, positive_label=positive_label)
+    native_classes = values["classes"]
+    values["roc_auc"] = _safe_roc_auc(np.asarray(y_true), scores, native_classes)
+    values["confusion_matrix"] = np.asarray(values["confusion_matrix"], dtype=int)
+    return values
 
 
 # ------------------------------------------------------------------
@@ -443,6 +400,7 @@ def _train_single(
     y_test: Any,
     *,
     timeout_seconds: int,
+    positive_label: Any = None,
 ) -> ClassificationResult:
 
     start = time.perf_counter()
@@ -514,6 +472,7 @@ def _train_single(
             predictions,
             scores,
             classes,
+            positive_label=positive_label,
         )
 
         elapsed = (
@@ -550,6 +509,8 @@ def _train_single(
             training_time=float(elapsed),
             success=True,
             status=ModelStatus.SUCCESS,
+            **{key: metrics.get(key) for key in EXPLICIT_CLASSIFICATION_METRICS},
+            positive_label=metrics.get("positive_label"),
             accuracy=metrics["accuracy"],
             precision=metrics["precision"],
             recall=metrics["recall"],
@@ -591,6 +552,7 @@ def safe_train_classifier(
     y_test: Any,
     *,
     timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
+    positive_label: Any = None,
 ) -> ClassificationResult:
 
     return _train_single(
@@ -601,6 +563,7 @@ def safe_train_classifier(
         y_train=y_train,
         y_test=y_test,
         timeout_seconds=timeout_seconds,
+        positive_label=positive_label,
     )
 
 
@@ -617,6 +580,7 @@ def train_classification_models(
     random_state: int = DEFAULT_RANDOM_STATE,
     excluded_algorithms: list[str] | None = None,
     timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
+    positive_label: Any = None,
 ) -> list[ClassificationResult]:
 
     _validate_target(
@@ -663,6 +627,7 @@ def train_classification_models(
                 y_train=y_train,
                 y_test=y_test,
                 timeout_seconds=timeout_seconds,
+                positive_label=positive_label,
             )
         )
 
