@@ -61,6 +61,7 @@ class ChatRequest(BaseModel):
     tools: list[str] = Field(default_factory=list, max_length=10)
     attachment_ids: list[str] = Field(default_factory=list, max_length=50)
     project_id: str | None = Field(default=None, max_length=100)
+    use_project_documents_only: bool = False
     confirmed_tools: list[str] = Field(default_factory=list, max_length=10)
     confirmation_id: str | None = Field(default=None, max_length=100)
     tool_arguments: dict[str, dict[str, Any]] = Field(default_factory=dict, max_length=10)

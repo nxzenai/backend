@@ -117,6 +117,44 @@ class AutoMLTask(str, Enum):
     DIMENSIONALITY = "dimensionality"
 
 
+_SELECTION_ORDER = {
+    "classification": {
+        "accuracy": ("accuracy", "f1_score", "recall", "precision", "roc_auc"),
+        "precision": ("precision", "f1_score", "recall", "accuracy", "roc_auc"),
+        "recall": ("recall", "f1_score", "precision", "accuracy", "roc_auc"),
+        "f1_score": ("f1_score", "accuracy", "roc_auc", "recall", "precision"),
+        "roc_auc": ("roc_auc", "f1_score", "accuracy", "recall", "precision"),
+    },
+    "regression": {
+        "r2_score": ("r2_score", "rmse", "mae"),
+        "mae": ("mae", "rmse", "r2_score"),
+        "mse": ("mse", "rmse", "mae", "r2_score"),
+        "rmse": ("rmse", "mae", "r2_score"),
+        "mape": ("mape", "rmse", "mae", "r2_score"),
+    },
+}
+
+
+def _sort_for_metric(results: list[Any], task: str, metric: str) -> None:
+    """Sort fitted results using existing held-out scores, with stable ties."""
+    order = _SELECTION_ORDER[task][metric]
+
+    def score(result: Any, field: str) -> float:
+        value = getattr(result, field, None)
+        if value is None or not np.isfinite(value):
+            return -np.inf
+        return -float(value) if task == "regression" and field != "r2_score" else float(value)
+
+    results.sort(key=lambda result: str(result.model_name).lower())
+    results.sort(
+        key=lambda result: (
+            int(bool(result.success and result.model is not None and result.status == ModelStatus.SUCCESS)),
+            *(score(result, field) for field in order),
+        ),
+        reverse=True,
+    )
+
+
 # ================================================================
 # TRAINER CONFIG
 # ================================================================
@@ -802,6 +840,7 @@ class AutoMLTrainer:
         best_model: Any,
         leaderboard: list[dict[str, Any]],
         clustering: dict[str, Any] | None = None,
+        ranking_metric: str | None = None,
     ) -> AutoMLResult:
 
         artifact = self._build_model_artifact(
@@ -858,6 +897,7 @@ class AutoMLTrainer:
                 )
             ),
             clustering=clustering,
+            ranking_metric=ranking_metric,
         )
 
     @staticmethod
@@ -1157,6 +1197,7 @@ class AutoMLTrainer:
         self,
         dataframe: pd.DataFrame,
         target_column: str,
+        optimization_metric: str | None = None,
     ) -> AutoMLResult:
 
         task, summary, processed = (
@@ -1181,8 +1222,12 @@ class AutoMLTrainer:
             ),
         )
 
-        best = best_classification_model(
-            results
+        ranking_metric = optimization_metric or "f1_score"
+        if optimization_metric:
+            _sort_for_metric(results, "classification", ranking_metric)
+        best = (
+            next((item for item in results if item.success and item.model is not None and item.status == ModelStatus.SUCCESS), None)
+            if optimization_metric else best_classification_model(results)
         )
 
         board = classification_leaderboard(
@@ -1196,6 +1241,7 @@ class AutoMLTrainer:
             training_results=results,
             best_model=best,
             leaderboard=board,
+            ranking_metric=ranking_metric,
         )
 
     # ============================================================
@@ -1206,6 +1252,7 @@ class AutoMLTrainer:
         self,
         dataframe: pd.DataFrame,
         target_column: str,
+        optimization_metric: str | None = None,
     ) -> AutoMLResult:
 
         task, summary, processed = (
@@ -1230,13 +1277,19 @@ class AutoMLTrainer:
             ),
         )
 
-        best = best_regression_model(
-            results
+        ranking_metric = optimization_metric or "r2_score"
+        if optimization_metric:
+            _sort_for_metric(results, "regression", ranking_metric)
+        best = (
+            next((item for item in results if item.success and item.model is not None and item.status == ModelStatus.SUCCESS), None)
+            if optimization_metric else best_regression_model(results)
         )
 
         board = regression_leaderboard(
             results
         )
+        for rank, row in enumerate(board, start=1):
+            row["rank"] = rank
 
         return self._make_result(
             task=task,
@@ -1245,6 +1298,7 @@ class AutoMLTrainer:
             training_results=results,
             best_model=best,
             leaderboard=board,
+            ranking_metric=ranking_metric,
         )
 
     # ============================================================
@@ -1433,6 +1487,7 @@ class AutoMLTrainer:
         *,
         task: AutoMLTask | str | None = None,
         clustering_config: ClusteringConfig | None = None,
+        optimization_metric: str | None = None,
     ) -> AutoMLResult:
 
         normalized_target = _normalize_target(
@@ -1444,6 +1499,18 @@ class AutoMLTrainer:
             normalized_target,
             requested_task=task,
         )
+
+        optimization_metric = {
+            "f1": "f1_score",
+            "r2": "r2_score",
+        }.get(optimization_metric, optimization_metric)
+
+        allowed_metrics = _SELECTION_ORDER.get(effective_task.value)
+        if optimization_metric is not None and allowed_metrics is not None and optimization_metric not in allowed_metrics:
+            raise ValueError(
+                f"Invalid optimization_metric '{optimization_metric}' for {effective_task.value}. "
+                f"Choose one of: {', '.join(allowed_metrics)}."
+            )
 
         if self.config.verbose:
             print(
@@ -1464,6 +1531,7 @@ class AutoMLTrainer:
             return self.train_classification(
                 dataframe,
                 normalized_target,
+                optimization_metric=optimization_metric,
             )
 
         if (
@@ -1479,6 +1547,7 @@ class AutoMLTrainer:
             return self.train_regression(
                 dataframe,
                 normalized_target,
+                optimization_metric=optimization_metric,
             )
 
         if (

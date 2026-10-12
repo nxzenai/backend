@@ -373,6 +373,7 @@ class AutoMLService:
         *,
         task: AutoMLTask | str | None = None,
         clustering_config: ClusteringConfig | None = None,
+        optimization_metric: str | None = None,
     ) -> AutoMLResult:
 
         if dataframe is None:
@@ -400,6 +401,7 @@ class AutoMLService:
             target_column=target_column,
             task=task,
             clustering_config=clustering_config,
+            optimization_metric=optimization_metric,
         )
 
         if (
@@ -424,6 +426,7 @@ class AutoMLService:
         *,
         task: AutoMLTask | str | None = None,
         clustering_config: ClusteringConfig | None = None,
+        optimization_metric: str | None = None,
     ) -> AutoMLResult:
 
         dataframe = self.load_dataset(
@@ -435,6 +438,7 @@ class AutoMLService:
             target_column=target_column,
             task=task,
             clustering_config=clustering_config,
+            optimization_metric=optimization_metric,
         )
 
     # ============================================================
@@ -819,7 +823,9 @@ class AutoMLService:
 
         try:
             if result.task == "classification":
-                from sklearn.metrics import auc, roc_curve
+                from sklearn.metrics import (
+                    auc, average_precision_score, precision_recall_curve, roc_curve,
+                )
 
                 X_test = processed.X_test
                 y_test = np.asarray(processed.y_test)
@@ -830,8 +836,10 @@ class AutoMLService:
                     return {}
                 if callable(getattr(model, "predict_proba", None)):
                     scores = np.asarray(evaluate("predict_proba", X_test))
+                    score_type = "probability"
                 elif callable(getattr(model, "decision_function", None)):
                     scores = np.asarray(evaluate("decision_function", X_test))
+                    score_type = "decision"
                 else:
                     return {}
 
@@ -858,7 +866,49 @@ class AutoMLService:
                             for i in sample
                         ],
                     })
-                return {"roc_curves": curves} if curves else {}
+                visuals: dict[str, Any] = {"roc_curves": curves} if curves else {}
+                if len(classes) == 2:
+                    try:
+                        positive_scores = scores if scores.ndim == 1 else scores[:, 1]
+                        positive_target = (y_test == classes[1]).astype(int)
+                        if len(np.unique(positive_target)) == 2:
+                            precision, recall, thresholds = precision_recall_curve(
+                                positive_target, positive_scores
+                            )
+                            indexes = np.unique(np.linspace(
+                                0, len(recall) - 1, min(250, len(recall)), dtype=int
+                            ))
+                            visuals["precision_recall_curve"] = {
+                                "positive_class": classes[1],
+                                "average_precision": float(average_precision_score(
+                                    positive_target, positive_scores
+                                )),
+                                "points": [
+                                    {"recall": float(recall[i]), "precision": float(precision[i])}
+                                    for i in reversed(indexes)
+                                ],
+                            }
+                            if len(thresholds):
+                                threshold_indexes = np.unique(np.linspace(
+                                    0, len(thresholds) - 1,
+                                    min(75, len(thresholds)), dtype=int,
+                                ))
+                                visuals["threshold_metrics"] = [
+                                    {
+                                        "threshold": float(thresholds[i]),
+                                        "precision": float(precision[i]),
+                                        "recall": float(recall[i]),
+                                        "f1": float(
+                                            2 * precision[i] * recall[i]
+                                            / (precision[i] + recall[i])
+                                        ) if precision[i] + recall[i] else 0.0,
+                                    }
+                                    for i in threshold_indexes
+                                ]
+                                visuals["threshold_score_type"] = score_type
+                    except Exception:
+                        pass
+                return visuals
 
             if result.task == "regression":
                 actual = np.asarray(processed.y_test, dtype=float)
@@ -898,7 +948,7 @@ class AutoMLService:
                     coordinates = matrix[:, :2]
                 count = min(1000, len(coordinates))
                 indexes = np.linspace(0, len(coordinates) - 1, count, dtype=int)
-                return {
+                visuals = {
                     "cluster_points": [
                         {
                             "x": float(coordinates[i, 0]),
@@ -909,6 +959,39 @@ class AutoMLService:
                     ],
                     "reduced_with_pca": reduced_with_pca,
                 }
+                try:
+                    from sklearn.base import clone
+                    from sklearn.cluster import KMeans
+                    from sklearn.metrics import silhouette_score
+
+                    if isinstance(model, KMeans) and matrix.shape[0] >= 3 and matrix.shape[1] <= 128:
+                        row_count = min(300, len(matrix))
+                        sample_indexes = np.random.default_rng(result.random_state).choice(
+                            len(matrix), size=row_count, replace=False,
+                        )
+                        sample_matrix = matrix[sample_indexes]
+                        if np.isfinite(sample_matrix).all():
+                            diagnostics = []
+                            for k in range(2, min(8, row_count - 1) + 1):
+                                candidate = clone(model).set_params(
+                                    n_clusters=k, n_init=3, max_iter=100,
+                                )
+                                fitted_labels = candidate.fit_predict(sample_matrix)
+                                silhouette = (
+                                    float(silhouette_score(sample_matrix, fitted_labels))
+                                    if 1 < len(np.unique(fitted_labels)) < row_count
+                                    else None
+                                )
+                                diagnostics.append({
+                                    "k": k,
+                                    "inertia": float(candidate.inertia_),
+                                    "silhouette": silhouette,
+                                })
+                            visuals["cluster_k_diagnostics"] = diagnostics
+                            visuals["cluster_k_rows_used"] = row_count
+                except Exception:
+                    pass
+                return visuals
         except Exception:
             return {}
 
@@ -1244,31 +1327,19 @@ class AutoMLService:
             f"Best model: {best.model_name}.",
         ]
 
-        if result.task == "classification":
-
-            if getattr(
-                best,
-                "f1_score",
-                None,
-            ) is not None:
-
-                recommendations.append(
-                    "F1-score was used as the primary "
-                    "classification selection metric."
-                )
-
-        elif result.task == "regression":
-
-            if getattr(
-                best,
-                "r2_score",
-                None,
-            ) is not None:
-
-                recommendations.append(
-                    "R² was used as the primary "
-                    "regression selection metric."
-                )
+        if result.task in {"classification", "regression"}:
+            metric = result.ranking_metric or (
+                "f1_score" if result.task == "classification" else "r2_score"
+            )
+            metric_label = {
+                "f1_score": "F1-score", "r2_score": "R²",
+                "roc_auc": "ROC-AUC", "mae": "MAE", "mse": "MSE", "rmse": "RMSE",
+                "mape": "MAPE",
+            }.get(metric, metric.replace("_", " ").title())
+            recommendations.append(
+                f"{metric_label} was used as the primary "
+                f"{result.task} selection metric."
+            )
 
         elif result.task == "clustering":
 
@@ -1461,8 +1532,23 @@ class AutoMLService:
                 result.excluded_algorithms,
         }
 
+        if result.task in {"classification", "regression"}:
+            response["ranking_metric"] = result.ranking_metric
+
         if result.task == "clustering":
             response["clustering"] = result.clustering
+            labels = getattr(result.best_model, "labels", None)
+            if labels is not None and len(labels):
+                cluster_ids, counts = np.unique(np.asarray(labels), return_counts=True)
+                total = int(counts.sum())
+                response["cluster_distribution"] = [
+                    {
+                        "cluster_id": cluster_id,
+                        "count": int(count),
+                        "percentage": float(count / total * 100),
+                    }
+                    for cluster_id, count in zip(cluster_ids, counts)
+                ]
 
         return _json_safe(
             response
