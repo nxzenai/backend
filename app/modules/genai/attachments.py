@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import logging
 import re
 import zipfile
 from pathlib import Path
@@ -263,18 +264,35 @@ def source_title(item: dict[str, Any]) -> str:
     return f"{filename} · Chunk {index + 1}" if isinstance(index, int) and index >= 0 else filename
 
 
-def assemble_source_evidence(chunks: list[dict[str, Any]], max_chars: int = 18000) -> tuple[str, list[dict[str, str]]]:
-    """Cite only passages that actually fit in the supplied model context."""
+def assemble_source_evidence(chunks: list[dict[str, Any]], max_chars: int = 18000) -> tuple[str, list[dict[str, Any]]]:
+    """Preserve provenance only for bounded passages actually supplied to generation."""
+    from app.modules.genai.schemas import DocumentCitation
+
     if not chunks:
         return "", []
     per_chunk_chars = max(200, 17000 // len(chunks) - 250)
     passages: list[str] = []
-    citations: list[dict[str, str]] = []
-    seen: set[tuple[str, str]] = set()
+    citations: list[dict[str, Any]] = []
+    seen: set[tuple[Any, ...]] = set()
     used = 0
     for item in chunks:
-        title = source_title(item)
-        heading = f"{title[:180]}:\n"
+        source = item.get("source") or {}
+        document_id = str(item.get("attachment_id") or "")
+        filename = str(item.get("filename") or "").strip()
+        page = source.get("page_start", source.get("page_number"))
+        page = page if type(page) is int and page > 0 else None
+        page_end = source.get("page_end")
+        page_end = page_end if type(page_end) is int and page is not None and page_end >= page else None
+        section = str(source.get("section") or "").strip() or None
+        chapter = str(source.get("chapter") or "").strip() or None
+        # Location metadata is taken verbatim from extraction, never guessed from prose/filename.
+        citation_id = f"D{len(citations) + 1}"
+        title = filename or "Document passage"
+        if page is not None:
+            title += f" · Page {page}" if page_end in (None, page) else f" · Pages {page}-{page_end}"
+        if section or chapter:
+            title += " · " + " · ".join(value for value in (section, chapter) if value)
+        heading = f"[{citation_id}] {title[:180]}:\n" if filename and document_id else title[:180] + ":\n"
         separator = 2 if passages else 0
         available = max_chars - used - separator - len(heading)
         if available <= 0:
@@ -282,11 +300,26 @@ def assemble_source_evidence(chunks: list[dict[str, Any]], max_chars: int = 1800
         content = str(item.get("content") or "")[:min(per_chunk_chars, available)]
         if not content.strip():
             continue
+        key = (document_id, page, page_end, " ".join((section or "").casefold().split()),
+               " ".join((chapter or "").casefold().split()), " ".join(content.split()))
+        if key in seen:
+            continue
+        seen.add(key)
         passages.append(heading + content)
         used += separator + len(heading) + len(content)
-        citation_key = (str(item.get("attachment_id")), title)
-        if citation_key not in seen:
-            seen.add(citation_key)
-            anchor = "metadata" if item.get("kind") == "metadata" else f"chunk-{item['chunk_index']}"
-            citations.append({"title": title, "url": f"attachment:{item['attachment_id']}#{anchor}"})
+        if not filename or not document_id:
+            logging.getLogger(__name__).warning("Document evidence has no usable citation metadata")
+            continue
+        index = item.get("chunk_index")
+        anchor = "metadata" if item.get("kind") == "metadata" else f"chunk-{index}" if isinstance(index, int) else "passage"
+        citation = DocumentCitation(
+            citation_id=citation_id, citation_label=f"[{citation_id}]", document_id=document_id,
+            document_name=filename, title=title, url=f"attachment:{document_id}#{anchor}",
+            source_type="project_document" if item.get("project_id") else "knowledge_base_document",
+            page_number=page, page_end=page_end, section=section, chapter=chapter,
+            chunk_id=str(item.get("chunk_id") or item.get("_id") or f"{document_id}:{anchor}"),
+            project_id=str(item["project_id"]) if item.get("project_id") else None,
+            excerpt=content[:600],
+        )
+        citations.append(citation.model_dump(exclude_none=True))
     return "\n\n".join(passages), citations
