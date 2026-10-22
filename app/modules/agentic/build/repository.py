@@ -30,6 +30,7 @@ def _public(document: dict[str, Any] | None) -> dict[str, Any] | None:
     result.pop("log_bytes", None)
     result.pop("active", None)
     result.pop("worker_slot", None)
+    result.pop("private_candidate", None)
     return result
 
 
@@ -80,7 +81,7 @@ class AgenticBuildRepository:
             unique=True,
         )
 
-    async def create_build(self, owner_id: str, project_id: str, version_id: str) -> dict[str, Any] | None:
+    async def create_build(self, owner_id: str, project_id: str, version_id: str, *, private_candidate: bool = False, candidate_worker: str | None = None) -> dict[str, Any] | None:
         document = {
             "_id": str(uuid.uuid4()),
             "owner_id": owner_id,
@@ -103,13 +104,22 @@ class AgenticBuildRepository:
             "active": True,
             "worker_slot": 1,
         }
+        if private_candidate:
+            document["private_candidate"] = True
+        if candidate_worker:
+            now = _now()
+            document.update(status=BuildStatus.RUNNING.value, stage=BuildStage.PREPARING.value,
+                            attempt=1, private_candidate=True, started_at=now, lease_owner=candidate_worker,
+                            lease_expires_at=now + timedelta(seconds=settings.agentic_build_lease_seconds),
+                            heartbeat_at=now)
+            # Private in-memory candidates cannot be requeued after a process crash.
         try:
             await self.builds.insert_one(document)
         except DuplicateKeyError:
             return None
         await self.append_event(
             document["_id"], owner_id, "build.created", BuildStage.QUEUED.value,
-            "Build queued for the Agentic Docker worker.",
+            "Candidate build claimed for generation verification." if candidate_worker else "Build queued for the Agentic Docker worker.",
         )
         return _public(document)
 
@@ -220,7 +230,7 @@ class AgenticBuildRepository:
                 "status": BuildStatus.RUNNING.value,
                 "lease_expires_at": {"$lt": now},
                 "cancel_requested": False,
-                "attempt": {"$gte": 2},
+                "$or": [{"attempt": {"$gte": 2}}, {"private_candidate": True}],
             },
             {"$set": {
                 "status": BuildStatus.FAILED.value,
@@ -239,6 +249,7 @@ class AgenticBuildRepository:
                 "lease_expires_at": {"$lt": now},
                 "cancel_requested": False,
                 "attempt": {"$lt": 2},
+                "private_candidate": {"$ne": True},
             },
             {"$set": {
                 "status": BuildStatus.QUEUED.value,

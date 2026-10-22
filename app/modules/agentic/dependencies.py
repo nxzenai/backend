@@ -26,7 +26,11 @@ async def get_agentic_version_service(
     repository = AgenticRepository(database)
     await repository.ensure_indexes()
     planning_service = AgenticService(repository, GenAIRepository(database))
-    return AgenticVersionService(repository, planning_service)
+    from app.modules.agentic.build.candidate import CandidateBuildVerifier
+    build_repository = AgenticBuildRepository(database)
+    await build_repository.ensure_indexes()
+    return AgenticVersionService(repository, planning_service,
+                                 build_verifier=CandidateBuildVerifier(build_repository, repository))
 
 
 async def get_agentic_build_service(

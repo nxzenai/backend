@@ -205,10 +205,12 @@ class AgenticVersionService:
         repository: AgenticRepository,
         planning_service: AgenticService,
         generator: ApplicationGenerator | None = None,
+        build_verifier=None,
     ):
         self.repository = repository
         self.planning_service = planning_service
         self.generator = generator or ApplicationGenerator()
+        self.build_verifier = build_verifier
 
     async def _project(self, project_id: str, owner_id: str) -> dict[str, Any]:
         return await self.planning_service.get_project(project_id, owner_id)
@@ -246,15 +248,26 @@ class AgenticVersionService:
             project_id, owner_id, {"status": ProjectStatus.GENERATING.value}
         )
         try:
+            if self.build_verifier is None:
+                raise GenerationOutputError("Application build verification is unavailable.")
+            architecture = ArchitecturePlan.model_validate(plan["plan"])
             context = await self.planning_service.attachment_context(project, owner_id)
             async with asyncio.timeout(GENERATION_TIMEOUT_SECONDS):
                 bundle = await self.generator.generate(
                     project_name=str(project["name"]),
                     problem_statement=str(project["problem_statement"]),
-                    plan=ArchitecturePlan.model_validate(plan["plan"]),
+                    plan=architecture,
                     attachment_context=context,
                 )
-            files = validate_generated_files(bundle)
+                for repair_cycle in range(3):
+                    files = validate_generated_files(bundle)
+                    outcome = await self.build_verifier.verify(owner_id, project_id, version_id, files)
+                    if outcome["passed"]:
+                        break
+                    if repair_cycle == 2 or not outcome.get("paths"):
+                        raise GenerationOutputError("Application build verification failed; no ready version was published.")
+                    bundle = await self.generator.repair(bundle, architecture, outcome["paths"], outcome.get("logs", ""))
+            await self.repository.discard_version_files(version_id, owner_id)
             await self.repository.save_files(project_id, version_id, owner_id, files)
             ready_version = await self.repository.complete_version(
                 version_id, project_id, owner_id, bundle.manifest.model_dump(mode="json")
@@ -268,12 +281,17 @@ class AgenticVersionService:
             if not updated:
                 raise RuntimeError("The generated version could not be linked to its project.")
             return ready_version
+        except asyncio.CancelledError:
+            await self.repository.discard_version_files(version_id, owner_id)
+            await self.repository.fail_version(version_id, project_id, owner_id, "Application generation cancelled.")
+            await self.repository.update_project(project_id, owner_id, {"status": ProjectStatus.GENERATION_FAILED.value})
+            raise
         except (GenerationOutputError, GeneratedSourceError) as exc:
             message = str(exc)
         except TimeoutError:
             message = "Application generation timed out."
-        except Exception as exc:
-            message = f"Application generation failed: {type(exc).__name__}: {exc}"
+        except Exception:
+            message = "Application generation failed; no ready version was published."
         await self.repository.discard_version_files(version_id, owner_id)
         await self.repository.fail_version(version_id, project_id, owner_id, message)
         await self.repository.update_project(

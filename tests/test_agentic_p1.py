@@ -200,8 +200,10 @@ async def test_malformed_planner_response_is_rejected():
             return '{"application": "not a plan"}'
 
     class Router:
-        def route(self, *args):
-            return object(), "test"
+        def route(self, *args, **kwargs):
+            from app.modules.agentic.model_router import AgenticModelRouter
+            from test_agentic_openrouter import configuration
+            return AgenticModelRouter(configuration()).route(*args, **kwargs)
 
     with pytest.raises(PlannerOutputError):
         await ArchitecturePlanner(Provider(), Router()).generate(

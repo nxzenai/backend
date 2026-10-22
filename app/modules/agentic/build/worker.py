@@ -183,7 +183,13 @@ async def run_worker(*, once: bool = False) -> None:
             await build_repository.recover_expired()
             build = await build_repository.claim_next(worker_id)
             if build:
-                await execute_claimed_build(build, build_repository, build_service, worker_id)
+                source_service = build_service
+                if build.get("private_candidate"):
+                    from app.modules.agentic.build.candidate import PrivateCandidateSource
+                    source_service = PrivateCandidateSource(
+                        agentic_repository, str(build["owner_id"]), str(build["project_id"]), str(build["version_id"])
+                    )
+                await execute_claimed_build(build, build_repository, source_service, worker_id)
             if once:
                 return
             await asyncio.sleep(settings.agentic_build_poll_seconds)

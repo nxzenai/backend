@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from pydantic import ValidationError
 from typing import Any
 
 from app.modules.agentic.constants import PLANNER_SCHEMA_VERSION, ProjectStatus
@@ -184,6 +185,20 @@ class AgenticService:
         plan_id = project.get("current_plan_id")
         if not plan_id:
             raise AgenticError("No architecture plan is ready for approval.")
+        candidate = await self.repository.get_plan(project_id, plan_id, owner_id)
+        if not candidate:
+            raise AgenticError("Architecture plan not found.", 404, "AGENTIC_PLAN_NOT_FOUND")
+        from app.modules.agentic.generator import validate_generation_compatibility, GenerationOutputError
+        try:
+            validate_generation_compatibility(ArchitecturePlan.model_validate(candidate["plan"]))
+        except ValidationError as exc:
+            error = exc.errors(include_input=False, include_url=False)[0]
+            location = ".".join(str(part) for part in error["loc"])
+            raise AgenticError(f"Plan is incompatible with generation: {location}: {error['msg']}. Revise before approval.",
+                               422, "AGENTIC_PLAN_INCOMPATIBLE") from None
+        except GenerationOutputError as exc:
+            raise AgenticError(f"Plan is incompatible with generation: {exc} Revise before approval.",
+                               422, "AGENTIC_PLAN_INCOMPATIBLE") from None
         plan = await self.repository.approve_plan(plan_id, project_id, owner_id)
         if not plan:
             raise AgenticError("Architecture plan not found.", 404, "AGENTIC_PLAN_NOT_FOUND")

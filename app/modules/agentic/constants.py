@@ -1,5 +1,6 @@
 import os
 from enum import Enum
+from typing import Literal
 
 
 PLANNER_SCHEMA_VERSION = "1.0"
@@ -33,3 +34,23 @@ class VersionStatus(str, Enum):
     GENERATING = "generating"
     READY = "ready"
     FAILED = "failed"
+
+# Shared Agentic V1 contract: P1 planning and P2 generation use the same values.
+MAX_APPLICATION_NAME = 160
+MAX_CONTRACT_NAME = 120
+MAX_SUMMARY = 2000
+MAX_ROLE = 500
+MAX_CONTRACT_TEXT = 1000
+ToolType = Literal["document_search", "csv_analysis", "calculator", "knowledge_retrieval", "report_generation", "http_api", "sql_query"]
+FrontendFramework = Literal["Next.js"]
+BackendFramework = Literal["FastAPI"]
+ApiMethod = Literal["GET", "POST", "PUT", "PATCH", "DELETE"]
+TOOL_TYPE_ALIASES = {"retrieval": "knowledge_retrieval"}
+TOOL_CONFIGURATION = {
+    "document_search": ["document_source"], "csv_analysis": ["csv_path"],
+    "knowledge_retrieval": ["knowledge_source"], "http_api": ["endpoint"],
+    "sql_query": ["connection_string"], "calculator": [], "report_generation": [],
+}
+
+def normalize_tool_type(value):
+    return TOOL_TYPE_ALIASES.get(value, value) if isinstance(value, str) else value

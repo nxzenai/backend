@@ -24,6 +24,10 @@ The JSON MUST exactly match the supplied schema:
 - preserve required nested objects
 - arrays must use the correct object/string types
 
+Use only the tool-type enum and Next.js/FastAPI framework values in the schema.
+Every endpoint must define request_schema and response_schema using supported JSON types.
+Use unique method/path pairs, safe absolute API paths, and the schema length limits.
+
 Solve only the stated business problem.
 Use the minimum useful number of agents.
 Avoid unnecessary multi-agent complexity.

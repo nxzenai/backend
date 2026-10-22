@@ -33,7 +33,7 @@ def configuration(**changes):
     return SimpleNamespace(**values)
 
 
-def test_last_resort_setting_defaults_to_openrouter_free():
+def test_last_resort_setting_defaults_to_free_router():
     field = Settings.model_fields["agentic_last_resort_model"]
     assert field.default == "openrouter/free"
     assert field.alias == "AGENTIC_LAST_RESORT_MODEL"
@@ -62,7 +62,7 @@ def test_agentic_routing_is_openrouter_only_and_has_separate_output_budgets():
     {"agentic_coder_model": "https://openrouter.ai/example/coder:free"},
     {"agentic_fallback_model": "example/fallback:paid"},
     {"agentic_last_resort_model": "example/paid"},
-    {"agentic_last_resort_model": "example/other:free"},
+    {"agentic_last_resort_model": "example/other:paid"},
     {"agentic_allow_paid_models": True},
 ])
 def test_non_free_or_unconfigured_agentic_routing_fails_closed(changes):
@@ -270,3 +270,198 @@ async def test_malformed_planner_output_does_not_trigger_model_fallback():
             name="Support", problem_statement="Improve support outcomes."
         )
     assert provider.models == ["example/planner:free", "example/planner:free"]
+
+
+def test_generation_free_model_defaults():
+    assert Settings.model_fields["agentic_coder_model"].default == "cohere/north-mini-code:free"
+    assert Settings.model_fields["agentic_fallback_model"].default == "nvidia/nemotron-3.5-lightning:free"
+    assert Settings.model_fields["agentic_last_resort_model"].default == "openrouter/free"
+    assert Settings.model_fields["agentic_planner_model"].default == ""
+
+
+@pytest.mark.asyncio
+async def test_timed_out_primary_then_429_advances_once_to_last_resort():
+    import asyncio
+    class Provider:
+        def __init__(self):
+            self.models = []
+        async def complete(self, config, *args, **kwargs):
+            self.models.append(config.model)
+            if len(self.models) == 1:
+                await asyncio.Event().wait()
+            if len(self.models) == 2:
+                raise provider_error(429)
+            return '{"ok": true}'
+    provider = Provider()
+    diagnostics = []
+    result = await complete_agentic(provider, AgenticModelRouter(configuration()), "coder", [],
+        ReasoningLevel.DEEP, timeout_seconds=0.01, stage="scaffold", diagnostics=diagnostics)
+    assert result == '{"ok": true}'
+    assert provider.models == ["example/coder:free", "example/fallback:free", "openrouter/free"]
+    assert [item["outcome"] for item in diagnostics] == ["TIMEOUT", "HTTP_429", "SUCCESS"]
+    assert all(item["stage"] == "scaffold" for item in diagnostics)
+
+
+@pytest.mark.asyncio
+async def test_all_attempt_timeouts_are_bounded_and_recorded():
+    import asyncio
+    class Provider:
+        def __init__(self):
+            self.models = []
+        async def complete(self, config, *args, **kwargs):
+            self.models.append(config.model)
+            await asyncio.Event().wait()
+    provider = Provider()
+    diagnostics = []
+    with pytest.raises(AgenticCompletionError):
+        await complete_agentic(provider, AgenticModelRouter(configuration()), "coder", [],
+            ReasoningLevel.DEEP, timeout_seconds=0.01, stage="application", diagnostics=diagnostics)
+    assert len(provider.models) == len(set(provider.models)) == 3
+    assert [item["outcome"] for item in diagnostics] == ["TIMEOUT"] * 3
+
+
+def test_availability_first_coder_routes_accept_free_router_and_reject_paid():
+    router = AgenticModelRouter(configuration(
+        agentic_coder_model="openrouter/free",
+        agentic_fallback_model="cohere/north-mini-code:free",
+        agentic_last_resort_model="nvidia/nemotron-3.5-lightning:free"))
+    assert [router.route(route, for_task="coder")[0].model for route in ("coder", "fallback", "last_resort")] == [
+        "openrouter/free", "cohere/north-mini-code:free", "nvidia/nemotron-3.5-lightning:free"]
+    assert router.route("planner")[0].model == "example/planner:free"
+    for field in ("agentic_coder_model", "agentic_fallback_model", "agentic_last_resort_model"):
+        with pytest.raises(AgenticConfigurationError):
+            AgenticModelRouter(configuration(**{field: "example/model:paid"})).route("coder")
+
+
+@pytest.mark.asyncio
+async def test_provider_attempts_are_clamped_to_remaining_stage_budget(monkeypatch):
+    from app.modules.agentic import model_router
+    limits = []
+    times = iter([10.0, 10.03])
+    async def capture_wait_for(awaitable, timeout):
+        limits.append(timeout)
+        return await awaitable
+    monkeypatch.setattr(model_router, "asyncio", SimpleNamespace(
+        get_running_loop=lambda: SimpleNamespace(time=lambda: next(times)), wait_for=capture_wait_for))
+    class Provider:
+        def __init__(self):
+            self.models = []
+        async def complete(self, config, *args, **kwargs):
+            self.models.append(config.model)
+            if len(self.models) == 1:
+                raise TimeoutError("primary timed out")
+            return '{"ok": true}'
+    provider = Provider()
+    result = await complete_agentic(provider, AgenticModelRouter(configuration()), "coder", [], ReasoningLevel.DEEP,
+        timeout_seconds=0.03, deadline=10.04)
+    assert result == '{"ok": true}'
+    assert len(provider.models) == 2
+    assert limits == pytest.approx([0.03, 0.01])
+
+
+CODER_ROUTES = ['cohere/north-mini-code:free', 'nvidia/nemotron-3.5-lightning:free', 'openrouter/free']
+
+
+def coding_configuration():
+    return configuration(agentic_coder_model=CODER_ROUTES[0], agentic_fallback_model=CODER_ROUTES[1],
+                         agentic_last_resort_model=CODER_ROUTES[2])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('timeouts_before_success', [1, 2])
+async def test_coder_timeouts_reach_each_next_route_and_success_stops(timeouts_before_success):
+    import asyncio
+    models = []
+    class Provider:
+        async def complete(self, config, *args, **kwargs):
+            models.append(config.model)
+            if len(models) <= timeouts_before_success:
+                await asyncio.Event().wait()
+            return '{"content":"source"}'
+    diagnostics = []
+    deadline = asyncio.get_running_loop().time() + 0.2
+    result = await complete_agentic(Provider(), AgenticModelRouter(coding_configuration()), 'coder', [],
+        ReasoningLevel.DEEP, timeout_seconds=0.01, deadline=deadline, stage='backend', diagnostics=diagnostics)
+    assert result == '{"content":"source"}'
+    assert models == CODER_ROUTES[:timeouts_before_success+1]
+    assert len(models) == len(set(models))
+    assert [item['outcome'] for item in diagnostics] == ['TIMEOUT'] * timeouts_before_success + ['SUCCESS']
+    assert asyncio.get_running_loop().time() < deadline
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('stage', ['backend','agents','frontend','repair'])
+async def test_three_coder_attempts_fit_within_120_seconds(stage, monkeypatch):
+    from app.modules.agentic import model_router
+    from app.modules.agentic.generator import STAGE_TIMEOUTS, PROVIDER_ATTEMPT_TIMEOUT_SECONDS
+    assert all(limit == 120.0 for limit in STAGE_TIMEOUTS.values())
+    assert PROVIDER_ATTEMPT_TIMEOUT_SECONDS == model_router.CODER_ATTEMPT_TIMEOUT_SECONDS == 35.0
+    clock = [0.0]
+    limits, models, diagnostics = [], [], []
+    async def timed_out(awaitable, timeout):
+        limits.append(timeout)
+        awaitable.close()
+        clock[0] += timeout
+        raise TimeoutError('mock provider timeout')
+    monkeypatch.setattr(model_router, 'asyncio', SimpleNamespace(
+        get_running_loop=lambda: SimpleNamespace(time=lambda: clock[0]), wait_for=timed_out))
+    class Provider:
+        def complete(self, config, *args, **kwargs):
+            models.append(config.model)
+            async def pending(): pass
+            return pending()
+    with pytest.raises(AgenticCompletionError):
+        await complete_agentic(Provider(), AgenticModelRouter(coding_configuration()), 'coder', [],
+            ReasoningLevel.DEEP, timeout_seconds=60, deadline=120, stage=stage, diagnostics=diagnostics)
+    assert models == CODER_ROUTES and len(set(models)) == 3
+    assert limits == [35.0,35.0,35.0]
+    assert clock[0] == 105.0 and 120-clock[0] == 15.0
+    assert [item['outcome'] for item in diagnostics] == ['TIMEOUT'] * 3
+
+
+@pytest.mark.asyncio
+async def test_coder_remaining_budget_clamps_cap_and_stops_at_deadline(monkeypatch):
+    from app.modules.agentic import model_router
+    clock, limits, models = [110.0], [], []
+    async def timed_out(awaitable, timeout):
+        limits.append(timeout)
+        awaitable.close()
+        clock[0] += timeout
+        raise TimeoutError('mock provider timeout')
+    monkeypatch.setattr(model_router, 'asyncio', SimpleNamespace(
+        get_running_loop=lambda: SimpleNamespace(time=lambda: clock[0]), wait_for=timed_out))
+    class Provider:
+        def complete(self, config, *args, **kwargs):
+            models.append(config.model)
+            async def pending(): pass
+            return pending()
+    with pytest.raises(TimeoutError, match='stage budget exhausted'):
+        await complete_agentic(Provider(), AgenticModelRouter(coding_configuration()), 'coder', [],
+            ReasoningLevel.DEEP, deadline=120, stage='frontend')
+    assert limits == [10.0] and clock[0] == 120.0
+    assert models == CODER_ROUTES[:1]
+
+
+@pytest.mark.asyncio
+async def test_structured_repair_uses_only_remaining_buffer(monkeypatch):
+    from app.modules.agentic import generator
+    from app.modules.agentic.generation_schemas import GeneratedFileContentResponse
+    router = AgenticModelRouter(coding_configuration())
+    selected = router.route('last_resort', for_task='coder')[0]
+    limits, models = [], []
+    async def completed(*args, **kwargs):
+        return '{}', selected
+    async def capture(awaitable, timeout):
+        limits.append(timeout)
+        return await awaitable
+    monkeypatch.setattr(generator, 'complete_agentic', completed)
+    monkeypatch.setattr(generator, 'asyncio', SimpleNamespace(
+        get_running_loop=lambda: SimpleNamespace(time=lambda: 105.0), wait_for=capture))
+    class Provider:
+        async def complete(self, config, *args, **kwargs):
+            models.append(config.model)
+            return '{"code":"source"}'
+    app = generator.ApplicationGenerator(Provider(), router)
+    result = await app._complete_stage('backend', {}, GeneratedFileContentResponse, [1], [], 120.0)
+    assert result.content == 'source'
+    assert limits == [15.0] and models == ['openrouter/free']

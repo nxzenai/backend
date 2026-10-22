@@ -3,32 +3,22 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Literal
 
-from pydantic import Field, model_validator
+from pydantic import Field, model_validator, field_validator
 
-from app.modules.agentic.constants import MAX_GENERATED_FILES, VersionStatus
-from app.modules.agentic.schemas import StrictModel
-
-
-ToolType = Literal[
-    "document_search",
-    "csv_analysis",
-    "calculator",
-    "knowledge_retrieval",
-    "report_generation",
-    "http_api",
-    "sql_query",
-]
+from app.modules.agentic.constants import (MAX_GENERATED_FILES, MAX_GENERATED_FILE_BYTES, VersionStatus, ToolType, FrontendFramework, BackendFramework,
+    MAX_APPLICATION_NAME, MAX_CONTRACT_NAME, MAX_SUMMARY, MAX_ROLE, MAX_CONTRACT_TEXT, normalize_tool_type)
+from app.modules.agentic.schemas import StrictModel, ApiEndpoint
 
 
 class GeneratedApplication(StrictModel):
-    name: str = Field(min_length=1, max_length=160)
-    description: str = Field(min_length=1, max_length=2_000)
+    name: str = Field(min_length=1, max_length=MAX_APPLICATION_NAME)
+    description: str = Field(min_length=1, max_length=MAX_SUMMARY)
 
 
 class GeneratedAgentContract(StrictModel):
-    name: str = Field(min_length=1, max_length=120)
-    role: str = Field(min_length=1, max_length=500)
-    goal: str = Field(min_length=1, max_length=1_000)
+    name: str = Field(min_length=1, max_length=MAX_CONTRACT_NAME)
+    role: str = Field(min_length=1, max_length=MAX_ROLE)
+    goal: str = Field(min_length=1, max_length=MAX_CONTRACT_TEXT)
     instructions: list[str] = Field(min_length=1)
     tools: list[str]
     input_schema: dict[str, str]
@@ -36,15 +26,17 @@ class GeneratedAgentContract(StrictModel):
 
 
 class GeneratedToolContract(StrictModel):
-    name: str = Field(min_length=1, max_length=120)
+    name: str = Field(min_length=1, max_length=MAX_CONTRACT_NAME)
     type: ToolType
-    description: str = Field(min_length=1, max_length=1_000)
+    description: str = Field(min_length=1, max_length=MAX_CONTRACT_TEXT)
     configuration_required: list[str]
+
+    _legacy_type = field_validator("type", mode="before")(normalize_tool_type)
 
 
 class GenerationManifest(StrictModel):
-    frontend_framework: Literal["Next.js"]
-    backend_framework: Literal["FastAPI"]
+    frontend_framework: FrontendFramework
+    backend_framework: BackendFramework
     agent_language: Literal["Python"]
     entrypoints: dict[str, str]
     environment_variables: list[str]
@@ -64,7 +56,7 @@ class GenerationManifest(StrictModel):
 class GeneratedSourceFile(StrictModel):
     path: str = Field(min_length=1, max_length=240)
     language: str | None = Field(default=None, max_length=40)
-    purpose: str = Field(min_length=1, max_length=1_000)
+    purpose: str = Field(min_length=1, max_length=MAX_CONTRACT_TEXT)
     content: str = Field(min_length=1)
 
 
@@ -74,12 +66,8 @@ class GeneratedApplicationBundle(StrictModel):
     manifest: GenerationManifest
 
 
-class GeneratedApiEndpoint(StrictModel):
-    method: Literal["GET", "POST", "PUT", "PATCH", "DELETE"]
-    path: str = Field(min_length=1)
-    purpose: str = Field(min_length=1)
-    request_schema: dict[str, str]
-    response_schema: dict[str, str]
+# P1 and P2 consume the exact same endpoint contract.
+GeneratedApiEndpoint = ApiEndpoint
 
 
 class GenerationScaffold(StrictModel):
@@ -87,6 +75,10 @@ class GenerationScaffold(StrictModel):
     manifest: GenerationManifest
     api_endpoints: list[GeneratedApiEndpoint] = Field(min_length=1)
     files: list[GeneratedSourceFile] = Field(min_length=2, max_length=12)
+
+
+class GeneratedFileContentResponse(StrictModel):
+    content: str = Field(min_length=1, max_length=MAX_GENERATED_FILE_BYTES, strict=True)
 
 
 class GeneratedStageFiles(StrictModel):

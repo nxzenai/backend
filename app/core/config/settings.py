@@ -408,8 +408,8 @@ class Settings(BaseSettings):
     agentic_provider: str = Field(default="openrouter", alias="AGENTIC_PROVIDER")
     openrouter_api_key: str | None = Field(default=None, alias="OPENROUTER_API_KEY")
     agentic_planner_model: str = Field(default="", alias="AGENTIC_PLANNER_MODEL")
-    agentic_coder_model: str = Field(default="", alias="AGENTIC_CODER_MODEL")
-    agentic_fallback_model: str = Field(default="", alias="AGENTIC_FALLBACK_MODEL")
+    agentic_coder_model: str = Field(default="cohere/north-mini-code:free", alias="AGENTIC_CODER_MODEL")
+    agentic_fallback_model: str = Field(default="nvidia/nemotron-3.5-lightning:free", alias="AGENTIC_FALLBACK_MODEL")
     agentic_last_resort_model: str = Field(default="openrouter/free", alias="AGENTIC_LAST_RESORT_MODEL")
     agentic_allow_paid_models: bool = Field(default=False, alias="AGENTIC_ALLOW_PAID_MODELS")
 

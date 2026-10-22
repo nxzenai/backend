@@ -205,9 +205,14 @@ class Generator:
         return bundle()
 
 
+class PassingBuildVerifier:
+    async def verify(self, owner_id, project_id, version_id, files):
+        return {"passed": True}
+
+
 def service(generator=None):
     repository = MemoryVersionRepository()
-    return AgenticVersionService(repository, PlanningService(repository), generator or Generator()), repository
+    return AgenticVersionService(repository, PlanningService(repository), generator or Generator(), build_verifier=PassingBuildVerifier()), repository
 
 
 def user_a():
@@ -241,8 +246,10 @@ async def test_malformed_llm_generation_is_rejected():
             return '{"files": "invalid"}'
 
     class Router:
-        def route(self, *args):
-            return object(), "test"
+        def route(self, *args, **kwargs):
+            from app.modules.agentic.model_router import AgenticModelRouter
+            from test_agentic_openrouter import configuration
+            return AgenticModelRouter(configuration()).route(*args, **kwargs)
 
     with pytest.raises(GenerationOutputError):
         await ApplicationGenerator(Provider(), Router()).generate(
