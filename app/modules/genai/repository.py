@@ -556,7 +556,12 @@ class GenAIRepository:
                     "chunk_index": {"$in": indices},
                 }).sort("chunk_index", ASCENDING).limit(take).to_list(length=take)
                 selected.extend(item for item in chunks if str(item.get("content", "")).strip())
-            return [{key: value for key, value in item.items() if key not in {"_id", "owner_id"}} for item in selected]
+            metadata_by_id = by_id
+            return [{**{key: value for key, value in item.items() if key not in {"_id", "owner_id"}},
+                     **({"chunk_id": str(item["_id"])} if item.get("_id") else {}),
+                     **({"project_id": metadata_by_id[str(item["attachment_id"])]["project_id"]}
+                        if metadata_by_id.get(str(item.get("attachment_id")), {}).get("project_id") else {})}
+                    for item in selected]
         comparison = len(attachment_ids) > 1 and bool(re.search(
             r"\b(compare|comparison|contrast|differences?|similarities|across|between)\b", query_text,
         ))
@@ -692,4 +697,9 @@ class GenAIRepository:
                 if score >= minimum_score
                 and (str(item.get("attachment_id")), int(item.get("chunk_index", -1))) not in seen
             ][:max(0, limit - len(selected))])
-        return [{key: value for key, value in item.items() if key not in {"_id", "owner_id"}} for item in selected]
+        metadata_by_id = {str(item["_id"]): item for item in attachment_documents}
+        return [{**{key: value for key, value in item.items() if key not in {"_id", "owner_id"}},
+                     **({"chunk_id": str(item["_id"])} if item.get("_id") else {}),
+                     **({"project_id": metadata_by_id[str(item["attachment_id"])]["project_id"]}
+                        if metadata_by_id.get(str(item.get("attachment_id")), {}).get("project_id") else {})}
+                    for item in selected]

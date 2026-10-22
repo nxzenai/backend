@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -33,6 +33,24 @@ class ConversationSummary(BaseModel):
     project_id: str | None = None
     created_at: datetime
     updated_at: datetime
+
+
+class DocumentCitation(BaseModel):
+    """Stored in ChatMessage.metadata.citations alongside legacy citation shapes."""
+    citation_id: str
+    citation_label: str
+    document_id: str
+    document_name: str
+    title: str
+    url: str
+    source_type: Literal["project_document", "knowledge_base_document"]
+    page_number: int | None = None
+    page_end: int | None = None
+    section: str | None = None
+    chapter: str | None = None
+    chunk_id: str | None = None
+    project_id: str | None = None
+    excerpt: str | None = None
 
 
 class ChatMessage(BaseModel):
